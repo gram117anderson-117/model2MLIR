@@ -130,6 +130,27 @@ def family_of(hint: str | None) -> str | None:
     return _FAMILY_OF.get(hint) if hint else None
 
 
+# Fallback when a decomposition emitted a named op but set no pattern_hint: infer the
+# (op-kind, family) straight from the MLIR op name, so tagging is 100% regardless of
+# whether each decomposition remembered a hint. Maps op.name -> (m2m.op, m2m.family).
+_OP_TYPE_TAXONOMY: dict[str, tuple[str, str]] = {
+    "linalg.matmul": ("matmul", "contraction"),
+    "linalg.batch_matmul": ("batch_matmul", "contraction"),
+    "linalg.quantized_matmul": ("matmul", "contraction"),
+    "linalg.transpose": ("transpose", "layout"),
+    "linalg.broadcast": ("broadcast", "layout"),
+    "linalg.reduce": ("reduce", "reduce"),
+    "linalg.fill": ("fill", "fill"),
+    "linalg.softmax": ("softmax", "normalization"),
+    "linalg.conv_2d": ("conv2d", "contraction"),
+    "tensor.concat": ("concat", "concat"),
+    "tensor.extract_slice": ("slice", "layout"),
+    "tensor.insert_slice": ("slice_scatter", "layout"),
+    "tensor.collapse_shape": ("reshape", "layout"),
+    "tensor.expand_shape": ("reshape", "layout"),
+}
+
+
 def _forward_fx_meta(
     op: Operation,
     fx_meta: dict[str, Any],
@@ -154,9 +175,15 @@ def _forward_fx_meta(
     #   m2m.op     = fine op-kind (the hint)            -- preserved as-is
     #   m2m.family = coarse family from the fixed map   -- AUTHORITATIVE: overwrite any
     #     ad-hoc family a decomposition set, so the whole module uses ONE vocabulary.
-    if effective_hint and "m2m.op" not in op.attributes:
-        op.attributes["m2m.op"] = StringAttr(str(effective_hint))
     fam = family_of(effective_hint)
+    op_kind = str(effective_hint) if effective_hint else None
+    if fam is None:
+        # no usable hint -> infer from the op's own type (named ops only)
+        type_tax = _OP_TYPE_TAXONOMY.get(getattr(op, "name", ""))
+        if type_tax is not None:
+            op_kind, fam = type_tax
+    if op_kind and "m2m.op" not in op.attributes:
+        op.attributes["m2m.op"] = StringAttr(op_kind)
     if fam is not None:
         op.attributes["m2m.family"] = StringAttr(fam)  # authoritative coarse family
 
@@ -607,6 +634,20 @@ class FXImporter:
         # ``compgen.transposed_b="true"`` so providers can short-
         # circuit by emitting a B^T kernel.
         _annotate_transposes_and_matmuls(module)
+
+        # Taxonomy backfill: a final sweep that stamps m2m.op / m2m.family on every named
+        # compute op still missing them (ops emitted by helpers outside any DecompResult --
+        # e.g. transpose/reduce built inside matmul/layer-norm helpers -- never pass through
+        # _forward_fx_meta). Guarantees the matchable vocabulary covers 100% of named ops.
+        for op in module.walk():
+            if "m2m.family" in op.attributes:
+                continue
+            tax = _OP_TYPE_TAXONOMY.get(getattr(op, "name", ""))
+            if tax is not None:
+                kind, fam = tax
+                if "m2m.op" not in op.attributes:
+                    op.attributes["m2m.op"] = StringAttr(kind)
+                op.attributes["m2m.family"] = StringAttr(fam)
 
         try:
             module.verify()

@@ -103,6 +103,78 @@ def dialect_op_histogram(mlir_text: str) -> dict[str, int]:
     return dict(Counter(o for o in ops if o.split(".")[0] in keep and o != "func.func"))
 
 
+# The matchable vocabulary -- the small, fixed surface a downstream pass keys on. These
+# mirror import_fx._FAMILY_OF; a model whose families fall outside this set means a new
+# pattern was introduced (proliferation) and should be reviewed, not silently accepted.
+CANONICAL_FAMILIES = frozenset({
+    "elementwise", "cast", "fill", "iota", "compare", "select", "minmax", "logical",
+    "bitwise", "reduce", "arg_reduce", "contraction", "normalization", "layout",
+    "concat", "gather_scatter", "scan", "search", "quantize",
+})
+
+
+def op_vocabulary(mlir_text: str) -> dict[str, dict[str, int]]:
+    """Return the matchable op surface as ``{family: {op_kind: count}}`` from the
+    ``m2m.family`` / ``m2m.op`` attribute tags. This is what a pass writer sees: how few,
+    stable buckets the whole network collapses into (the scalability goal)."""
+    out: dict[str, dict[str, int]] = {}
+    for fam, op in re.findall(r'm2m\.family = "([^"]+)"[^\n]*?m2m\.op = "([^"]+)"', mlir_text):
+        out.setdefault(fam, Counter())[op] += 1
+    # also catch ops where the attrs print in the other order
+    for op, fam in re.findall(r'm2m\.op = "([^"]+)"[^\n]*?m2m\.family = "([^"]+)"', mlir_text):
+        d = out.setdefault(fam, Counter())
+        # avoid double counting lines already matched above is hard via regex; this is a
+        # best-effort report, not an exact count -- use it to see the *shape*, not totals.
+        d[op] += 0
+    return {k: dict(v) for k, v in out.items()}
+
+
+# Named ops are matchable by their op-type alone (no attr needed); only the catch-all
+# linalg.generic must carry m2m.family/m2m.op to be matchable. (xDSL's custom assembly for
+# named linalg ops doesn't even print discardable attrs, though they exist on the IR.)
+_NAMED_MATCHABLE = re.compile(
+    r"\b(linalg\.matmul|linalg\.batch_matmul|linalg\.transpose|linalg\.reduce|linalg\.fill|"
+    r"linalg\.broadcast|linalg\.softmax|linalg\.conv\w*|tensor\.concat|tensor\.extract_slice|"
+    r"tensor\.insert_slice|tensor\.collapse_shape|tensor\.expand_shape|scf\.for)\b")
+
+
+def untagged_compute_ops(mlir_text: str) -> int:
+    """Count ``linalg.generic`` ops carrying NO ``m2m.family`` tag. Should be 0 -- a generic
+    is the only op that's *not* self-describing (everything is a linalg.generic), so it MUST
+    be tagged to be matchable. Named ops (matmul/transpose/reduce/...) are matchable by their
+    op-type and are excluded. A non-zero value means a generic escaped the taxonomy."""
+    untagged = 0
+    for line in mlir_text.splitlines():
+        if "linalg.generic" in line and "m2m.family" not in line:
+            untagged += 1
+    return untagged
+
+
+_NAMED_FAMILY = {  # named op (matchable by type) -> coarse family
+    "linalg.matmul": "contraction", "linalg.batch_matmul": "contraction",
+    "linalg.conv": "contraction", "linalg.transpose": "layout", "linalg.broadcast": "layout",
+    "linalg.reduce": "reduce", "linalg.fill": "fill", "linalg.softmax": "normalization",
+    "tensor.concat": "concat", "tensor.extract_slice": "layout",
+    "tensor.insert_slice": "layout", "tensor.collapse_shape": "layout",
+    "tensor.expand_shape": "layout", "scf.for": "gather_scatter",
+}
+
+
+def family_histogram(mlir_text: str) -> dict[str, int]:
+    """Multiset of coarse families over the FULL matchable surface: generics by their
+    ``m2m.family`` attr, plus named ops folded in by op-type (since named ops are matchable
+    by type and xDSL doesn't print their discardable attrs)."""
+    h = Counter(re.findall(r'm2m\.family = "([^"]+)"', mlir_text))
+    for line in mlir_text.splitlines():
+        if "linalg.generic" in line:
+            continue
+        for named, fam in _NAMED_FAMILY.items():
+            if re.search(r"\b" + re.escape(named) + r"\w*\b" if named.endswith("conv") else r"\b" + re.escape(named) + r"\b", line):
+                h[fam] += 1
+                break
+    return dict(h)
+
+
 @dataclass
 class OpDiff:
     op: str
@@ -192,11 +264,15 @@ def differential_op(
 
 
 __all__ = [
+    "CANONICAL_FAMILIES",
     "OpDiff",
     "OpValidation",
     "dialect_op_histogram",
     "differential_op",
+    "family_histogram",
     "golden_lowering",
+    "op_vocabulary",
     "opaque_report",
+    "untagged_compute_ops",
     "validate_op",
 ]
