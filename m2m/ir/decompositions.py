@@ -1322,6 +1322,85 @@ def decompose_mean_dim(operands, meta, node_name):
     return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="reduce_mean")
 
 
+def _try_direct_conv2d(operands, meta, in_shape, w_shape):
+    """2-D conv as a single linalg.generic contraction (groups=1, no padding, dilation 1).
+
+    out[n,f,oh,ow] = sum_{ci,kh,kw} in[n,ci, oh*sh+kh, ow*sw+kw] * w[f,ci,kh,kw] (+ bias).
+    Returns a DecompResult or None (caller -> im2col path). Verify-fallback covers mistakes.
+    """
+    val: Any = meta.get("val")
+    if val is None or not hasattr(val, "shape"):
+        return None
+    out_shape = _static_shape(val.shape)
+    if len(out_shape) != 4 or any(d < 0 for d in out_shape):
+        return None
+    stride = _fx_arg(meta, 3, [1, 1]) or [1, 1]
+    padding = _fx_arg(meta, 4, [0, 0]) or [0, 0]
+    dilation = _fx_arg(meta, 5, [1, 1]) or [1, 1]
+    transposed = _fx_arg(meta, 6, False)
+    groups = _fx_arg(meta, 8, 1)
+    if transposed or int(groups or 1) != 1:
+        return None
+    if any(int(p) != 0 for p in padding) or any(int(d) != 1 for d in dilation):
+        return None
+    sh, sw = (int(stride[0]), int(stride[1])) if isinstance(stride, (list, tuple)) else (int(stride), int(stride))
+    elem = _t_elem(operands[0])
+    if _t_elem(operands[1]) != elem:
+        return None
+
+    from xdsl.dialects.arith import AddfOp, ConstantOp, MulfOp
+    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import SplatOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    inp, w = operands[0], operands[1]
+    result_type = TensorType(elem, out_shape)
+    zero = ConstantOp(FloatAttr(0.0, elem), elem)
+    init = SplatOp(zero.result, [], result_type)
+    D = AffineExpr.dimension  # dims: n=0,f=1,oh=2,ow=3,ci=4,kh=5,kw=6
+    in_map = AffineMap(7, 0, (D(0), D(4), D(2) * sh + D(5), D(3) * sw + D(6)))
+    w_map = AffineMap(7, 0, (D(1), D(4), D(5), D(6)))
+    out_map = AffineMap(7, 0, (D(0), D(1), D(2), D(3)))
+    blk = Block(arg_types=[elem, elem, elem])
+    prod = MulfOp(blk.args[0], blk.args[1])
+    acc = AddfOp(blk.args[2], prod.results[0])
+    blk.add_op(prod)
+    blk.add_op(acc)
+    blk.add_op(YieldOp(acc.results[0]))
+    par, red = IteratorType.PARALLEL, IteratorType.REDUCTION
+    gen = GenericOp(
+        inputs=[inp, w],
+        outputs=[init.results[0]],
+        body=Region(blk),
+        indexing_maps=[AffineMapAttr(in_map), AffineMapAttr(w_map), AffineMapAttr(out_map)],
+        iterator_types=[IteratorTypeAttr(par)] * 4 + [IteratorTypeAttr(red)] * 3,
+        result_types=[result_type],
+    )
+    ops: list[Operation] = [zero, init, gen]
+    res = gen.results[0]
+    rid = _next_region_id("conv")
+    # optional bias [F] over [N,F,Ho,Wo]
+    if len(operands) >= 3 and isinstance(operands[2].type, TensorType):
+        from xdsl.ir.affine import AffineExpr as _AE
+        from xdsl.ir.affine import AffineMap as _AM
+
+        bias = operands[2]
+        bias_map = _AM(4, 0, (_AE.dimension(1),))
+        em = _elementwise(
+            [res, bias], result_type, _bin_build(AddfOp),
+            input_maps=[_broadcast_map(out_shape, out_shape), bias_map], promote=True,
+        )
+        if em is not None:
+            ops += em[0]
+            res = em[1]
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("conv")
+    return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="conv2d")
+
+
 def decompose_convolution(operands, meta, node_name):
     """aten.convolution.default → im2col + linalg.matmul + reshape (REQ-021).
 
@@ -1396,6 +1475,13 @@ def decompose_convolution(operands, meta, node_name):
             "convolution",
             pattern_hint="convolution",
         )
+
+    # Direct convolution as a single linalg.generic contraction, for the common
+    # 2-D, groups=1, no-padding, dilation-1 case (patch-embed convs). Falls through to
+    # the im2col path otherwise.
+    direct = _try_direct_conv2d(operands, meta, in_shape, w_shape)
+    if direct is not None:
+        return direct
 
     val: Any = meta.get("val")
     if val is None or not hasattr(val, "shape"):
