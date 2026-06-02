@@ -338,29 +338,32 @@ def decompose_linear(
     return DecompResult(ops=ops, result=result, region_ids=region_ids)
 
 
-def decompose_gelu(
-    operands: list[SSAValue],
-    meta: dict[str, Any],
-    node_name: str,
-) -> DecompResult:
-    """Decompose aten.gelu.default(input) -> element-wise GELU.
+def _gelu_build(args, out_elem):
+    """gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))  (matches torch-mlir's exact form)."""
+    import math as _pymath
 
-    For MVP, represent as a func.call to @aten_gelu (element-wise ops in
-    linalg.generic require indexing_maps and a body region, which we'll
-    add in a later phase). The region_id is still attached.
-    """
-    from xdsl.dialects.func import CallOp
+    from xdsl.dialects.arith import AddfOp, ConstantOp, MulfOp
+    from xdsl.dialects.builtin import FloatAttr
+    from xdsl.dialects.math import ErfOp
 
-    val: Any = meta["val"]
-    result_type = TensorType(Float32Type(), _static_shape(val.shape))
+    x = args[0]
+    half = ConstantOp(FloatAttr(0.5, out_elem), out_elem)
+    one = ConstantOp(FloatAttr(1.0, out_elem), out_elem)
+    inv_sqrt2 = ConstantOp(FloatAttr(1.0 / _pymath.sqrt(2.0), out_elem), out_elem)
+    scaled = MulfOp(x, inv_sqrt2.results[0])
+    er = ErfOp(scaled.results[0])
+    onep = AddfOp(one.results[0], er.results[0])
+    hx = MulfOp(half.results[0], x)
+    out = MulfOp(hx.results[0], onep.results[0])
+    return [half, one, inv_sqrt2, scaled, er, onep, hx, out], out.results[0]
 
-    # Create external function declaration for gelu
-    # (In later phase, this becomes a linalg.generic with the GELU body)
-    rid = _next_region_id("gelu")
-    call = CallOp("aten_gelu", [operands[0]], [result_type])
-    _attach_region_id(call, rid)
 
-    return DecompResult(ops=[call], result=call.res[0], region_ids=[rid])
+def decompose_gelu(operands, meta, node_name):
+    """aten.gelu.default(input) -> 0.5*x*(1+erf(x/sqrt(2))) via linalg.generic."""
+    real = _unary_elementwise(operands, meta, "gelu", _gelu_build)
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_gelu", operands[:1], meta, "elementwise", pattern_hint="gelu")
 
 
 def _coerce_static_dim(d: Any) -> int:
@@ -1881,7 +1884,31 @@ def decompose_choose_qparams_per_channel(operands, meta, node_name):
 # Decomposition table
 # ============================================================================
 
+
+def _make_math_unary(op_cls_name: str, hint: str):
+    """Build a decomposition that lowers a pointwise unary op to linalg.generic{math.X}
+    (the exact form torch-mlir produces), with an opaque fallback."""
+
+    def f(operands, meta, node_name):
+        import xdsl.dialects.math as _M
+
+        real = _unary_elementwise(operands, meta, hint, _un_build(getattr(_M, op_cls_name)))
+        if real is not None:
+            return real
+        return _opaque_decomp(f"aten_{hint}", operands[:1], meta, "elementwise", pattern_hint=hint)
+
+    return f
+
+
 DECOMPOSITION_TABLE: dict[str, DecompFn] = {
+    # --- pointwise unary math (linalg.generic{math.*}) ---
+    "aten.exp.default": _make_math_unary("ExpOp", "exp"),
+    "aten.sqrt.default": _make_math_unary("SqrtOp", "sqrt"),
+    "aten.tanh.default": _make_math_unary("TanhOp", "tanh"),
+    "aten.abs.default": _make_math_unary("AbsFOp", "abs"),
+    "aten.floor.default": _make_math_unary("FloorOp", "floor"),
+    "aten.ceil.default": _make_math_unary("CeilOp", "ceil"),
+    "aten.log.default": _make_math_unary("LogOp", "log"),
     # --- pre-wave-6 entries (kept) ---
     "aten.addmm.default": decompose_addmm,
     "aten.linear.default": decompose_linear,

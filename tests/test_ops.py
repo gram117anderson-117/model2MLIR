@@ -31,6 +31,13 @@ CASES = [
     ("cos", torch.cos, X),
     ("sin", torch.sin, X),
     ("to_f16", lambda a: a.to(torch.float16), X),
+    ("exp", torch.exp, X),
+    ("sqrt", lambda a: torch.sqrt(a.abs() + 1), X),
+    ("tanh", torch.tanh, X),
+    ("abs", torch.abs, X),
+    ("floor", torch.floor, X),
+    ("log", lambda a: torch.log(a.abs() + 1), X),
+    ("gelu", torch.nn.functional.gelu, X),
 ]
 
 
