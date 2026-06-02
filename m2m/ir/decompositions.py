@@ -115,36 +115,56 @@ def _attach_region_id(op: Operation, region_id: str) -> None:
     op.attributes["m2m.region_id"] = StringAttr(region_id)
 
 
+def _reassoc(rank: int):
+    """Reassociation grouping all ``rank`` dims into one group: [[0, 1, ..., rank-1]]."""
+    from xdsl.dialects.builtin import ArrayAttr, IntegerAttr
+
+    return ArrayAttr([ArrayAttr([IntegerAttr(j, i64) for j in range(rank)])])
+
+
 def _emit_reshape(source: SSAValue, out_shape: list[int], elem: Any):
-    """Emit a real ``tensor.reshape`` to ``out_shape`` (a logical reshape).
+    """Emit a logical reshape via the canonical ``tensor.collapse_shape`` +
+    ``tensor.expand_shape`` pair (collapse the source to 1-D, expand to the target) --
+    the same form torch-mlir produces, with no shape-tensor / constant noise.
 
-    Covers view/reshape/unsqueeze/squeeze/flatten -- all logical reshapes to a
-    statically-known output shape. Returns ``(ops, result_ssa)``, or ``None`` when
-    the output shape has a dynamic dim (can't build a static shape tensor), so the
-    caller falls back to an opaque placeholder.
-    """
-    if any(d < 0 for d in out_shape):
+    Covers view/reshape/unsqueeze/squeeze/flatten. Returns ``(ops, result_ssa)``, or
+    ``None`` on dynamic/0-rank shapes (caller falls back to an opaque placeholder)."""
+    src_type = source.type
+    if not isinstance(src_type, TensorType):
         return None
+    in_shape = list(src_type.get_shape())
+    if not in_shape or not out_shape or any(d < 0 for d in (*in_shape, *out_shape)):
+        return None
+    if in_shape == out_shape:
+        return [], source  # identity reshape
 
-    from xdsl.dialects.arith import ConstantOp
-    from xdsl.dialects.builtin import IntegerAttr
-    from xdsl.dialects.tensor import FromElementsOp, ReshapeOp
+    from xdsl.dialects.tensor import CollapseShapeOp, ExpandShapeOp
+
+    numel = 1
+    for d in in_shape:
+        numel *= d
 
     ops: list[Operation] = []
-    dim_ssas: list[SSAValue] = []
-    for d in out_shape:
-        c = ConstantOp(IntegerAttr(int(d), i64), i64)
-        ops.append(c)
-        dim_ssas.append(c.result)
-
-    shape_type = TensorType(i64, [len(out_shape)])
-    from_elems = FromElementsOp(dim_ssas[0], *dim_ssas[1:], result_type=shape_type)
-    ops.append(from_elems)
-
-    result_type = TensorType(elem, out_shape)
-    reshape = ReshapeOp(source, from_elems.results[0], result_type)
-    ops.append(reshape)
-    return ops, reshape.results[0]
+    cur = source
+    if len(in_shape) != 1:  # collapse N-D -> 1-D
+        flat = CollapseShapeOp(
+            operands=[cur],
+            result_types=[TensorType(elem, [numel])],
+            properties={"reassociation": _reassoc(len(in_shape))},
+        )
+        ops.append(flat)
+        cur = flat.results[0]
+    if len(out_shape) != 1:  # expand 1-D -> target (static output shape, no dynamic dims)
+        exp = ExpandShapeOp(
+            cur,
+            [],  # dynamic_output_shape (none -- fully static)
+            _reassoc(len(out_shape)),
+            list(out_shape),  # static_output_shape
+            TensorType(elem, out_shape),
+        )
+        ops.append(exp)
+        cur = exp.results[0]
+    return ops, cur
 
 
 def _elementwise(inputs: list[SSAValue], result_type: TensorType, scalar_build):
