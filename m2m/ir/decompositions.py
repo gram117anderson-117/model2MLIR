@@ -196,7 +196,26 @@ def _broadcast_map(operand_shape, result_shape):
     return AffineMap(r, 0, tuple(exprs))
 
 
-def _elementwise(inputs: list[SSAValue], result_type: TensorType, scalar_build, input_maps=None):
+def _cast_scalar_arg(x, dst):
+    """Cast a scalar SSA value to ``dst`` element type (for arith dtype promotion)."""
+    src = x.type
+    if src == dst:
+        return [], x
+    from xdsl.dialects.arith import ExtFOp, FPToSIOp, SIToFPOp, TruncFOp
+    from xdsl.dialects.builtin import AnyFloat, IntegerType
+
+    if isinstance(src, AnyFloat) and isinstance(dst, AnyFloat):
+        op = TruncFOp(x, dst) if dst.bitwidth < src.bitwidth else ExtFOp(x, dst)
+    elif isinstance(src, IntegerType) and isinstance(dst, AnyFloat):
+        op = SIToFPOp(x, dst)
+    elif isinstance(src, AnyFloat) and isinstance(dst, IntegerType):
+        op = FPToSIOp(x, dst)
+    else:
+        return [], x  # can't bridge; leave as-is (importer verify-fallback handles it)
+    return [op], op.results[0]
+
+
+def _elementwise(inputs: list[SSAValue], result_type: TensorType, scalar_build, input_maps=None, promote=False):
     """Emit a ``linalg.generic`` elementwise op (all-parallel).
 
     ``input_maps`` (one AffineMap per input) enables broadcasting; defaults to identity
@@ -218,7 +237,16 @@ def _elementwise(inputs: list[SSAValue], result_type: TensorType, scalar_build, 
 
     in_elems = [inp.type.element_type for inp in inputs]  # type: ignore[union-attr]
     block = Block(arg_types=[*in_elems, out_elem])
-    body_ops, yield_ssa = scalar_build(list(block.args[: len(inputs)]), out_elem)
+    args = list(block.args[: len(inputs)])
+    if promote:  # cast each input element to the result dtype (dtype promotion, e.g. bf16*f32)
+        casted = []
+        for a in args:
+            cops, ca = _cast_scalar_arg(a, out_elem)
+            for c in cops:
+                block.add_op(c)
+            casted.append(ca)
+        args = casted
+    body_ops, yield_ssa = scalar_build(args, out_elem)
     for op in body_ops:
         block.add_op(op)
     block.add_op(YieldOp(yield_ssa))
@@ -421,20 +449,15 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
     lhs0_type = operands[0].type if operands else None
     if not isinstance(lhs0_type, TensorType):
         return None
-    # Emit a real op ONLY when operand dtype(s) are consistent with the meta result
-    # dtype. The importer's meta/SSA dtypes can diverge; the old opaque path hid this
-    # by typing everything from meta. A real op with a divergent result dtype breaks
-    # the downstream consumer (which expects the meta dtype) -> bail to opaque.
+    # Result dtype = meta dtype; operands are cast to it inside the body (promote=True),
+    # so mixed-dtype promotion (e.g. bf16 * f32 -> f32) lowers instead of bailing.
     elem = _element_type_from_meta(meta)
-    if lhs0_type.element_type != elem:
-        return None
     result_type = TensorType(elem, out_shape)
 
     pre: list[Operation] = []
     if len(operands) >= 2:
         lhs, rhs = operands[0], operands[1]
-        rt = rhs.type
-        if not isinstance(rt, TensorType) or rt.element_type != elem:
+        if not isinstance(rhs.type, TensorType):
             return None
     elif len(operands) == 1:
         sp = _splat_scalar(_fx_arg(meta, 1, 0), result_type)
@@ -452,7 +475,7 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
     if ml is None or mr is None:
         return None
 
-    em = _elementwise([lhs, rhs], result_type, scalar_build, input_maps=[ml, mr])
+    em = _elementwise([lhs, rhs], result_type, scalar_build, input_maps=[ml, mr], promote=True)
     if em is None:
         return None
     ops, res = em
@@ -1058,7 +1081,7 @@ def decompose_pow_tensor_scalar(operands, meta, node_name):
         p = PowFOp(args[0], c.results[0])
         return [c, p], p.results[0]
 
-    real = _pointwise(operands[:1], meta, build, family="pow")
+    real = _pointwise(operands[:1], meta, build, family="pow", promote=True)
     if real is not None:
         return real
     return _opaque_decomp("aten_pow", operands, meta, "pow", pattern_hint="pow_tensor_scalar")
@@ -1089,7 +1112,7 @@ def decompose_pow_tensor_tensor(operands, meta, node_name):
         p = PowFOp(args[0], args[1])
         return [p], p.results[0]
 
-    real = _pointwise(operands[:2], meta, build, family="pow")
+    real = _pointwise(operands[:2], meta, build, family="pow", promote=True)
     if real is not None:
         return real
     return _opaque_decomp("aten_pow", operands[:2], meta, "pow", pattern_hint="pow")
@@ -2276,7 +2299,7 @@ def decompose_choose_qparams_per_channel(operands, meta, node_name):
 # ============================================================================
 
 
-def _pointwise(operands, meta, scalar_build, *, family: str, out_elem=None):
+def _pointwise(operands, meta, scalar_build, *, family: str, out_elem=None, promote=False):
     """Scalable pointwise core: build a broadcast-aware linalg.generic for ANY pointwise
     op, tagged with an ``m2m.family`` cluster attribute so transforms can match families
     rather than unique ops. ``out_elem`` defaults to the meta result dtype.
@@ -2301,7 +2324,7 @@ def _pointwise(operands, meta, scalar_build, *, family: str, out_elem=None):
         if m is None:
             return None
         maps.append(m)
-    em = _elementwise(operands, result_type, scalar_build, input_maps=maps)
+    em = _elementwise(operands, result_type, scalar_build, input_maps=maps, promote=promote)
     if em is None:
         return None
     ops, res = em
@@ -2373,7 +2396,7 @@ def decompose_relu(operands, meta, node_name):
         m = MaximumfOp(args[0], z.results[0])
         return [z, m], m.results[0]
 
-    real = _pointwise(operands[:1], meta, build, family="minmax")
+    real = _pointwise(operands[:1], meta, build, family="minmax", promote=True)
     if real is not None:
         return real
     return _opaque_decomp("aten_relu", operands[:1], meta, "elementwise", pattern_hint="relu")
@@ -2402,7 +2425,7 @@ def decompose_clamp(operands, meta, node_name):
             cur = mn.results[0]
         return ops, cur
 
-    real = _pointwise(operands[:1], meta, build, family="minmax")
+    real = _pointwise(operands[:1], meta, build, family="minmax", promote=True)
     if real is not None:
         return real
     return _opaque_decomp("aten_clamp", operands[:1], meta, "elementwise", pattern_hint="clamp")
@@ -2420,7 +2443,7 @@ def _make_minmax(op_cls_name: str, hint: str):
             o = cls(args[0], args[1])
             return [o], o.results[0]
 
-        real = _pointwise(operands[:2], meta, build, family="minmax")
+        real = _pointwise(operands[:2], meta, build, family="minmax", promote=True)
         if real is not None:
             return real
         return _opaque_decomp(f"aten_{hint}", operands[:2], meta, "elementwise", pattern_hint=hint)
