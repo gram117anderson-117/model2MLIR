@@ -259,6 +259,7 @@ class FXImporter:
         # Build the function body
         block = Block(arg_types=arg_types)
         value_map: dict[str, SSAValue] = {}
+        multi_results: dict[str, list[SSAValue]] = {}  # split/unbind: node -> per-output SSA
         for i, p in enumerate(placeholders):
             value_map[p.name] = block.args[i]
 
@@ -329,6 +330,19 @@ class FXImporter:
             #   ``<built-in function getitem>`` op no provider can match).
             # Acceptance per REQ-020: ``<built-in function getitem>``
             # never appears in payload.mlir.
+            # Multi-output ops (split/unbind): getitem(node, i) -> the i-th real output.
+            if (
+                target_str == "<built-in function getitem>"
+                and len(node.args) >= 2
+                and hasattr(node.args[0], "name")
+                and node.args[0].name in multi_results
+            ):
+                outs = multi_results[node.args[0].name]
+                idx = node.args[1]
+                if isinstance(idx, int) and 0 <= idx < len(outs):
+                    value_map[node.name] = outs[idx]
+                    continue
+
             if (
                 target_str == "<built-in function getitem>"
                 and len(node.args) >= 2
@@ -422,6 +436,8 @@ class FXImporter:
 
                         if result.result is not None:
                             value_map[node.name] = result.result
+                        if result.results:
+                            multi_results[node.name] = list(result.results)
 
                         self.decomposed_count += 1
                         hint_suffix = f", hint: {result.pattern_hint}" if result.pattern_hint else ""

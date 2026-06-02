@@ -73,6 +73,9 @@ class DecompResult:
     result: SSAValue | None = None
     region_ids: list[str] = field(default_factory=list)
     pattern_hint: str | None = None
+    # Multi-output ops (split, unbind, ...): per-output SSA values so the importer can
+    # resolve getitem(node, i) -> results[i]. Empty for single-output ops.
+    results: list[SSAValue] = field(default_factory=list)
 
 
 # Type for decomposition functions
@@ -1652,17 +1655,40 @@ def decompose_cat(operands, meta, node_name):
 def decompose_split_with_sizes(operands, meta, node_name):
     """aten.split_with_sizes.default(input, split_sizes, dim?).
 
-    Returns a list of tensors; for MVP we emit a single opaque call
-    with pattern_hint='split' — the FX graph's getitem ops disambiguate
-    which chunk each downstream consumer needs.
+    Emits one tensor.extract_slice per chunk (multi-output); getitem(node, i) resolves to
+    the i-th slice via the importer's multi_results map.
     """
-    return _opaque_decomp(
-        "aten_split_with_sizes",
-        operands[:1],
-        meta,
-        "layout",
-        pattern_hint="split",
-    )
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("aten_split_with_sizes", operands[:1], meta, "layout", pattern_hint="split")
+    src = operands[0]
+    in_shape = list(src.type.get_shape())
+    if any(d < 0 for d in in_shape):
+        return _opaque_decomp("aten_split_with_sizes", operands[:1], meta, "layout", pattern_hint="split")
+    rank = len(in_shape)
+    sizes_list = _fx_arg(meta, 1, None)
+    dim = int(_fx_arg(meta, 2, 0) or 0) % rank
+    if not isinstance(sizes_list, (list, tuple)) or not sizes_list:
+        return _opaque_decomp("aten_split_with_sizes", operands[:1], meta, "layout", pattern_hint="split")
+
+    from xdsl.dialects.tensor import ExtractSliceOp
+
+    ops: list[Operation] = []
+    results: list[SSAValue] = []
+    rid = _next_region_id("split")
+    off = 0
+    for sz in sizes_list:
+        sz = int(sz)
+        offsets = [0] * rank
+        offsets[dim] = off
+        sizes = list(in_shape)
+        sizes[dim] = sz
+        op = ExtractSliceOp.from_static_parameters(src, offsets, sizes, [1] * rank)
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("slice")
+        ops.append(op)
+        results.append(op.results[0])
+        off += sz
+    return DecompResult(ops=ops, result=results[0], results=results, region_ids=[rid], pattern_hint="split")
 
 
 def decompose_clone(operands, meta, node_name):
@@ -2725,6 +2751,8 @@ DECOMPOSITION_TABLE.update(
         "aten.any.dim": decompose_any_real,
         "aten.any.default": decompose_any_real,
         "aten.any.dims": decompose_any_real,
+        "aten.reshape.default": decompose_view,
+        "aten._unsafe_view.default": decompose_view,
         "aten.min.other": _make_minmax("MinimumfOp", "minimum"),
         "aten.max.other": _make_minmax("MaximumfOp", "maximum"),
     }
