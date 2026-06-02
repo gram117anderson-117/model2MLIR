@@ -861,14 +861,69 @@ def decompose_rsqrt(operands, meta, node_name):
 
 
 def decompose_pow_tensor_scalar(operands, meta, node_name):
-    """aten.pow.Tensor_Scalar(input, exponent) - common in RMS norm (pow 2)."""
-    return _opaque_decomp(
-        "aten_pow",
-        operands,
-        meta,
-        "pow",
-        pattern_hint="pow_tensor_scalar",
-    )
+    """aten.pow.Tensor_Scalar(input, exponent) -> math.powf via linalg.generic."""
+    from xdsl.dialects.arith import ConstantOp
+    from xdsl.dialects.builtin import FloatAttr
+    from xdsl.dialects.math import PowFOp
+
+    exp = _fx_arg(meta, 1, 2.0)
+
+    def build(args, oe):
+        c = ConstantOp(FloatAttr(float(exp), oe), oe)
+        p = PowFOp(args[0], c.results[0])
+        return [c, p], p.results[0]
+
+    real = _pointwise(operands[:1], meta, build, family="pow")
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_pow", operands, meta, "pow", pattern_hint="pow_tensor_scalar")
+
+
+def _identity_decomp(operands, meta, node_name):
+    """alias/detach/lift_fresh_copy -> identity: forward the operand SSA (no op)."""
+    if operands:
+        return DecompResult(ops=[], result=operands[0], pattern_hint="identity")
+    return _opaque_decomp("aten_identity", operands[:1], meta, "identity", pattern_hint="identity")
+
+
+def decompose_empty(operands, meta, node_name):
+    """aten.empty.memory_format / empty_like / new_empty -> tensor.empty (uninitialized)."""
+    val: Any = meta["val"]
+    if isinstance(val, (tuple, list)) and val:
+        val = val[0]
+    elem = _element_type_from_meta(meta)
+    out_shape = _static_shape(getattr(val, "shape", []))
+    if any(d < 0 for d in out_shape):
+        return _opaque_decomp("aten_empty", [], meta, "empty", pattern_hint="empty")
+    e = _make_empty(TensorType(elem, out_shape))
+    rid = _next_region_id("empty")
+    e.attributes["m2m.family"] = StringAttr("empty")
+    _attach_region_id(e, rid)
+    return DecompResult(ops=[e], result=e.results[0], region_ids=[rid], pattern_hint="empty")
+
+
+def _make_fill(value_idx: int):
+    """aten.{scalar_tensor,full,full_like} -> tensor.splat(const) (family: fill)."""
+
+    def f(operands, meta, node_name):
+        val: Any = meta["val"]
+        if isinstance(val, (tuple, list)) and val:
+            val = val[0]
+        elem = _element_type_from_meta(meta)
+        out_shape = _static_shape(getattr(val, "shape", []))
+        if any(d < 0 for d in out_shape):
+            return _opaque_decomp("aten_fill", [], meta, "fill", pattern_hint="fill")
+        sp = _splat_scalar(_fx_arg(meta, value_idx, 0.0), TensorType(elem, out_shape))
+        if sp is None:
+            return _opaque_decomp("aten_fill", [], meta, "fill", pattern_hint="fill")
+        ops, res = sp
+        rid = _next_region_id("fill")
+        for op in ops:
+            _attach_region_id(op, rid)
+            op.attributes["m2m.family"] = StringAttr("fill")
+        return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="fill")
+
+    return f
 
 
 def decompose_mean_dim(operands, meta, node_name):
@@ -2246,6 +2301,17 @@ DECOMPOSITION_TABLE.update(
         "aten.minimum.default": _make_minmax("MinimumfOp", "minimum"),
         "aten.where.self": decompose_where_self,
         "aten.logical_not.default": decompose_logical_not,
+        # identity aliases
+        "aten.alias.default": _identity_decomp,
+        "aten.detach.default": _identity_decomp,
+        "aten.lift_fresh_copy.default": _identity_decomp,
+        # empty / fill
+        "aten.empty.memory_format": decompose_empty,
+        "aten.empty_like.default": decompose_empty,
+        "aten.new_empty.default": decompose_empty,
+        "aten.scalar_tensor.default": _make_fill(0),
+        "aten.full.default": _make_fill(1),
+        "aten.full_like.default": _make_fill(1),
     }
 )
 for _k in ("eq", "ne", "lt", "le", "gt", "ge"):
