@@ -201,7 +201,7 @@ def _cast_scalar_arg(x, dst):
     src = x.type
     if src == dst:
         return [], x
-    from xdsl.dialects.arith import ExtFOp, FPToSIOp, SIToFPOp, TruncFOp
+    from xdsl.dialects.arith import ExtFOp, ExtSIOp, FPToSIOp, SIToFPOp, TruncFOp, TruncIOp
     from xdsl.dialects.builtin import AnyFloat, IntegerType
 
     if isinstance(src, AnyFloat) and isinstance(dst, AnyFloat):
@@ -210,6 +210,8 @@ def _cast_scalar_arg(x, dst):
         op = SIToFPOp(x, dst)
     elif isinstance(src, AnyFloat) and isinstance(dst, IntegerType):
         op = FPToSIOp(x, dst)
+    elif isinstance(src, IntegerType) and isinstance(dst, IntegerType):
+        op = TruncIOp(x, dst) if dst.width.data < src.width.data else ExtSIOp(x, dst)
     else:
         return [], x  # can't bridge; leave as-is (importer verify-fallback handles it)
     return [op], op.results[0]
@@ -524,6 +526,21 @@ def _bin_build(arith_cls):
     return build
 
 
+def _arith_build2(float_name: str, int_name: str):
+    """Binary build that picks the integer or float arith op based on the result dtype
+    (so integer index/position math lowers, not just float)."""
+
+    def build(args, out_elem):
+        import xdsl.dialects.arith as _A
+        from xdsl.dialects.builtin import IntegerType
+
+        cls = getattr(_A, int_name) if isinstance(out_elem, IntegerType) else getattr(_A, float_name)
+        op = cls(args[0], args[1])
+        return [op], op.results[0]
+
+    return build
+
+
 def _un_build(op_cls):
     def build(args, out_elem):
         op = op_cls(args[0])
@@ -613,7 +630,7 @@ def decompose_add_tensor(
 
     from xdsl.dialects.arith import AddfOp
 
-    real = _binary_elementwise(operands, meta, "add", _bin_build(AddfOp))
+    real = _binary_elementwise(operands, meta, "add", _arith_build2("AddfOp", "AddiOp"))
     if real is not None:
         return real
 
@@ -641,7 +658,7 @@ def decompose_mul_tensor(
 
     from xdsl.dialects.arith import MulfOp
 
-    real = _binary_elementwise(operands, meta, "mul", _bin_build(MulfOp))
+    real = _binary_elementwise(operands, meta, "mul", _arith_build2("MulfOp", "MuliOp"))
     if real is not None:
         return real
 
@@ -1435,7 +1452,7 @@ def decompose_sub_tensor(operands, meta, node_name):
     """aten.sub.Tensor(a, b) -> arith.subf via linalg.generic."""
     from xdsl.dialects.arith import SubfOp
 
-    real = _binary_elementwise(operands, meta, "sub", _bin_build(SubfOp))
+    real = _binary_elementwise(operands, meta, "sub", _arith_build2("SubfOp", "SubiOp"))
     if real is not None:
         return real
     return _opaque_decomp("aten_sub", operands[:2], meta, "elementwise", pattern_hint="sub")
@@ -1445,7 +1462,7 @@ def decompose_div_tensor(operands, meta, node_name):
     """aten.div.Tensor(a, b) -> arith.divf via linalg.generic."""
     from xdsl.dialects.arith import DivfOp
 
-    real = _binary_elementwise(operands, meta, "div", _bin_build(DivfOp))
+    real = _binary_elementwise(operands, meta, "div", _arith_build2("DivfOp", "DivSIOp"))
     if real is not None:
         return real
     return _opaque_decomp("aten_div", operands[:2], meta, "elementwise", pattern_hint="div")
@@ -2435,14 +2452,8 @@ def _make_minmax(op_cls_name: str, hint: str):
     """aten.{maximum,minimum}(a, b) -> arith.{maximumf,minimumf} (family: minmax)."""
 
     def f(operands, meta, node_name):
-        import xdsl.dialects.arith as _A
-
-        cls = getattr(_A, op_cls_name)
-
-        def build(args, oe):
-            o = cls(args[0], args[1])
-            return [o], o.results[0]
-
+        int_name = {"MaximumfOp": "MaxSIOp", "MinimumfOp": "MinSIOp"}.get(op_cls_name, op_cls_name)
+        build = _arith_build2(op_cls_name, int_name)
         real = _pointwise(operands[:2], meta, build, family="minmax", promote=True)
         if real is not None:
             return real
