@@ -43,6 +43,15 @@ CASES = [
     ("mul_bcast", lambda a, b: a * b, (torch.randn(4, 8), torch.randn(8))),
     ("mm", torch.mm, (torch.randn(4, 8), torch.randn(8, 16))),
     ("addmm", lambda b, x, w: torch.addmm(b, x, w), (torch.randn(16), torch.randn(4, 8), torch.randn(8, 16))),
+    ("relu", torch.relu, X),
+    ("clamp", lambda a: a.clamp(-1, 1), X),
+    ("maximum", torch.maximum, XY),
+    ("minimum", torch.minimum, XY),
+    ("where", lambda c, a, b: torch.where(c, a, b), (torch.randn(4, 8) > 0, torch.randn(4, 8), torch.randn(4, 8))),
+    ("lt", lambda a, b: a < b, XY),
+    ("eq_scalar", lambda a: a == 0, X),
+    ("logical_not", lambda a: torch.logical_not(a > 0), X),
+    ("expand", lambda a: a.expand(4, 8), (torch.randn(1, 8),)),
 ]
 
 

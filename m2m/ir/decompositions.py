@@ -1441,6 +1441,8 @@ def _element_type_from_meta(meta: dict[str, Any]) -> Any:
         return Float32Type()
 
     d = val.dtype
+    if d == torch.bool:
+        return IntegerType(1)
     if d == torch.float32:
         return Float32Type()
     if d == torch.float64:
@@ -1942,6 +1944,176 @@ def decompose_choose_qparams_per_channel(operands, meta, node_name):
 # ============================================================================
 
 
+def _pointwise(operands, meta, scalar_build, *, family: str, out_elem=None):
+    """Scalable pointwise core: build a broadcast-aware linalg.generic for ANY pointwise
+    op, tagged with an ``m2m.family`` cluster attribute so transforms can match families
+    rather than unique ops. ``out_elem`` defaults to the meta result dtype.
+
+    Returns a DecompResult, or None (caller -> opaque) on dynamic shapes / unsupported
+    broadcast. The importer verify-fallback turns any invalid scalar body into opaque too.
+    """
+    val: Any = meta["val"]
+    if isinstance(val, (tuple, list)) and val:
+        val = val[0]
+    out_shape = [_coerce_static_dim(d) for d in getattr(val, "shape", [])]
+    if not operands or any(d < 0 for d in out_shape):
+        return None
+    oe = out_elem if out_elem is not None else _element_type_from_meta(meta)
+    result_type = TensorType(oe, out_shape)
+    maps = []
+    for o in operands:
+        sh = _shape_of(o)
+        if sh is None:
+            return None
+        m = _broadcast_map(sh, out_shape)
+        if m is None:
+            return None
+        maps.append(m)
+    em = _elementwise(operands, result_type, scalar_build, input_maps=maps)
+    if em is None:
+        return None
+    ops, res = em
+    rid = _next_region_id(family)
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr(family)
+    return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint=family)
+
+
+# Compare / select family (cmp + select), all sharing the _pointwise core ----------
+_CMP_PREDICATE = {"eq": "oeq", "ne": "one", "lt": "olt", "le": "ole", "gt": "ogt", "ge": "oge"}
+
+
+def decompose_where_self(operands, meta, node_name):
+    """aten.where.self(cond, a, b) -> arith.select via linalg.generic (family: select)."""
+    from xdsl.dialects.arith import SelectOp
+
+    def build(args, oe):
+        s = SelectOp(args[0], args[1], args[2])
+        return [s], s.results[0]
+
+    real = _pointwise(operands[:3], meta, build, family="select") if len(operands) >= 3 else None
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_where", operands[:3], meta, "select", pattern_hint="where")
+
+
+def _make_compare(kind: str):
+    """aten.{eq,ne,lt,le,gt,ge}.{Tensor,Scalar} -> arith.cmpf (family: compare, i1 out)."""
+    from xdsl.dialects.builtin import IntegerType
+
+    pred = _CMP_PREDICATE[kind]
+
+    def f(operands, meta, node_name):
+        from xdsl.dialects.arith import CmpfOp
+
+        def build(args, oe):
+            c = CmpfOp(args[0], args[1], pred)
+            return [c], c.results[0]
+
+        ops_in = list(operands)
+        if len(ops_in) == 1:  # scalar form: splat the scalar to the lhs shape
+            lhs_t = ops_in[0].type
+            if isinstance(lhs_t, TensorType):
+                sp = _splat_scalar(_fx_arg(meta, 1, 0), TensorType(lhs_t.element_type, lhs_t.get_shape()))
+                if sp is not None:
+                    pre, rhs = sp
+                    real = _pointwise([ops_in[0], rhs], meta, build, family="compare", out_elem=IntegerType(1))
+                    if real is not None:
+                        real.ops[:0] = pre
+                        return real
+            return _opaque_decomp("aten_compare", operands[:2], meta, "compare", pattern_hint="compare")
+        real = _pointwise(ops_in[:2], meta, build, family="compare", out_elem=IntegerType(1))
+        if real is not None:
+            return real
+        return _opaque_decomp("aten_compare", operands[:2], meta, "compare", pattern_hint="compare")
+
+    return f
+
+
+def decompose_relu(operands, meta, node_name):
+    """aten.relu.default(x) -> max(x, 0) via arith.maximumf (family: minmax)."""
+    from xdsl.dialects.arith import ConstantOp, MaximumfOp
+    from xdsl.dialects.builtin import FloatAttr
+
+    def build(args, oe):
+        z = ConstantOp(FloatAttr(0.0, oe), oe)
+        m = MaximumfOp(args[0], z.results[0])
+        return [z, m], m.results[0]
+
+    real = _pointwise(operands[:1], meta, build, family="minmax")
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_relu", operands[:1], meta, "elementwise", pattern_hint="relu")
+
+
+def decompose_clamp(operands, meta, node_name):
+    """aten.clamp.default(x, min?, max?) -> minimumf(maximumf(x,min),max) (family: minmax)."""
+    from xdsl.dialects.arith import ConstantOp, MaximumfOp, MinimumfOp
+    from xdsl.dialects.builtin import FloatAttr
+
+    lo = _fx_arg(meta, 1, None)
+    hi = _fx_arg(meta, 2, None)
+
+    def build(args, oe):
+        cur = args[0]
+        ops = []
+        if lo is not None:
+            c = ConstantOp(FloatAttr(float(lo), oe), oe)
+            mx = MaximumfOp(cur, c.results[0])
+            ops += [c, mx]
+            cur = mx.results[0]
+        if hi is not None:
+            c = ConstantOp(FloatAttr(float(hi), oe), oe)
+            mn = MinimumfOp(cur, c.results[0])
+            ops += [c, mn]
+            cur = mn.results[0]
+        return ops, cur
+
+    real = _pointwise(operands[:1], meta, build, family="minmax")
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_clamp", operands[:1], meta, "elementwise", pattern_hint="clamp")
+
+
+def _make_minmax(op_cls_name: str, hint: str):
+    """aten.{maximum,minimum}(a, b) -> arith.{maximumf,minimumf} (family: minmax)."""
+
+    def f(operands, meta, node_name):
+        import xdsl.dialects.arith as _A
+
+        cls = getattr(_A, op_cls_name)
+
+        def build(args, oe):
+            o = cls(args[0], args[1])
+            return [o], o.results[0]
+
+        real = _pointwise(operands[:2], meta, build, family="minmax")
+        if real is not None:
+            return real
+        return _opaque_decomp(f"aten_{hint}", operands[:2], meta, "elementwise", pattern_hint=hint)
+
+    return f
+
+
+def decompose_logical_not(operands, meta, node_name):
+    """aten.logical_not.default(x) -> x XOR true (family: logical, i1 out)."""
+    from xdsl.dialects.arith import ConstantOp, XOrIOp
+    from xdsl.dialects.builtin import IntegerAttr, IntegerType
+
+    i1 = IntegerType(1)
+
+    def build(args, oe):
+        true = ConstantOp(IntegerAttr(1, i1), i1)
+        x = XOrIOp(args[0], true.results[0])
+        return [true, x], x.results[0]
+
+    real = _pointwise(operands[:1], meta, build, family="logical", out_elem=i1)
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_logical_not", operands[:1], meta, "logical", pattern_hint="logical_not")
+
+
 def _make_math_unary(op_cls_name: str, hint: str):
     """Build a decomposition that lowers a pointwise unary op to linalg.generic{math.X}
     (the exact form torch-mlir produces), with an opaque fallback."""
@@ -2062,6 +2234,23 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.sin.default": decompose_sin,
     "aten.cumsum.default": decompose_cumsum,
 }
+
+
+# Compare / select / minmax family registrations (parameterized; one emitter per family).
+DECOMPOSITION_TABLE.update(
+    {
+        "aten.relu.default": decompose_relu,
+        "aten.clamp.default": decompose_clamp,
+        "aten.clamp.Tensor": decompose_clamp,
+        "aten.maximum.default": _make_minmax("MaximumfOp", "maximum"),
+        "aten.minimum.default": _make_minmax("MinimumfOp", "minimum"),
+        "aten.where.self": decompose_where_self,
+        "aten.logical_not.default": decompose_logical_not,
+    }
+)
+for _k in ("eq", "ne", "lt", "le", "gt", "ge"):
+    DECOMPOSITION_TABLE[f"aten.{_k}.Tensor"] = _make_compare(_k)
+    DECOMPOSITION_TABLE[f"aten.{_k}.Scalar"] = _make_compare(_k)
 
 
 __all__ = [

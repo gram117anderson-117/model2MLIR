@@ -121,6 +121,15 @@ def _torch_dtype_to_xdsl(dtype: torch.dtype) -> Attribute:
         return Float8E4M3FNType()
     if hasattr(torch, "float8_e5m2") and dtype == torch.float8_e5m2:
         return Float8E5M2Type()
+    # Bool -> i1 (so arith.select conds / comparison results verify) and integers ->
+    # their bitwidth, instead of silently defaulting to f32.
+    from xdsl.dialects.builtin import IntegerType
+
+    if dtype == torch.bool:
+        return IntegerType(1)
+    int_bits = {torch.int8: 8, torch.uint8: 8, torch.int16: 16, torch.int32: 32, torch.int64: 64}
+    if dtype in int_bits:
+        return IntegerType(int_bits[dtype])
     factory = mapping.get(dtype, Float32Type)
     return factory()  # type: ignore[abstract]
 
