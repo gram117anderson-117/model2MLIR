@@ -1121,6 +1121,100 @@ def decompose_copy(operands, meta, node_name):
     return _opaque_decomp("aten_copy", operands[:1], meta, "copy", pattern_hint="copy")
 
 
+def decompose_pow_scalar(operands, meta, node_name):
+    """aten.pow.Scalar(base_scalar, exponent_tensor) -> base ** x via math.powf."""
+    from xdsl.dialects.arith import ConstantOp
+    from xdsl.dialects.builtin import FloatAttr
+    from xdsl.dialects.math import PowFOp
+
+    base = _fx_arg(meta, 0, 2.0)
+
+    def build(args, oe):
+        c = ConstantOp(FloatAttr(float(base), oe), oe)
+        p = PowFOp(c.results[0], args[0])
+        return [c, p], p.results[0]
+
+    real = _pointwise(operands[:1], meta, build, family="pow")
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_pow", operands[:1], meta, "pow", pattern_hint="pow")
+
+
+def decompose_slice_scatter(operands, meta, node_name):
+    """aten.slice_scatter(input, src, dim, start, end, step) -> tensor.insert_slice."""
+    if len(operands) < 2 or not isinstance(operands[0].type, TensorType) or not isinstance(operands[1].type, TensorType):
+        return _opaque_decomp("aten_slice_scatter", operands[:1], meta, "layout", pattern_hint="slice_scatter")
+    inp, src = operands[0], operands[1]
+    si = list(inp.type.get_shape())
+    ss = list(src.type.get_shape())
+    if any(d < 0 for d in si) or any(d < 0 for d in ss) or len(ss) != len(si):
+        return _opaque_decomp("aten_slice_scatter", operands[:1], meta, "layout", pattern_hint="slice_scatter")
+    rank = len(si)
+    dim = int(_fx_arg(meta, 2, 0) or 0) % rank
+    start = _fx_arg(meta, 3, 0)
+    start = 0 if start is None else int(start)
+    if start < 0:
+        start += si[dim]
+    step = _fx_arg(meta, 4, 1)
+    step = 1 if step is None else max(1, int(step))
+    offsets = [0] * rank
+    offsets[dim] = max(0, min(start, si[dim]))
+    strides = [1] * rank
+    strides[dim] = step
+
+    from xdsl.dialects.tensor import InsertSliceOp
+
+    op = InsertSliceOp.from_static_parameters(src, inp, offsets, ss, strides)
+    rid = _next_region_id("slice_scatter")
+    _attach_region_id(op, rid)
+    op.attributes["m2m.family"] = StringAttr("slice")
+    return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="slice_scatter")
+
+
+def decompose_any_real(operands, meta, node_name):
+    """aten.any.dim(input, dim, keepdim) -> linalg.reduce with arith.ori (family reduce)."""
+    from xdsl.dialects.arith import ConstantOp, OrIOp
+    from xdsl.dialects.builtin import DenseArrayBase, IntegerAttr, IntegerType
+    from xdsl.dialects.linalg import ReduceOp, YieldOp
+    from xdsl.dialects.tensor import SplatOp
+    from xdsl.ir import Block, Region
+
+    x = operands[0]
+    in_shape = _shape_of(x)
+    if in_shape is None or any(d < 0 for d in in_shape):
+        return _opaque_decomp("aten_any", operands[:1], meta, "bool_reduce", pattern_hint="any")
+    i1 = IntegerType(1)
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    dim = _fx_arg(meta, 1, None)
+    if dim is None:
+        dims = list(range(len(in_shape)))
+    elif isinstance(dim, int):
+        dims = [dim % len(in_shape)]
+    else:
+        dims = [d % len(in_shape) for d in dim]
+    dims = sorted(set(dims))
+    reduced = [s for i, s in enumerate(in_shape) if i not in dims]
+    c0 = ConstantOp(IntegerAttr(0, i1), i1)
+    init = SplatOp(c0.result, [], TensorType(i1, reduced))
+    blk = Block(arg_types=[i1, i1])
+    comb = OrIOp(blk.args[0], blk.args[1])
+    blk.add_op(comb)
+    blk.add_op(YieldOp(comb.results[0]))
+    red = ReduceOp(x, init.results[0], DenseArrayBase.from_list(i64, dims), Region(blk))
+    ops = [c0, init, red]
+    res = red.results[0]
+    if reduced != out_shape:
+        res = _keepdim_reshape(ops, res, reduced, out_shape, i1)
+        if res is None:
+            return _opaque_decomp("aten_any", operands[:1], meta, "bool_reduce", pattern_hint="any")
+    rid = _next_region_id("reduce")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("reduce")
+    return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="any")
+
+
 def decompose_pow_tensor_tensor(operands, meta, node_name):
     """aten.pow.Tensor_Tensor(a, b) -> math.powf via linalg.generic (family: pow)."""
     from xdsl.dialects.math import PowFOp
@@ -2581,7 +2675,7 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.arange.default": decompose_arange,
     "aten.logical_not.default": decompose_logical_not,
     "aten.bitwise_and.Tensor": decompose_bitwise_and,
-    "aten.any.dim": decompose_any_dim,
+    "aten.any.dim": decompose_any_real,
     "aten.index.Tensor": decompose_index_tensor,
     # Comparisons + trig + scan (RoPE / mask construction)
     "aten.eq.Scalar": decompose_compare,
@@ -2626,6 +2720,11 @@ DECOMPOSITION_TABLE.update(
         # copy / pow / minmax extras
         "aten.copy.default": decompose_copy,
         "aten.pow.Tensor_Tensor": decompose_pow_tensor_tensor,
+        "aten.pow.Scalar": decompose_pow_scalar,
+        "aten.slice_scatter.default": decompose_slice_scatter,
+        "aten.any.dim": decompose_any_real,
+        "aten.any.default": decompose_any_real,
+        "aten.any.dims": decompose_any_real,
         "aten.min.other": _make_minmax("MinimumfOp", "minimum"),
         "aten.max.other": _make_minmax("MaximumfOp", "maximum"),
     }
