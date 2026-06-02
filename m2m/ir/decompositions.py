@@ -934,6 +934,124 @@ def decompose_bmm(operands, meta, node_name):
     return DecompResult(ops=[zero, init, gen], result=gen.results[0], region_ids=[rid], pattern_hint="batch_matmul")
 
 
+def decompose_int_mm(operands, meta, node_name):
+    """aten._int_mm(a:i8[M,K], b:i8[K,N]) -> i32[M,N] — the TRUE quantized matmul.
+
+    This is the non-QDQ integer GEMM: sign-extend i8 operands to i32 and accumulate
+    in i32 (linalg.generic contraction, family ``matmul``). No dequantize roundtrip --
+    the low-precision op is preserved for a target that supports int8 matmul natively."""
+    if len(operands) < 2:
+        return _opaque_decomp("aten__int_mm", operands, meta, "matmul", pattern_hint="int_matmul")
+    a, b = operands[0], operands[1]
+    sa, sb = _shape_of(a), _shape_of(b)
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    out_elem = _element_type_from_meta(meta)  # i32
+    if sa is None or sb is None or len(sa) != 2 or len(sb) != 2 or len(out_shape) != 2 \
+            or any(d < 0 for d in [*sa, *sb, *out_shape]):
+        return _opaque_decomp("aten__int_mm", operands, meta, "matmul", pattern_hint="int_matmul")
+
+    from xdsl.dialects.arith import AddiOp, ConstantOp, ExtSIOp, MuliOp
+    from xdsl.dialects.builtin import AffineMapAttr, IntegerAttr, IntegerType
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import SplatOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    if not isinstance(out_elem, IntegerType):
+        out_elem = IntegerType(32)
+    a_elem, b_elem = a.type.element_type, b.type.element_type
+    result_type = TensorType(out_elem, out_shape)
+    zero = ConstantOp(IntegerAttr(0, out_elem), out_elem)
+    init = SplatOp(zero.result, [], result_type)
+    D = AffineExpr.dimension  # (m=0, n=1, k=2)
+    a_map = AffineMap(3, 0, (D(0), D(2)))
+    b_map = AffineMap(3, 0, (D(2), D(1)))
+    o_map = AffineMap(3, 0, (D(0), D(1)))
+    blk = Block(arg_types=[a_elem, b_elem, out_elem])
+    ea = ExtSIOp(blk.args[0], out_elem) if a_elem != out_elem else None
+    eb = ExtSIOp(blk.args[1], out_elem) if b_elem != out_elem else None
+    av = ea.results[0] if ea else blk.args[0]
+    bv = eb.results[0] if eb else blk.args[1]
+    prod = MuliOp(av, bv)
+    acc = AddiOp(blk.args[2], prod.results[0])
+    for op in (ea, eb, prod, acc):
+        if op is not None:
+            blk.add_op(op)
+    blk.add_op(YieldOp(acc.results[0]))
+    par, red = IteratorType.PARALLEL, IteratorType.REDUCTION
+    gen = GenericOp(
+        inputs=[a, b],
+        outputs=[init.results[0]],
+        body=Region(blk),
+        indexing_maps=[AffineMapAttr(a_map), AffineMapAttr(b_map), AffineMapAttr(o_map)],
+        iterator_types=[IteratorTypeAttr(par), IteratorTypeAttr(par), IteratorTypeAttr(red)],
+        result_types=[result_type],
+    )
+    rid = _next_region_id("matmul")
+    for op in (zero, init, gen):
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("matmul")
+    return DecompResult(ops=[zero, init, gen], result=gen.results[0], region_ids=[rid], pattern_hint="int_matmul")
+
+
+def _make_amin_amax(is_min):
+    """aten.amin/amax(input, dim, keepdim) — min/max reduction over dims (family reduce)."""
+    name = "aten_amin" if is_min else "aten_amax"
+
+    def decompose(operands, meta, node_name):
+        from xdsl.dialects.arith import MaxSIOp, MinSIOp
+        from xdsl.dialects.builtin import IntegerType
+
+        x = operands[0]
+        in_shape = _shape_of(x)
+        if in_shape is None or any(d < 0 for d in in_shape):
+            return _opaque_decomp(name, operands[:1], meta, "reduce", pattern_hint="reduce")
+        elem = _t_elem(x)
+        val: Any = meta["val"]
+        out_shape = _static_shape(getattr(val, "shape", []))
+        dims = _fx_arg(meta, 1, None)
+        if dims is None:
+            dims = list(range(len(in_shape)))
+        elif isinstance(dims, int):
+            dims = [dims]
+        else:
+            dims = list(dims)
+        dims = [d % len(in_shape) for d in dims]
+        is_int = isinstance(elem, IntegerType)
+        if is_int:
+            bits = elem.width.data
+            ident = ((1 << (bits - 1)) - 1) if is_min else -(1 << (bits - 1))
+            combine = MinSIOp if is_min else MaxSIOp
+        else:
+            from xdsl.dialects.arith import MaximumfOp, MinimumfOp
+            ident = float("inf") if is_min else float("-inf")
+            combine = MinimumfOp if is_min else MaximumfOp
+        ops, red, rsh = _reduce(x, in_shape, dims, ident, combine, elem)
+        res = red
+        if rsh != out_shape:
+            res = _keepdim_reshape(ops, res, rsh, out_shape, elem)
+            if res is None:
+                return _opaque_decomp(name, operands[:1], meta, "reduce", pattern_hint="reduce")
+        rid = _next_region_id("reduce")
+        for op in ops:
+            _attach_region_id(op, rid)
+            op.attributes["m2m.family"] = StringAttr("reduce")
+        return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="reduce")
+
+    return decompose
+
+
+def decompose_round(operands, meta, node_name):
+    """aten.round.default — round half-to-even (math.roundeven), family elementwise."""
+    from xdsl.dialects.math import RoundEvenOp
+
+    real = _unary_elementwise(operands, meta, "round", _un_build(RoundEvenOp))
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_round", operands[:1], meta, "elementwise", pattern_hint="round")
+
+
 def decompose_native_layer_norm(operands, meta, node_name):
     """aten.native_layer_norm.default(input, normalized_shape, weight, bias, eps).
 
@@ -2793,14 +2911,12 @@ def _element_type_from_meta(meta: dict[str, Any]) -> Any:
         return IntegerType(32)
     if d == torch.int64:
         return IntegerType(64)
-    if hasattr(torch, "float8_e4m3fn") and d == torch.float8_e4m3fn:
-        from m2m.ir.types import Float8E4M3FNType
-
-        return Float8E4M3FNType()
-    if hasattr(torch, "float8_e5m2") and d == torch.float8_e5m2:
-        from m2m.ir.types import Float8E5M2Type
-
-        return Float8E5M2Type()
+    # fp8 flows through compute as f32 (xDSL has no builtin Float8 / closed AnyFloat
+    # union; see _torch_dtype_to_xdsl). The fp8 scheme is recorded as a module attribute.
+    _f8 = {getattr(torch, n, None) for n in ("float8_e4m3fn", "float8_e5m2",
+                                             "float8_e4m3fnuz", "float8_e5m2fnuz", "float8_e8m0fnu")}
+    if d in _f8:
+        return Float32Type()
     return Float32Type()
 
 
@@ -3615,6 +3731,11 @@ DECOMPOSITION_TABLE.update(
         "aten.index_put.default": decompose_index_put,
         "aten.index_put_.default": decompose_index_put,
         "aten._index_put_impl.default": decompose_index_put,
+        # true-quantized (non-QDQ) integer ops
+        "aten._int_mm.default": decompose_int_mm,
+        "aten.amin.default": _make_amin_amax(is_min=True),
+        "aten.amax.default": _make_amin_amax(is_min=False),
+        "aten.round.default": decompose_round,
     }
 )
 for _k in ("eq", "ne", "lt", "le", "gt", "ge"):

@@ -23,16 +23,25 @@ class QuantizationConfig:
     """Quantization configuration.
 
     Attributes:
-        scheme: Quantization scheme (e.g., "int8_weight_only", "int4_weight_only", "fp8").
+        scheme: Default quantization scheme applied to every quantizable module
+            (e.g., "int8_weight_only", "int4_weight_only", "fp8"). Used as a fallback
+            for modules not matched by ``per_module``.
         calibration_samples: Number of calibration samples.
         group_size: Group size for grouped quantization.
         extra_args: Additional scheme-specific arguments.
+        per_module: Optional mixed-precision map ``{name_substring_or_regex: scheme}``.
+            Each rule quantizes modules whose fully-qualified name matches the key with
+            the given scheme -- so one network can mix fp8 + int8 (and leave the rest in
+            full precision). Rules are applied in iteration order; first match wins per
+            module. If ``per_module`` is set and ``scheme`` is left as the sentinel
+            ``"none"``, unmatched modules stay unquantized.
     """
 
     scheme: str
     calibration_samples: int = 100
     group_size: int | None = None
     extra_args: dict[str, Any] = field(default_factory=dict)
+    per_module: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -164,27 +173,62 @@ def apply_quantization(model: Any, config: QuantizationConfig) -> Any:
         except ImportError:
             pass
 
-    factory = scheme_map.get(config.scheme)
-    if factory is None:
-        # Fall back to the scheme catalog (covers fp8 variants, mx, nvfp4, etc.):
-        # resolve the scheme's config_class_path to a TorchAO Config class.
-        from m2m.capture.torchao_schemes import TORCHAO_SCHEMES, resolve_config
+    def _resolve_factory(scheme: str) -> Any:
+        f = scheme_map.get(scheme)
+        if f is None:
+            # Fall back to the scheme catalog (covers fp8 variants, mx, nvfp4, etc.):
+            # resolve the scheme's config_class_path to a TorchAO Config class.
+            from m2m.capture.torchao_schemes import TORCHAO_SCHEMES, resolve_config
 
-        scheme_obj = TORCHAO_SCHEMES.get(config.scheme)
-        if scheme_obj is not None:
-            factory = resolve_config(scheme_obj)
-    if factory is None:
-        raise ValueError(f"Unsupported TorchAO scheme: {config.scheme}")
+            scheme_obj = TORCHAO_SCHEMES.get(scheme)
+            if scheme_obj is not None:
+                f = resolve_config(scheme_obj)
+        if f is None:
+            raise ValueError(f"Unsupported TorchAO scheme: {scheme}")
+        return f
 
-    quantizer = factory()
-    quantize_(model, quantizer)
+    def _reset_swap() -> None:
+        try:
+            torch.__future__.set_swap_module_params_on_conversion(False)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Mixed-precision: apply each per-module rule to the modules whose fully-qualified
+    # name matches its pattern (regex search). One quantize_ call per rule with a
+    # filter_fn; first matching rule wins, so later rules don't re-quantize a module.
+    if config.per_module:
+        import re
+
+        rules = list(config.per_module.items())
+
+        def _matched_earlier(fqn: str, upto: int) -> bool:
+            return any(re.search(pat, fqn) for pat, _ in rules[:upto])
+
+        for i, (pattern, scheme) in enumerate(rules):
+            factory = _resolve_factory(scheme)
+
+            def filter_fn(module: Any, fqn: str, _pat=pattern, _i=i) -> bool:
+                return bool(re.search(_pat, fqn)) and not _matched_earlier(fqn, _i)
+
+            quantize_(model, factory(), filter_fn=filter_fn)
+            _reset_swap()
+        # default scheme (if not the "none" sentinel) covers everything still unmatched
+        if config.scheme and config.scheme != "none":
+            default_factory = _resolve_factory(config.scheme)
+
+            def default_filter(module: Any, fqn: str) -> bool:
+                return not any(re.search(pat, fqn) for pat, _ in rules)
+
+            quantize_(model, default_factory(), filter_fn=default_filter)
+            _reset_swap()
+        return model
+
+    factory = _resolve_factory(config.scheme)
+    quantize_(model, factory())
     # torchao's quantize_ re-enables swap-on-conversion; turn it back off so the
     # subsequent capture (.to()/.eval() on quantized-subclass weights) uses copy
     # semantics and doesn't trip the weakref guard.
-    try:
-        torch.__future__.set_swap_module_params_on_conversion(False)
-    except Exception:  # noqa: BLE001
-        pass
+    _reset_swap()
     return model
 
 

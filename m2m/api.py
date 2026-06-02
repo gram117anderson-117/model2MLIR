@@ -130,6 +130,23 @@ def convert(
         exported_program=exported_program,
         use_torch_mlir=(backend != "fx_importer"),
     )
+    # Record the quantization scheme on the module so the (fp8/int8) quantization
+    # is captured in the IR even when fp8 element types render as f32 (xDSL has no
+    # builtin Float8). Downstream targets read m2m.quantization to recover the scheme.
+    if quantization is not None and result.module is not None:
+        try:
+            from xdsl.dialects.builtin import StringAttr
+
+            scheme = getattr(quantization, "scheme", None) or str(quantization)
+            result.module.attributes["m2m.quantization"] = StringAttr(str(scheme))
+            per_module = getattr(quantization, "per_module", None)
+            if per_module:
+                # serialize the mixed-precision map as "pattern=scheme;pattern=scheme"
+                mixed = ";".join(f"{k}={v}" for k, v in per_module.items())
+                result.module.attributes["m2m.quantization_mixed"] = StringAttr(mixed)
+        except Exception:  # noqa: BLE001
+            pass
+
     mlir_text = result.mlir_text or (module_to_text(result.module) if result.module is not None else "")
     return ConversionResult(
         mlir_text=mlir_text,

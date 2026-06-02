@@ -113,14 +113,19 @@ def _torch_dtype_to_xdsl(dtype: torch.dtype) -> Attribute:
         torch.float16: Float16Type,
         torch.bfloat16: BFloat16Type,
     }
-    # FP8 is a first-class CompGen type (`compgen.float8_e4m3fn`,
-    # `compgen.float8_e5m2`) that mirrors MLIR's semantics.  Earlier
-    # revisions silently demoted to Float16Type; we now preserve the
-    # FP8 semantics so Phase-2 numerics passes see the real type.
-    if hasattr(torch, "float8_e4m3fn") and dtype == torch.float8_e4m3fn:
-        return Float8E4M3FNType()
-    if hasattr(torch, "float8_e5m2") and dtype == torch.float8_e5m2:
-        return Float8E5M2Type()
+    # FP8: torch's float8 dtypes (e4m3fn / e5m2) have MLIR-native equivalents
+    # (f8E4M3FN, f8E5M2) but xDSL 0.65 ships no builtin Float8 type and its
+    # `AnyFloat` is a closed union, so linalg body-builders (transpose/generic)
+    # reject our custom Float8 type with an AnyFloat assertion. Since we can't
+    # patch xDSL (and fp8 here is for representation, not execution), fp8 tensors
+    # flow through the compute path as f32; the exact torchAO fp8 scheme is recorded
+    # as the module attribute `m2m.quantization` so the quantization is still captured.
+    # `Float8E4M3FNType`/`Float8E5M2Type` remain available for a future xDSL that
+    # supports f8 natively (or a torch-mlir round-trip).
+    _f8 = {getattr(torch, n, None) for n in ("float8_e4m3fn", "float8_e5m2",
+                                             "float8_e4m3fnuz", "float8_e5m2fnuz", "float8_e8m0fnu")}
+    if dtype in _f8:
+        return Float32Type()
     # Bool -> i1 (so arith.select conds / comparison results verify) and integers ->
     # their bitwidth, instead of silently defaulting to f32.
     from xdsl.dialects.builtin import IntegerType
