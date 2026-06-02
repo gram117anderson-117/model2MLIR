@@ -1454,18 +1454,39 @@ def decompose_cumsum(operands, meta, node_name):
 
 
 def decompose_slice_tensor(operands, meta, node_name):
-    """aten.slice.Tensor(input, dim, start, end, step) -> tensor slice.
+    """aten.slice.Tensor(input, dim, start, end, step) -> tensor.extract_slice."""
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("aten_slice", operands[:1], meta, "layout", pattern_hint="slice")
+    src = operands[0]
+    in_shape = list(src.type.get_shape())
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    if any(d < 0 for d in in_shape) or any(d < 0 for d in out_shape) or len(out_shape) != len(in_shape):
+        return _opaque_decomp("aten_slice", operands[:1], meta, "layout", pattern_hint="slice")
 
-    All parameters except ``input`` are scalars. Result shape
-    comes from meta.
-    """
-    return _opaque_decomp(
-        "aten_slice",
-        operands[:1],
-        meta,
-        "layout",
-        pattern_hint="slice",
-    )
+    rank = len(in_shape)
+    dim = int(_fx_arg(meta, 1, 0) or 0)
+    if dim < 0:
+        dim += rank
+    start = _fx_arg(meta, 2, 0)
+    start = 0 if start is None else int(start)
+    if start < 0:
+        start += in_shape[dim]
+    step = _fx_arg(meta, 4, 1)
+    step = 1 if step is None else max(1, int(step))
+
+    offsets = [0] * rank
+    offsets[dim] = max(0, min(start, in_shape[dim]))
+    strides = [1] * rank
+    strides[dim] = step
+
+    from xdsl.dialects.tensor import ExtractSliceOp
+
+    op = ExtractSliceOp.from_static_parameters(src, offsets, out_shape, strides)
+    rid = _next_region_id("slice")
+    _attach_region_id(op, rid)
+    op.attributes["m2m.family"] = StringAttr("slice")
+    return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="slice")
 
 
 # ============================================================================
