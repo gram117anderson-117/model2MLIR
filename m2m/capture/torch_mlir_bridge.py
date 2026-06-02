@@ -143,6 +143,7 @@ def bridge_fx_graph(
     allow_fallback: bool = True,
     exported_program: Any | None = None,
     use_torch_mlir: bool = True,
+    emit_named_ops: bool = False,
 ) -> BridgeResult:
     """Convert ``model`` + ``example_inputs`` into an xDSL ModuleOp.
 
@@ -231,7 +232,7 @@ def bridge_fx_graph(
         from m2m.ir.import_fx import FXImporter
 
         exported = exported_program if exported_program is not None else capture_model(model, example_inputs)
-        importer = FXImporter()
+        importer = FXImporter(emit_named_ops=emit_named_ops)
         module = importer.import_graph(exported)
         errors = [d for d in importer.diagnostics if d.level == "error"]
         if errors:

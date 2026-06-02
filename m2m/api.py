@@ -55,6 +55,7 @@ def convert(
     allow_fallback: bool = True,
     decompose: bool = True,
     backend: str = "auto",
+    level: str = "linalg-on-tensors",
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -121,6 +122,9 @@ def convert(
         except Exception:  # noqa: BLE001 - bridge will re-export as a fallback
             exported_program = None
 
+    # The high-level (structured) form is only produced by the FXImporter path -- torch-mlir
+    # always emits standard linalg -- so requesting it forces the FXImporter backend.
+    emit_named = level == "high-level"
     result = bridge_fx_graph(
         model,
         tuple(example_inputs),
@@ -128,7 +132,8 @@ def convert(
         output_type=output_type,
         allow_fallback=allow_fallback,
         exported_program=exported_program,
-        use_torch_mlir=(backend != "fx_importer"),
+        use_torch_mlir=(backend != "fx_importer" and not emit_named),
+        emit_named_ops=emit_named,
     )
     # Stamp the representation level so downstream/merlin knows which contract it received
     # (default portable standard form vs the opt-in structured high-level form).
@@ -136,8 +141,7 @@ def convert(
         try:
             from xdsl.dialects.builtin import StringAttr
 
-            if "m2m.level" not in result.module.attributes:
-                result.module.attributes["m2m.level"] = StringAttr("linalg-on-tensors")
+            result.module.attributes["m2m.level"] = StringAttr(level)
         except Exception:  # noqa: BLE001
             pass
 

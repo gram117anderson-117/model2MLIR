@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from m2m.api import ConversionResult, convert, coverage_report
 from m2m.capture.torch_mlir_bridge import torch_mlir_available
+from m2m.transforms import expand_to_linalg
 
 __version__ = "0.0.1"
 
@@ -24,5 +25,6 @@ __all__ = [
     "__version__",
     "convert",
     "coverage_report",
+    "expand_to_linalg",
     "torch_mlir_available",
 ]

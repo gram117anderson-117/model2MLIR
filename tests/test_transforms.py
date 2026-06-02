@@ -48,9 +48,35 @@ def test_expand_layer_norm_lowers_to_standard():
     assert "linalg_ext.layer_norm" not in _module_to_text(m)
 
 
+def test_high_level_then_expand_equals_standard():
+    """convert(level=high-level) then expand_to_linalg == convert(level=linalg-on-tensors):
+    proves the importer's standard path and the expansion pass are one source of truth."""
+    import torch.nn as nn
+    import m2m
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ln = nn.LayerNorm(16)
+            self.fc = nn.Linear(16, 16)
+
+        def forward(self, x):
+            return torch.softmax(self.fc(self.ln(x)), dim=-1)
+
+    x = (torch.randn(2, 16),)
+    std = m2m.convert(Net().eval(), x, backend="fx_importer", level="linalg-on-tensors")
+    hl = m2m.convert(Net().eval(), x, backend="fx_importer", level="high-level")
+    # high-level form carries the named ops
+    assert "linalg_ext.softmax" in hl.mlir_text and "linalg_ext.layer_norm" in hl.mlir_text
+    # expand the high-level module and compare op histograms to the standard form
+    m2m.expand_to_linalg(hl.module)
+    from m2m.api import module_to_text
+    assert dialect_op_histogram(module_to_text(hl.module)) == dialect_op_histogram(std.mlir_text)
+
+
 def test_every_named_op_has_expander():
     """Registry-completeness: every named op the high-level form can emit must have an
     expansion handler (else expand_to_linalg would leave an unloadable op for backends)."""
-    from m2m.ir import import_fx
-    emittable = getattr(import_fx, "HIGH_LEVEL_NAMED_OPS", {SoftmaxOp, LayerNormOp})
+    from m2m.ir.import_fx import high_level_named_ops
+    emittable = high_level_named_ops()
     assert set(emittable) <= set(EXPANDERS), f"named ops without expander: {set(emittable) - set(EXPANDERS)}"

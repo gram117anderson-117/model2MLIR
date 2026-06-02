@@ -1145,9 +1145,19 @@ def decompose_native_layer_norm(operands, meta, node_name):
     norm_shape = _fx_arg(meta, 1, None)
     k = len(norm_shape) if norm_shape is not None else 1
     eps = _fx_arg(meta, 4, 1e-5)
-    weight = operands[1] if len(operands) >= 2 else None
-    bias = operands[2] if len(operands) >= 3 else None
-    built = build_layer_norm_body(operands[0], weight, bias, eps=eps, k=k)
+    weight = operands[1] if len(operands) >= 2 and isinstance(operands[1].type, TensorType) else None
+    bias = operands[2] if len(operands) >= 3 and isinstance(operands[2].type, TensorType) else None
+    x = operands[0]
+    in_shape = _shape_of(x)
+    if meta.get("_emit_named_ops") and in_shape is not None and not any(d < 0 for d in in_shape):
+        from m2m.ir.linalg_ext.ops import LayerNormOp
+        elem = _t_elem(x)
+        axis = len(in_shape) - k  # first normalized dim
+        op = LayerNormOp(x, TensorType(elem, in_shape), weight=weight, bias=bias, eps=float(eps), axis=axis)
+        rid = _next_region_id("layer_norm")
+        _attach_region_id(op, rid)
+        return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="layer_norm")
+    built = build_layer_norm_body(x, weight, bias, eps=eps, k=k)
     if built is None:
         return _opaque_decomp("aten_native_layer_norm", operands, meta, "layer_norm", pattern_hint="layer_norm")
     ops, res = built
@@ -1244,8 +1254,21 @@ def build_softmax_body(x, *, dim):
 
 
 def decompose_softmax(operands, meta, node_name):
-    """aten._softmax(input, dim, _) -> max/sub/exp/sum/div (family: softmax)."""
-    built = build_softmax_body(operands[0], dim=_fx_arg(meta, 1, -1))
+    """aten._softmax(input, dim, _) -> max/sub/exp/sum/div (family: softmax).
+
+    In high-level mode (``meta['_emit_named_ops']``) emits a single ``linalg_ext.softmax``
+    named op instead of the standard body; the expansion pass lowers it back identically."""
+    x = operands[0]
+    in_shape = _shape_of(x)
+    if meta.get("_emit_named_ops") and in_shape is not None and not any(d < 0 for d in in_shape):
+        from m2m.ir.linalg_ext.ops import SoftmaxOp
+        elem = _t_elem(x)
+        dim = int(_fx_arg(meta, 1, -1)) % len(in_shape)
+        op = SoftmaxOp(x, dim, TensorType(elem, in_shape))
+        rid = _next_region_id("softmax")
+        _attach_region_id(op, rid)
+        return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="softmax")
+    built = build_softmax_body(x, dim=_fx_arg(meta, 1, -1))
     if built is None:
         return _opaque_decomp("aten_softmax", operands, meta, "softmax", pattern_hint="softmax")
     ops, res = built

@@ -130,6 +130,14 @@ def family_of(hint: str | None) -> str | None:
     return _FAMILY_OF.get(hint) if hint else None
 
 
+def high_level_named_ops() -> set:
+    """The named ``*_ext`` op types the high-level form (``emit_named_ops``) can emit.
+    Every one MUST have an expander in ``m2m.transforms.expand_ext.EXPANDERS`` (enforced by
+    tests/test_transforms.py). Lazily imported to avoid a dialect import at module load."""
+    from m2m.ir.linalg_ext.ops import LayerNormOp, SoftmaxOp
+    return {SoftmaxOp, LayerNormOp}
+
+
 # Fallback when a decomposition emitted a named op but set no pattern_hint: infer the
 # (op-kind, family) straight from the MLIR op name, so tagging is 100% regardless of
 # whether each decomposition remembered a hint. Maps op.name -> (m2m.op, m2m.family).
@@ -307,6 +315,7 @@ class FXImporter:
     allow_opaque_fallback: bool = True
     explicit_blackboxes: set[str] = field(default_factory=set)
     dynamic_decompositions: dict[str, DecompFn] = field(default_factory=dict)
+    emit_named_ops: bool = False  # high-level form: emit linalg_ext.* composites
 
     @property
     def decomposition_coverage(self) -> float:
@@ -503,6 +512,7 @@ class FXImporter:
                 meta["_fx_args"] = tuple(node.args)
                 meta["_fx_kwargs"] = dict(node.kwargs)
                 meta["_aten_target"] = target_str  # provenance: source aten op
+                meta["_emit_named_ops"] = self.emit_named_ops  # high-level form toggle
                 try:
                     result = decomp_fn(operands, meta, node.name)
                 except (IndexError, KeyError, TypeError) as decomp_err:
