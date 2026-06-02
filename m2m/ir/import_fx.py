@@ -363,11 +363,16 @@ class FXImporter:
                     )
                 continue
 
-            # Resolve operands
+            # Resolve operands. Flatten list/tuple args (e.g. cat/stack take a tensor
+            # list as their first arg) so the decomposition sees all tensor operands.
             operands: list[SSAValue] = []
             for arg in node.args:
                 if hasattr(arg, "name") and arg.name in value_map:
                     operands.append(value_map[arg.name])
+                elif isinstance(arg, (list, tuple)):
+                    for sub in arg:
+                        if hasattr(sub, "name") and sub.name in value_map:
+                            operands.append(value_map[sub.name])
 
             # Try decomposition table first
             decomp_fn = self.dynamic_decompositions.get(target_str, DECOMPOSITION_TABLE.get(target_str))

@@ -1470,15 +1470,25 @@ def decompose_cat(operands, meta, node_name):
     Concat preserves the tensor inputs but not the scalar ``dim`` — the
     lowering wave will read the axis from node.args[1].
     """
-    # The first positional arg is a list of tensors; FX expands that
-    # list onto operands, so everything that's already an SSAValue stays.
-    return _opaque_decomp(
-        "aten_cat",
-        operands,
-        meta,
-        "layout",
-        pattern_hint="cat",
-    )
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    elem = _element_type_from_meta(meta)
+    if (
+        len(operands) >= 1
+        and not any(d < 0 for d in out_shape)
+        and all(isinstance(o.type, TensorType) and o.type.element_type == elem for o in operands)
+    ):
+        dim = int(_fx_arg(meta, 1, 0) or 0)
+        if dim < 0:
+            dim += len(out_shape)
+        from xdsl.dialects.tensor import ConcatOp
+
+        op = ConcatOp(inputs=list(operands), dim=dim, result_type=TensorType(elem, out_shape))
+        rid = _next_region_id("cat")
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("concat")
+        return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="cat")
+    return _opaque_decomp("aten_cat", operands, meta, "layout", pattern_hint="cat")
 
 
 def decompose_split_with_sizes(operands, meta, node_name):
