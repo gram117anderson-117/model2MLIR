@@ -147,6 +147,95 @@ def _emit_reshape(source: SSAValue, out_shape: list[int], elem: Any):
     return ops, reshape.results[0]
 
 
+def _elementwise(inputs: list[SSAValue], result_type: TensorType, scalar_build):
+    """Emit a ``linalg.generic`` elementwise op (identity maps, all-parallel).
+
+    ``inputs`` must all have ``result_type``'s shape (splat scalars first).
+    ``scalar_build(args, out_elem) -> (ops, yield_ssa)`` builds the scalar body from the
+    per-element block args. Returns ``(ops, result_ssa)`` or ``None`` on dynamic shape.
+    """
+    shape = result_type.get_shape()
+    if any(d < 0 for d in shape):
+        return None
+
+    # xDSL's bf16 constant/pack handling is unreliable (NotImplementedError / f32
+    # fallback), which yields invalid IR inside the generic body. A single invalid op
+    # fails the whole module, so bail to an opaque placeholder for bf16 elementwise.
+    from xdsl.dialects.builtin import BFloat16Type
+
+    if isinstance(result_type.element_type, BFloat16Type) or any(
+        isinstance(inp.type.element_type, BFloat16Type) for inp in inputs  # type: ignore[union-attr]
+    ):
+        return None
+
+    from xdsl.dialects.builtin import AffineMapAttr
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import EmptyOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineMap
+
+    rank = len(shape)
+    out_elem = result_type.element_type
+    empty = EmptyOp([], result_type)
+
+    in_elems = [inp.type.element_type for inp in inputs]  # type: ignore[union-attr]
+    block = Block(arg_types=[*in_elems, out_elem])
+    body_ops, yield_ssa = scalar_build(list(block.args[: len(inputs)]), out_elem)
+    for op in body_ops:
+        block.add_op(op)
+    block.add_op(YieldOp(yield_ssa))
+
+    idmap = AffineMapAttr(AffineMap.identity(rank))
+    generic = GenericOp(
+        inputs=list(inputs),
+        outputs=[empty.results[0]],
+        body=Region(block),
+        indexing_maps=[idmap] * (len(inputs) + 1),
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * rank,
+        result_types=[result_type],
+    )
+    return [empty, generic], generic.results[0]
+
+
+def _splat_scalar(scalar: Any, result_type: TensorType):
+    """Build a full-shape constant tensor by splatting a scalar (for binary-with-scalar)."""
+    from xdsl.dialects.arith import ConstantOp
+    from xdsl.dialects.builtin import FloatAttr, IntegerAttr, IntegerType
+    from xdsl.dialects.tensor import SplatOp
+
+    elem = result_type.element_type
+    if any(d < 0 for d in result_type.get_shape()):
+        return None
+    if isinstance(elem, IntegerType):
+        const = ConstantOp(IntegerAttr(int(scalar), elem), elem)
+    else:
+        const = ConstantOp(FloatAttr(float(scalar), elem), elem)
+    splat = SplatOp(const.result, [], result_type)
+    return [const, splat], splat.results[0]
+
+
+def _cast_scalar_build(target_elem):
+    """scalar_build for a dtype cast: float trunc/ext or int<->float, picked by types."""
+    from xdsl.dialects.arith import ExtFOp, FPToSIOp, SIToFPOp, TruncFOp
+    from xdsl.dialects.builtin import AnyFloat, IntegerType
+
+    def build(args, out_elem):
+        x = args[0]
+        src = x.type
+        dst = target_elem
+        if isinstance(src, AnyFloat) and isinstance(dst, AnyFloat):
+            op = TruncFOp(x, dst) if dst.bitwidth < src.bitwidth else ExtFOp(x, dst)
+        elif isinstance(src, IntegerType) and isinstance(dst, AnyFloat):
+            op = SIToFPOp(x, dst)
+        elif isinstance(src, AnyFloat) and isinstance(dst, IntegerType):
+            op = FPToSIOp(x, dst)
+        else:
+            op = ExtFOp(x, dst)  # best-effort
+        return [op], op.results[0]
+
+    return build
+
+
 # ============================================================================
 # Decomposition functions
 # ============================================================================
@@ -261,6 +350,111 @@ def _coerce_static_dim(d: Any) -> int:
         return -1
 
 
+def _shape_of(ssa: SSAValue) -> list[int] | None:
+    t = ssa.type
+    if isinstance(t, TensorType):
+        return list(t.get_shape())
+    return None
+
+
+def _binary_elementwise(operands, meta, op_name, scalar_build):
+    """Binary elementwise via linalg.generic. Handles (tensor, scalar) by splatting.
+
+    Returns a DecompResult, or None to signal the caller to use the opaque fallback
+    (dynamic shapes, or operand shapes that don't already match the result -> broadcast,
+    which we don't emit yet)."""
+    val: Any = meta["val"]
+    out_shape = [_coerce_static_dim(d) for d in val.shape]
+    if any(d < 0 for d in out_shape):
+        return None
+    lhs0_type = operands[0].type if operands else None
+    if not isinstance(lhs0_type, TensorType):
+        return None
+    # Emit a real op ONLY when operand dtype(s) are consistent with the meta result
+    # dtype. The importer's meta/SSA dtypes can diverge; the old opaque path hid this
+    # by typing everything from meta. A real op with a divergent result dtype breaks
+    # the downstream consumer (which expects the meta dtype) -> bail to opaque.
+    elem = _element_type_from_meta(meta)
+    if lhs0_type.element_type != elem:
+        return None
+    result_type = TensorType(elem, out_shape)
+
+    pre: list[Operation] = []
+    if len(operands) >= 2:
+        lhs, rhs = operands[0], operands[1]
+        rt = rhs.type
+        if not isinstance(rt, TensorType) or rt.element_type != elem:
+            return None
+    elif len(operands) == 1:
+        sp = _splat_scalar(_fx_arg(meta, 1, 0), result_type)
+        if sp is None:
+            return None
+        pre, rhs = sp[0], sp[1]
+        lhs = operands[0]
+    else:
+        return None
+
+    # We only emit identity-map elementwise when both operands already match the
+    # result shape; broadcasting (e.g. [M,N] + [N]) needs non-identity maps -> opaque.
+    if _shape_of(lhs) != out_shape or _shape_of(rhs) != out_shape:
+        return None
+
+    em = _elementwise([lhs, rhs], result_type, scalar_build)
+    if em is None:
+        return None
+    ops, res = em
+    rid = _next_region_id(op_name)
+    for op in (*pre, *ops):
+        _attach_region_id(op, rid)
+    return DecompResult(ops=[*pre, *ops], result=res, region_ids=[rid], pattern_hint=op_name)
+
+
+def _unary_elementwise(operands, meta, op_name, scalar_build, out_elem=None):
+    """Unary elementwise via linalg.generic. Returns DecompResult or None (opaque).
+
+    Result dtype defaults to the operand's dtype (dtype-preserving ops); pass
+    ``out_elem`` for casts (where the output dtype differs from the input)."""
+    src_type = operands[0].type if operands else None
+    if not isinstance(src_type, TensorType):
+        return None
+    val: Any = meta["val"]
+    out_shape = [_coerce_static_dim(d) for d in val.shape]
+    if any(d < 0 for d in out_shape):
+        return None
+    meta_elem = _element_type_from_meta(meta)
+    if out_elem is None:
+        # dtype-preserving op: require operand dtype == meta dtype (consistency), else opaque.
+        if src_type.element_type != meta_elem:
+            return None
+        elem = meta_elem
+    else:
+        # cast: result dtype is the explicit target; input dtype may differ (that's the cast).
+        elem = out_elem
+    result_type = TensorType(elem, out_shape)
+    em = _elementwise([operands[0]], result_type, scalar_build)
+    if em is None:
+        return None
+    ops, res = em
+    rid = _next_region_id(op_name)
+    for op in ops:
+        _attach_region_id(op, rid)
+    return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint=op_name)
+
+
+def _bin_build(arith_cls):
+    def build(args, out_elem):
+        op = arith_cls(args[0], args[1])
+        return [op], op.results[0]
+    return build
+
+
+def _un_build(op_cls):
+    def build(args, out_elem):
+        op = op_cls(args[0])
+        return [op], op.results[0]
+    return build
+
+
 def _scalar_to_tensor(scalar: Any, like_type: TensorType) -> tuple[list[Operation], SSAValue]:
     """Materialize a Python scalar as a constant tensor matching ``like_type``.
 
@@ -341,12 +535,16 @@ def decompose_add_tensor(
     elem = _element_type_from_meta(meta)
     result_type = TensorType(elem, [_coerce_static_dim(d) for d in val.shape])
 
-    pre, lhs, rhs = _binary_operands(operands, meta)
+    from xdsl.dialects.arith import AddfOp
 
+    real = _binary_elementwise(operands, meta, "add", _bin_build(AddfOp))
+    if real is not None:
+        return real
+
+    pre, lhs, rhs = _binary_operands(operands, meta)
     rid = _next_region_id("add")
     call = CallOp("aten_add", [lhs, rhs], [result_type])
     _attach_region_id(call, rid)
-
     return DecompResult(ops=[*pre, call], result=call.res[0], region_ids=[rid])
 
 
@@ -365,12 +563,16 @@ def decompose_mul_tensor(
     elem = _element_type_from_meta(meta)
     result_type = TensorType(elem, [_coerce_static_dim(d) for d in val.shape])
 
-    pre, lhs, rhs = _binary_operands(operands, meta)
+    from xdsl.dialects.arith import MulfOp
 
+    real = _binary_elementwise(operands, meta, "mul", _bin_build(MulfOp))
+    if real is not None:
+        return real
+
+    pre, lhs, rhs = _binary_operands(operands, meta)
     rid = _next_region_id("mul")
     call = CallOp("aten_mul", [lhs, rhs], [result_type])
     _attach_region_id(call, rid)
-
     return DecompResult(ops=[*pre, call], result=call.res[0], region_ids=[rid])
 
 
@@ -572,14 +774,13 @@ def decompose_softmax(operands, meta, node_name):
 
 
 def decompose_rsqrt(operands, meta, node_name):
-    """aten.rsqrt.default(input) -> math.rsqrt (opaque call MVP)."""
-    return _opaque_decomp(
-        "aten_rsqrt",
-        operands,
-        meta,
-        "rsqrt",
-        pattern_hint="rsqrt",
-    )
+    """aten.rsqrt.default(input) -> math.rsqrt via linalg.generic."""
+    from xdsl.dialects.math import RsqrtOp
+
+    real = _unary_elementwise(operands, meta, "rsqrt", _un_build(RsqrtOp))
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_rsqrt", operands, meta, "rsqrt", pattern_hint="rsqrt")
 
 
 def decompose_pow_tensor_scalar(operands, meta, node_name):
@@ -782,70 +983,95 @@ def decompose_embedding(operands, meta, node_name):
     )
 
 
+def _sigmoid_build(args, out_elem):
+    """sigmoid(x) = 1 / (1 + exp(-x))."""
+    from xdsl.dialects.arith import AddfOp, ConstantOp, DivfOp, NegfOp
+    from xdsl.dialects.builtin import FloatAttr
+    from xdsl.dialects.math import ExpOp
+
+    x = args[0]
+    one = ConstantOp(FloatAttr(1.0, out_elem), out_elem)
+    neg = NegfOp(x)
+    ex = ExpOp(neg.results[0])
+    den = AddfOp(one.results[0], ex.results[0])
+    r = DivfOp(one.results[0], den.results[0])
+    return [one, neg, ex, den, r], r.results[0]
+
+
+def _silu_build(args, out_elem):
+    """silu(x) = x * sigmoid(x)."""
+    from xdsl.dialects.arith import MulfOp
+
+    ops, sig = _sigmoid_build(args, out_elem)
+    m = MulfOp(args[0], sig)
+    return [*ops, m], m.results[0]
+
+
 def decompose_sigmoid(operands, meta, node_name):
-    """aten.sigmoid.default(input) -> elementwise sigmoid (MVP: opaque)."""
-    return _opaque_decomp(
-        "aten_sigmoid",
-        operands,
-        meta,
-        "elementwise",
-        pattern_hint="sigmoid",
-    )
+    """aten.sigmoid.default(input) -> 1/(1+exp(-x)) via linalg.generic."""
+    real = _unary_elementwise(operands, meta, "sigmoid", _sigmoid_build)
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_sigmoid", operands, meta, "elementwise", pattern_hint="sigmoid")
 
 
 def decompose_neg(operands, meta, node_name):
-    """aten.neg.default(input) -> elementwise negation."""
-    return _opaque_decomp(
-        "aten_neg",
-        operands,
-        meta,
-        "elementwise",
-        pattern_hint="neg",
-    )
+    """aten.neg.default(input) -> arith.negf via linalg.generic."""
+    from xdsl.dialects.arith import NegfOp
+
+    real = _unary_elementwise(operands, meta, "neg", _un_build(NegfOp))
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_neg", operands, meta, "elementwise", pattern_hint="neg")
 
 
 def decompose_silu(operands, meta, node_name):
-    """aten.silu.default(input) -> elementwise silu (used in many MLPs)."""
-    return _opaque_decomp(
-        "aten_silu",
-        operands,
-        meta,
-        "elementwise",
-        pattern_hint="silu",
-    )
+    """aten.silu.default(input) -> x*sigmoid(x) via linalg.generic."""
+    real = _unary_elementwise(operands, meta, "silu", _silu_build)
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_silu", operands, meta, "elementwise", pattern_hint="silu")
 
 
 def decompose_sub_tensor(operands, meta, node_name):
-    """aten.sub.Tensor(a, b, alpha?) -> elementwise sub."""
-    return _opaque_decomp(
-        "aten_sub",
-        operands[:2],
-        meta,
-        "elementwise",
-        pattern_hint="sub",
-    )
+    """aten.sub.Tensor(a, b) -> arith.subf via linalg.generic."""
+    from xdsl.dialects.arith import SubfOp
+
+    real = _binary_elementwise(operands, meta, "sub", _bin_build(SubfOp))
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_sub", operands[:2], meta, "elementwise", pattern_hint="sub")
 
 
 def decompose_div_tensor(operands, meta, node_name):
-    """aten.div.Tensor(a, b) -> elementwise div."""
-    return _opaque_decomp(
-        "aten_div",
-        operands[:2],
-        meta,
-        "elementwise",
-        pattern_hint="div",
-    )
+    """aten.div.Tensor(a, b) -> arith.divf via linalg.generic."""
+    from xdsl.dialects.arith import DivfOp
+
+    real = _binary_elementwise(operands, meta, "div", _bin_build(DivfOp))
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_div", operands[:2], meta, "elementwise", pattern_hint="div")
 
 
 # ---- layout / structural (preserve shape metadata; no compute) ----
 
 
 def _reshape_decomp(operands, meta, node_name, *, hint: str, prefix: str):
-    """Shared logical-reshape decomposition (view/reshape/unsqueeze/squeeze/flatten)."""
+    """Shared logical-reshape decomposition (view/reshape/unsqueeze/squeeze/flatten).
+
+    tensor.reshape preserves the element type, so the result dtype MUST equal the
+    source SSA's dtype (meta['val'].dtype can disagree, e.g. bf16/f32), or module
+    verification fails."""
     val: Any = meta["val"]
-    elem = _element_type_from_meta(meta)
+    src_type = operands[0].type
+    meta_elem = _element_type_from_meta(meta)
+    # reshape preserves dtype (source elem must == result elem), AND the result must
+    # match the meta dtype the downstream consumers expect. Only emit when source SSA
+    # dtype and meta dtype agree; otherwise fall back to opaque (typed from meta).
+    if not isinstance(src_type, TensorType) or src_type.element_type != meta_elem:
+        return _opaque_decomp(f"aten_{prefix}", operands[:1], meta, "layout", pattern_hint=hint)
     out_shape = _static_shape(val.shape)
-    emitted = _emit_reshape(operands[0], out_shape, elem)
+    emitted = _emit_reshape(operands[0], out_shape, meta_elem)
     if emitted is None:
         return _opaque_decomp(f"aten_{prefix}", operands[:1], meta, "layout", pattern_hint=hint)
     ops, result = emitted
@@ -1006,7 +1232,11 @@ def decompose_matmul(operands, meta, node_name):
 
 
 def decompose_to_copy(operands, meta, node_name):
-    """aten._to_copy.default — dtype/device cast. Emits a DTYPE_CAST kernel."""
+    """aten._to_copy.default — dtype cast via linalg.generic (arith.trunc/ext/sitofp)."""
+    target_elem = _element_type_from_meta(meta)
+    real = _unary_elementwise(operands, meta, "dtype_cast", _cast_scalar_build(target_elem), out_elem=target_elem)
+    if real is not None:
+        return real
     return _opaque_decomp("aten_to_dtype", operands[:1], meta, "cast", pattern_hint="dtype_cast")
 
 
@@ -1064,12 +1294,22 @@ def decompose_compare(operands, meta, node_name):
 
 
 def decompose_cos(operands, meta, node_name):
-    """aten.cos.default — pointwise cosine (RoPE)."""
+    """aten.cos.default — math.cos via linalg.generic (RoPE)."""
+    from xdsl.dialects.math import CosOp
+
+    real = _unary_elementwise(operands, meta, "cos", _un_build(CosOp))
+    if real is not None:
+        return real
     return _opaque_decomp("aten_cos", operands[:1], meta, "trig", pattern_hint="cos")
 
 
 def decompose_sin(operands, meta, node_name):
-    """aten.sin.default — pointwise sine (RoPE)."""
+    """aten.sin.default — math.sin via linalg.generic (RoPE)."""
+    from xdsl.dialects.math import SinOp
+
+    real = _unary_elementwise(operands, meta, "sin", _un_build(SinOp))
+    if real is not None:
+        return real
     return _opaque_decomp("aten_sin", operands[:1], meta, "trig", pattern_hint="sin")
 
 

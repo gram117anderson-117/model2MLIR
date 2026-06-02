@@ -382,28 +382,47 @@ class FXImporter:
                         )
                     )
                 else:
-                    for op in result.ops:
-                        if isinstance(op, CallOp):
-                            ensure_external_decl(op)
-                        _forward_fx_meta(op, meta, result.pattern_hint)
-                        block.add_op(op)
+                    # Verify the emitted ops before committing them. A single invalid op
+                    # (e.g. a decomposition that hardcoded f32 for a bf16 tensor) would
+                    # fail whole-module verification and lose the entire lowering, so on
+                    # any verification failure we discard and fall through to the opaque
+                    # path (typed from meta, which is always consistent downstream).
+                    verify_err = None
+                    try:
+                        for op in result.ops:
+                            op.verify()
+                    except Exception as verr:  # noqa: BLE001
+                        verify_err = verr
+                    if verify_err is None:
+                        for op in result.ops:
+                            if isinstance(op, CallOp):
+                                ensure_external_decl(op)
+                            _forward_fx_meta(op, meta, result.pattern_hint)
+                            block.add_op(op)
 
-                    if result.result is not None:
-                        value_map[node.name] = result.result
+                        if result.result is not None:
+                            value_map[node.name] = result.result
 
-                    self.decomposed_count += 1
-                    hint_suffix = f", hint: {result.pattern_hint}" if result.pattern_hint else ""
+                        self.decomposed_count += 1
+                        hint_suffix = f", hint: {result.pattern_hint}" if result.pattern_hint else ""
+                        self.diagnostics.append(
+                            ImportDiagnostic(
+                                fx_node=node.name,
+                                level="info",
+                                message=(
+                                    f"Decomposed {target_str} -> {len(result.ops)} ops "
+                                    f"(regions: {result.region_ids}{hint_suffix})"
+                                ),
+                            )
+                        )
+                        continue
                     self.diagnostics.append(
                         ImportDiagnostic(
                             fx_node=node.name,
-                            level="info",
-                            message=(
-                                f"Decomposed {target_str} -> {len(result.ops)} ops "
-                                f"(regions: {result.region_ids}{hint_suffix})"
-                            ),
+                            level="warning",
+                            message=f"Decomposition for {target_str} produced invalid IR ({verify_err}); opaque fallback",
                         )
                     )
-                    continue
 
             if not self.allow_opaque_fallback and target_str not in self.explicit_blackboxes:
                 self.diagnostics.append(
