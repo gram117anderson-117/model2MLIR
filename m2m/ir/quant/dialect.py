@@ -21,12 +21,12 @@ ALL_ATTRS = [
     NVFP4TensorType,
 ]
 
-Quant = Dialect("m2m.quant", ALL_OPS, ALL_ATTRS)
+Quant = Dialect("quant_ext", ALL_OPS, ALL_ATTRS)
 """The quantization dialect.
 
 Register on a ``Context`` with::
 
-    ctx.register_dialect("m2m.quant", lambda: Quant)
+    ctx.register_dialect("quant_ext", lambda: Quant)
 """
 
 

@@ -8,7 +8,7 @@ and  ``normalize_subbyte`` passes have a real destination.
 
 Register on a ``Context`` with::
 
-    ctx.register_dialect("m2m.tensor_ext", lambda: TensorExt)
+    ctx.register_dialect("tensor_ext", lambda: TensorExt)
 """
 
 from __future__ import annotations

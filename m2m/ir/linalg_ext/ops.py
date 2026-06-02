@@ -1,4 +1,4 @@
-"""Named high-level structured ops for the ``compgen.linalg_ext`` dialect.
+"""Named high-level structured ops for the ``linalg_ext`` dialect.
 
 Each op is ``Pure`` and carries explicit typed operands so the dialect
 is usable as both a destination for ``raise_special_ops`` and a source
@@ -62,7 +62,7 @@ class SoftmaxOp(IRDLOperation):
     sum(exp(x - max(x, axis=dim)), axis=dim)``.
     """
 
-    name = "m2m.linalg_ext.softmax"
+    name = "linalg_ext.softmax"
 
     input = operand_def(Attribute)
     result = result_def(Attribute)
@@ -111,7 +111,7 @@ class LayerNormOp(IRDLOperation):
             ``len(normalized_shape) + axis`` dims are normalized).
     """
 
-    name = "m2m.linalg_ext.layer_norm"
+    name = "linalg_ext.layer_norm"
 
     input = operand_def(Attribute)
     weight = opt_operand_def(Attribute)
@@ -168,7 +168,7 @@ class RMSNormOp(IRDLOperation):
     ``out = x * weight / sqrt(mean(x**2, axis=-1, keepdim=True) + eps)``.
     """
 
-    name = "m2m.linalg_ext.rms_norm"
+    name = "linalg_ext.rms_norm"
 
     input = operand_def(Attribute)
     weight = opt_operand_def(Attribute)
@@ -210,7 +210,7 @@ class RoPEOp(IRDLOperation):
     Produces a pair (q_rot, k_rot) with the same shape as q, k.
     """
 
-    name = "m2m.linalg_ext.rope"
+    name = "linalg_ext.rope"
 
     q = operand_def(Attribute)
     k = operand_def(Attribute)
@@ -276,7 +276,7 @@ class RoPEOp(IRDLOperation):
 class SwiGLUOp(IRDLOperation):
     """``swiglu(gate, up) = silu(gate) * up`` (LLaMA-style MLP gate)."""
 
-    name = "m2m.linalg_ext.swiglu"
+    name = "linalg_ext.swiglu"
 
     gate = operand_def(Attribute)
     up = operand_def(Attribute)
@@ -307,7 +307,7 @@ class GeluOp(IRDLOperation):
     ``torch.nn.functional.gelu(approximate=...)``.
     """
 
-    name = "m2m.linalg_ext.gelu"
+    name = "linalg_ext.gelu"
 
     input = operand_def(Attribute)
     result = result_def(Attribute)
@@ -347,7 +347,7 @@ class GeluOp(IRDLOperation):
 class SiluOp(IRDLOperation):
     """``silu(x) = x * sigmoid(x)`` (aka Swish-1)."""
 
-    name = "m2m.linalg_ext.silu"
+    name = "linalg_ext.silu"
 
     input = operand_def(Attribute)
     result = result_def(Attribute)

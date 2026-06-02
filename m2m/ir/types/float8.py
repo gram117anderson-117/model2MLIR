@@ -97,7 +97,7 @@ class Float8E4M3FNType(_Float8Base):
     paths.
     """
 
-    name = "m2m.float8_e4m3fn"
+    name = "builtin_ext.f8E4M3FN"
 
     EXPONENT_BITS: ClassVar[int] = 4
     MANTISSA_BITS: ClassVar[int] = 3
@@ -117,7 +117,7 @@ class Float8E5M2Type(_Float8Base):
     precision.
     """
 
-    name = "m2m.float8_e5m2"
+    name = "builtin_ext.f8E5M2"
 
     EXPONENT_BITS: ClassVar[int] = 5
     MANTISSA_BITS: ClassVar[int] = 2

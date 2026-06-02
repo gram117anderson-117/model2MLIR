@@ -17,7 +17,7 @@ calls. The dialect owns:
 
 Register the dialect on a ``Context`` via::
 
-    ctx.register_dialect("m2m.quant", lambda: Quant)
+    ctx.register_dialect("quant_ext", lambda: Quant)
 """
 
 from __future__ import annotations

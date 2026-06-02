@@ -72,7 +72,7 @@ class ConcatOp(IRDLOperation):
     sum of each input's extent along ``dim``.
     """
 
-    name = "m2m.tensor_ext.concat"
+    name = "tensor_ext.concat"
 
     inputs = var_operand_def(Attribute)
     result = result_def(Attribute)
@@ -175,7 +175,7 @@ class PackOp(IRDLOperation):
     inner tiles in the order given by ``inner_dims_pos``.
     """
 
-    name = "m2m.tensor_ext.pack"
+    name = "tensor_ext.pack"
 
     source = operand_def(Attribute)
     padding_value = opt_operand_def(Attribute)
@@ -272,7 +272,7 @@ class UnpackOp(IRDLOperation):
     ``source rank - len(inner_dims_pos)``.
     """
 
-    name = "m2m.tensor_ext.unpack"
+    name = "tensor_ext.unpack"
 
     source = operand_def(Attribute)
     result = result_def(Attribute)

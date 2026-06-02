@@ -1,4 +1,4 @@
-"""Registration of the ``compgen.linalg_ext`` dialect."""
+"""Registration of the ``linalg_ext`` dialect."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ from m2m.ir.linalg_ext.ops import LINALG_EXT_OPS
 ALL_OPS = list(LINALG_EXT_OPS)
 ALL_ATTRS: list = []
 
-LinalgExt = Dialect("m2m.linalg_ext", ALL_OPS, ALL_ATTRS)
+LinalgExt = Dialect("linalg_ext", ALL_OPS, ALL_ATTRS)
 """Register on a ``Context`` with
-``ctx.register_dialect('compgen.linalg_ext', lambda: LinalgExt)``."""
+``ctx.register_dialect('linalg_ext', lambda: LinalgExt)``."""
 
 
 __all__ = ["ALL_ATTRS", "ALL_OPS", "LinalgExt"]

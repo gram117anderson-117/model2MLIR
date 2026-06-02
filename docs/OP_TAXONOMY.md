@@ -42,10 +42,18 @@ For ops that are semantically distinct AND awkward to match as a tagged generic/
 attention-shaped composites and irregular structural ops — prefer a **named op** in an
 extension dialect over a bespoke generic. These already exist:
 
-- `m2m.linalg_ext`: `softmax`, `layer_norm`, `rms_norm`, `rope`, `swiglu`, `gelu`, `silu`
-- `m2m.tensor_ext`: `concat`, `pack`, `unpack`
-- `m2m.quant`:      `quantize/dequantize_per_{tensor,channel,group}`, `weight_int{4,8}pack_mm`,
+- `linalg_ext`: `softmax`, `layer_norm`, `rms_norm`, `rope`, `swiglu`, `gelu`, `silu`
+- `tensor_ext`: `concat`, `pack`, `unpack`
+- `quant_ext`:  `quantize/dequantize_per_{tensor,channel,group}`, `weight_int{4,8}pack_mm`,
   `choose_qparams_*`
+
+Naming convention: extension dialects use **bare, standard-adjacent** names (`linalg_ext`
+reads as "an extension of linalg", portable / close to upstream MLIR) — *not* a vendor
+prefix. `quant_ext` is named to avoid colliding with MLIR's real `quant` dialect. FP8 types
+mirror the MLIR-native spelling (`!builtin_ext.f8E4M3FN`) so swapping to native xDSL f8 later
+is trivial. Only the **discardable annotation attributes** keep a namespace prefix (`m2m.op`,
+`m2m.family`, `m2m.region_id`, …) — MLIR requires one, and standard tooling simply ignores
+them, so the *ops* stay standard MLIR.
 
 A named op is matched by **op type** (the strongest possible match) and carries its
 parameters as attributes. A single **expansion/legalization pass** then lowers each named

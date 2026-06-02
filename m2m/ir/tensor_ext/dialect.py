@@ -9,10 +9,10 @@ from m2m.ir.tensor_ext.ops import TENSOR_EXT_OPS
 ALL_OPS = list(TENSOR_EXT_OPS)
 ALL_ATTRS: list = []
 
-TensorExt = Dialect("m2m.tensor_ext", ALL_OPS, ALL_ATTRS)
+TensorExt = Dialect("tensor_ext", ALL_OPS, ALL_ATTRS)
 """The tensor-ext dialect.
 
-Register with ``ctx.register_dialect("m2m.tensor_ext", lambda: TensorExt)``.
+Register with ``ctx.register_dialect("tensor_ext", lambda: TensorExt)``.
 """
 
 

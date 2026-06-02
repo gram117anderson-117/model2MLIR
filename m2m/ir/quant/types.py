@@ -99,7 +99,7 @@ class AffineQuantizedTensorType(ParametrizedAttribute):
         layout: one of the TorchAO layouts in ``_VALID_AFFINE_LAYOUTS``.
     """
 
-    name = "m2m.quant.affine_tensor"
+    name = "quant_ext.affine_tensor"
 
     storage_type: Attribute = param_def(Attribute)
     scale_dtype: Attribute = param_def(Attribute)
@@ -154,7 +154,7 @@ class PackedIntTensorType(ParametrizedAttribute):
             ``IntegerType(8)`` when packing 4-bit values two-per-byte).
     """
 
-    name = "m2m.quant.packed_int_tensor"
+    name = "quant_ext.packed_int_tensor"
 
     bit_width: IntegerAttr = param_def(IntegerAttr)
     pack_dim: IntegerAttr = param_def(IntegerAttr)
@@ -193,7 +193,7 @@ class MXQuantizedTensorType(ParametrizedAttribute):
             ``"fp32"`` for debug/reference builds.
     """
 
-    name = "m2m.quant.mx_tensor"
+    name = "quant_ext.mx_tensor"
 
     element_bit_width: IntegerAttr = param_def(IntegerAttr)
     block_size: IntegerAttr = param_def(IntegerAttr)
@@ -246,7 +246,7 @@ class NVFP4TensorType(ParametrizedAttribute):
             ``Float32Type`` or ``BFloat16Type``).
     """
 
-    name = "m2m.quant.nvfp4_tensor"
+    name = "quant_ext.nvfp4_tensor"
 
     block_size: IntegerAttr = param_def(IntegerAttr)
     scale_dtype: Attribute = param_def(Attribute)
