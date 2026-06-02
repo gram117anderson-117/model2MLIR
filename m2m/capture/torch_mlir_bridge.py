@@ -272,11 +272,27 @@ def bridge_fx_graph_or_raise(
     return result.module
 
 
+# xDSL has no builtin Float8, so our shim types print as `!builtin_ext.f8E4M3FN`. On TEXT
+# emission we render the MLIR-native spelling (`f8E4M3FN`) so the artifact a standard MLIR
+# toolchain receives uses native f8 types; the custom type stays internal for IR manipulation.
+# When xDSL gains native f8 (or we route fp8 through torch-mlir) this shim is dropped.
+_NATIVE_F8 = {
+    "!builtin_ext.f8E4M3FN": "f8E4M3FN",
+    "!builtin_ext.f8E5M2": "f8E5M2",
+    "!builtin_ext.f8E8M0FNU": "f8E8M0FNU",
+}
+
+
 def module_to_text(module: ModuleOp) -> str:
-    """Pretty-print an xDSL ModuleOp as MLIR text (for debugging)."""
+    """Pretty-print an xDSL ModuleOp as MLIR text, rendering shim fp8 types with their
+    MLIR-native spelling (``f8E4M3FN`` etc.) for portability."""
     buf = io.StringIO()
     Printer(stream=buf).print(module)
-    return buf.getvalue()
+    text = buf.getvalue()
+    for shim, native in _NATIVE_F8.items():
+        if shim in text:
+            text = text.replace(shim, native)
+    return text
 
 
 def torch_mlir_available() -> bool:

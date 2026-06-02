@@ -82,11 +82,29 @@ extension dialect over a bespoke generic. These already exist:
 
 Naming convention: extension dialects use **bare, standard-adjacent** names (`linalg_ext`
 reads as "an extension of linalg", portable / close to upstream MLIR) — *not* a vendor
-prefix. `quant_ext` is named to avoid colliding with MLIR's real `quant` dialect. FP8 types
-mirror the MLIR-native spelling (`!builtin_ext.f8E4M3FN`) so swapping to native xDSL f8 later
-is trivial. Only the **discardable annotation attributes** keep a namespace prefix (`m2m.op`,
-`m2m.family`, `m2m.region_id`, …) — MLIR requires one, and standard tooling simply ignores
-them, so the *ops* stay standard MLIR.
+prefix. `quant_ext` is named to avoid colliding with MLIR's real `quant` dialect. Only the
+**discardable annotation attributes** keep a namespace prefix (`m2m.op`, `m2m.family`,
+`m2m.region_id`, …) — MLIR requires one, and standard tooling simply ignores them, so the
+*ops* stay standard MLIR.
+
+## Quantization representation
+
+- **Weight-only (int8) → QDQ preserved.** `convert(preserve_qdq=True, default)` folds
+  torchao's implicit dequant — `mul(matmul(x, cast(w_i8→f32)), scale[N])` — into an explicit
+  `quant_ext.dequantize_per_channel(w_i8, scale, zp, axis)` feeding the matmul (the per-output
+  scale is exactly a weight dequant). The quantization is then first-class/matchable; a later
+  target-aware fuse can map it to a native int8 matmul. `quant_ext.{quantize,dequantize}` is
+  the one non-standard op allowed in the default portable form (no standard-dialect equivalent
+  in xDSL 0.65). `fuse_qdq` is verify-guarded — never regresses the 0-opaque output.
+- **Dynamic-activation int8 → true quantized op.** `_int_mm` lowers to a real `i8×i8→i32`
+  `linalg.generic` contraction (no dequant roundtrip); left as-is.
+- **fp8.** `module_to_text` renders the shim f8 type with the MLIR-native spelling
+  (`f8E4M3FN`/`f8E5M2`), so any f8 storage in the artifact parses in a standard toolchain. But
+  **end-to-end f8 storage is currently blocked**: the weight transpose (`aten.t`) lowers to
+  `linalg.transpose`, whose body-builder asserts `AnyFloat | IntegerType`, which the shim f8
+  type isn't. So fp8 compute flows as f32 today (scheme recoverable via `m2m.quantization` +
+  `m2m.provenance.orig_dtype`). Full native-f8 needs xDSL native f8 (so linalg accepts it) or
+  a torch-mlir round-trip (torch-mlir has f8 and handles f8 transpose) — tracked follow-up.
 
 A named op is matched by **op type** (the strongest possible match) and carries its
 parameters as attributes. A single **expansion/legalization pass** then lowers each named

@@ -64,6 +64,23 @@ def test_true_int_matmul_present():
     assert "i32" in r.mlir_text  # int32 accumulation
 
 
+def test_fp8_type_renders_native_spelling():
+    """The shim fp8 type prints with the MLIR-native spelling (f8E4M3FN) on text emission,
+    so an artifact carrying f8 storage parses in a standard MLIR toolchain."""
+    from xdsl.dialects.builtin import ModuleOp, TensorType
+    from xdsl.dialects.func import FuncOp, ReturnOp
+    from xdsl.ir import Block, Region
+
+    from m2m.capture.torch_mlir_bridge import module_to_text
+    from m2m.ir.types import Float8E4M3FNType
+
+    t = TensorType(Float8E4M3FNType(), [4, 8])
+    blk = Block(arg_types=[t])
+    blk.add_op(ReturnOp(blk.args[0]))
+    txt = module_to_text(ModuleOp([FuncOp("f", ((t,), (t,)), region=Region(blk))]))
+    assert "f8E4M3FN" in txt and "builtin_ext" not in txt
+
+
 def test_mixed_precision_lowers():
     """One network mixing int8 + fp8 + full-precision submodules lowers to 0 opaque."""
     class Net(nn.Module):
