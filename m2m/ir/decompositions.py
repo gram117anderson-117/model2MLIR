@@ -1052,25 +1052,20 @@ def decompose_round(operands, meta, node_name):
     return _opaque_decomp("aten_round", operands[:1], meta, "elementwise", pattern_hint="round")
 
 
-def decompose_native_layer_norm(operands, meta, node_name):
-    """aten.native_layer_norm.default(input, normalized_shape, weight, bias, eps).
+def build_layer_norm_body(x, weight, bias, *, eps, k):
+    """Pure layer-norm lowering (mean/var/normalize + optional affine) on SSA tensors.
 
-    Decomposes to mean/var/normalize/scale/shift (family: layer_norm). Returns the
-    normalized output as the primary result (getitem(_,0)); mean/rstd aux outputs are
-    folded away by the importer.
-    """
-    from xdsl.dialects.arith import AddfOp, ConstantOp, MulfOp, SubfOp
+    Single source of truth for layer_norm: called by ``decompose_native_layer_norm`` (the
+    standard path) and by the high-level expansion pass. ``weight``/``bias`` may be None;
+    ``k`` is the number of trailing normalized dims. Returns ``(ops, result_ssa)`` or None."""
+    from xdsl.dialects.arith import AddfOp, ConstantOp, DivfOp, MulfOp, SubfOp
     from xdsl.dialects.builtin import FloatAttr
     from xdsl.dialects.math import RsqrtOp
 
-    x = operands[0]
     in_shape = _shape_of(x)
     if in_shape is None or any(d < 0 for d in in_shape):
-        return _opaque_decomp("aten_native_layer_norm", operands, meta, "layer_norm", pattern_hint="layer_norm")
+        return None
     elem = _t_elem(x)
-    norm_shape = _fx_arg(meta, 1, None)
-    k = len(norm_shape) if norm_shape is not None else 1
-    eps = _fx_arg(meta, 4, 1e-5)
     rank = len(in_shape)
     dims = list(range(rank - k, rank))
     keep = list(in_shape)
@@ -1098,18 +1093,16 @@ def decompose_native_layer_norm(operands, meta, node_name):
         ops.extend(dv[0])
         return _keepdim_reshape(ops, dv[1], rsh, keep, elem)
 
-    from xdsl.dialects.arith import DivfOp
-
     mean = reduce_mean(x)
     if mean is None:
-        return _opaque_decomp("aten_native_layer_norm", operands, meta, "layer_norm", pattern_hint="layer_norm")
+        return None
     cen = _elementwise([x, mean], rt, _bin_build(SubfOp), input_maps=[id_map, keep_map])
     ops += cen[0]
     sq = _elementwise([cen[1], cen[1]], rt, _bin_build(MulfOp))
     ops += sq[0]
     var = reduce_mean(sq[1])
     if var is None:
-        return _opaque_decomp("aten_native_layer_norm", operands, meta, "layer_norm", pattern_hint="layer_norm")
+        return None
 
     def add_eps_rsqrt(v):
         c = ConstantOp(FloatAttr(float(eps), elem), elem)
@@ -1126,23 +1119,38 @@ def decompose_native_layer_norm(operands, meta, node_name):
     res = normed[1]
 
     # optional affine: out = normed * weight + bias (weight/bias broadcast over norm dims)
-    if len(operands) >= 2 and isinstance(operands[1].type, TensorType):
-        w = operands[1]
-        wmap = _broadcast_map(_shape_of(w) or [], in_shape)
+    if weight is not None and isinstance(weight.type, TensorType):
+        wmap = _broadcast_map(_shape_of(weight) or [], in_shape)
         if wmap is not None:
-            sc = _elementwise([res, w], rt, _bin_build(MulfOp), input_maps=[id_map, wmap])
+            sc = _elementwise([res, weight], rt, _bin_build(MulfOp), input_maps=[id_map, wmap])
             if sc is not None:
                 ops += sc[0]
                 res = sc[1]
-    if len(operands) >= 3 and isinstance(operands[2].type, TensorType):
-        b = operands[2]
-        bmap = _broadcast_map(_shape_of(b) or [], in_shape)
+    if bias is not None and isinstance(bias.type, TensorType):
+        bmap = _broadcast_map(_shape_of(bias) or [], in_shape)
         if bmap is not None:
-            sh = _elementwise([res, b], rt, _bin_build(AddfOp), input_maps=[id_map, bmap])
+            sh = _elementwise([res, bias], rt, _bin_build(AddfOp), input_maps=[id_map, bmap])
             if sh is not None:
                 ops += sh[0]
                 res = sh[1]
+    return ops, res
 
+
+def decompose_native_layer_norm(operands, meta, node_name):
+    """aten.native_layer_norm.default(input, normalized_shape, weight, bias, eps).
+
+    Decomposes to mean/var/normalize/scale/shift (family: layer_norm). Returns the
+    normalized output as the primary result (getitem(_,0)); mean/rstd aux outputs are
+    folded away by the importer. Thin adapter over ``build_layer_norm_body``."""
+    norm_shape = _fx_arg(meta, 1, None)
+    k = len(norm_shape) if norm_shape is not None else 1
+    eps = _fx_arg(meta, 4, 1e-5)
+    weight = operands[1] if len(operands) >= 2 else None
+    bias = operands[2] if len(operands) >= 3 else None
+    built = build_layer_norm_body(operands[0], weight, bias, eps=eps, k=k)
+    if built is None:
+        return _opaque_decomp("aten_native_layer_norm", operands, meta, "layer_norm", pattern_hint="layer_norm")
+    ops, res = built
     rid = _next_region_id("layer_norm")
     for op in ops:
         _attach_region_id(op, rid)
@@ -1197,17 +1205,20 @@ def _keepdim_reshape(ops, ssa, reduced_shape, keep_shape, elem):
     return re[1]
 
 
-def decompose_softmax(operands, meta, node_name):
-    """aten._softmax(input, dim, _) -> max/sub/exp/sum/div (family: softmax)."""
+def build_softmax_body(x, *, dim):
+    """Pure softmax lowering (max/sub/exp/sum/div over ``dim``) on an SSA tensor.
+
+    The single source of truth for softmax: called both by ``decompose_softmax`` (the
+    importer/standard path) and by the high-level expansion pass (linalg_ext.softmax ->
+    standard). Returns ``(ops, result_ssa)`` or ``None`` if shapes are dynamic."""
     from xdsl.dialects.arith import AddfOp, DivfOp, MaximumfOp, SubfOp
     from xdsl.dialects.math import ExpOp
 
-    x = operands[0]
     in_shape = _shape_of(x)
     if in_shape is None or any(d < 0 for d in in_shape):
-        return _opaque_decomp("aten_softmax", operands, meta, "softmax", pattern_hint="softmax")
+        return None
     elem = _t_elem(x)
-    dim = int(_fx_arg(meta, 1, -1)) % len(in_shape)
+    dim = int(dim) % len(in_shape)
     keep = list(in_shape)
     keep[dim] = 1
     rt = TensorType(elem, in_shape)
@@ -1218,7 +1229,7 @@ def decompose_softmax(operands, meta, node_name):
     mx = _keepdim_reshape(ops, mx, rsh, keep, elem)
     sub = _elementwise([x, mx], rt, _bin_build(SubfOp), input_maps=[id_map, keep_map]) if mx is not None else None
     if sub is None:
-        return _opaque_decomp("aten_softmax", operands, meta, "softmax", pattern_hint="softmax")
+        return None
     ops += sub[0]
     ex = _elementwise([sub[1]], rt, _un_build(ExpOp))
     ops += ex[0]
@@ -1227,13 +1238,22 @@ def decompose_softmax(operands, meta, node_name):
     s = _keepdim_reshape(ops, s, rsh2, keep, elem)
     div = _elementwise([ex[1], s], rt, _bin_build(DivfOp), input_maps=[id_map, keep_map]) if s is not None else None
     if div is None:
-        return _opaque_decomp("aten_softmax", operands, meta, "softmax", pattern_hint="softmax")
+        return None
     ops += div[0]
+    return ops, div[1]
+
+
+def decompose_softmax(operands, meta, node_name):
+    """aten._softmax(input, dim, _) -> max/sub/exp/sum/div (family: softmax)."""
+    built = build_softmax_body(operands[0], dim=_fx_arg(meta, 1, -1))
+    if built is None:
+        return _opaque_decomp("aten_softmax", operands, meta, "softmax", pattern_hint="softmax")
+    ops, res = built
     rid = _next_region_id("softmax")
     for op in ops:
         _attach_region_id(op, rid)
         op.attributes["m2m.family"] = StringAttr("softmax")
-    return DecompResult(ops=ops, result=div[1], region_ids=[rid], pattern_hint="softmax")
+    return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="softmax")
 
 
 def decompose_rsqrt(operands, meta, node_name):
