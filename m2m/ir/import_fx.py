@@ -79,17 +79,70 @@ _FX_META_FORWARD_KEYS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Canonical op taxonomy (the matchable vocabulary for downstream passes).
+#
+# Every emitted op is stamped with TWO attributes, centrally and automatically:
+#   m2m.op     -- the fine canonical op-kind  (e.g. "add", "matmul", "softmax")
+#   m2m.family -- the coarse family it belongs to (a small, fixed set below)
+# so a pass matches on an attribute, never by inspecting linalg.generic bodies.
+# Adding a new aten op means slotting its hint into one of these families --
+# NOT inventing a new pattern. Keep this vocabulary small; only add a family
+# when an op is *fundamentally* different from every existing one.
+# ---------------------------------------------------------------------------
+_FAMILY_OF: dict[str, str] = {}
+def _reg(family: str, *hints: str) -> None:
+    for h in hints:
+        _FAMILY_OF[h] = family
+
+_reg("elementwise", "add", "mul", "sub", "div", "neg", "reciprocal", "pow",
+     "pow_tensor_scalar", "exp", "sqrt", "rsqrt", "tanh", "abs", "floor", "ceil",
+     "log", "cos", "sin", "erf", "round", "sigmoid", "silu", "gelu", "relu", "clamp",
+     "copy", "clone", "contiguous", "identity")
+_reg("cast", "dtype_cast", "to_dtype")
+_reg("fill", "fill", "empty", "scalar_tensor")
+_reg("iota", "arange")
+_reg("compare", "compare")
+_reg("select", "where")
+_reg("minmax", "maximum", "minimum", "minmax")
+_reg("logical", "logical_not")
+_reg("bitwise", "bitwise_and", "bitwise_not")
+_reg("reduce", "reduce", "reduce_sum", "reduce_mean", "sum", "mean", "any", "bool_reduce")
+_reg("arg_reduce", "aten_min_dim", "aten_max_dim", "aten_argmin", "aten_argmax")
+_reg("contraction", "matmul", "batch_matmul", "int_matmul", "addmm", "linear",
+     "conv2d", "convolution", "convolution_im2col_matmul",
+     "weight_int8pack_mm", "weight_int4pack_mm", "weight_int4pack_qm")
+_reg("normalization", "softmax", "layer_norm")
+_reg("layout", "view", "reshape", "unsqueeze", "squeeze", "flatten", "permute",
+     "transpose", "expand", "slice", "select", "slice_scatter", "split", "repeat")
+_reg("concat", "cat", "concat")
+_reg("gather_scatter", "gather", "embedding", "embedding_lookup", "index_gather",
+     "mask_gather", "index_put", "mask_scatter")
+_reg("scan", "cumsum")
+_reg("search", "bucketize")
+_reg("quantize", "quantize_per_tensor", "quantize_per_channel", "quantize_per_group",
+     "dequantize_per_tensor", "dequantize_per_channel", "dequantize_per_group",
+     "choose_qparams_per_tensor", "choose_qparams_per_channel")
+
+
+def family_of(hint: str | None) -> str | None:
+    """Coarse family for a fine op-kind hint (the matchable vocabulary). None if unknown."""
+    return _FAMILY_OF.get(hint) if hint else None
+
+
 def _forward_fx_meta(
     op: Operation,
     fx_meta: dict[str, Any],
     decomp_hint: str | None = None,
 ) -> None:
-    """Copy FX node meta + DecompResult.pattern_hint onto ``op.attributes``.
+    """Copy FX node meta + DecompResult.pattern_hint onto ``op.attributes`` and stamp the
+    canonical taxonomy (``m2m.op`` fine kind + ``m2m.family`` coarse family) on EVERY op.
 
-    - ``_compgen_pattern`` (FX-level tag) -> ``compgen._pattern_hint``
-    - ``_compgen_transpose_absorbed`` -> ``compgen.transpose_absorbed`` (bool string)
-    - ``_compgen_fuse_dequant`` -> ``compgen.fuse_dequant`` (bool string)
+    - ``_compgen_pattern`` (FX-level tag) -> ``m2m._pattern_hint``
     - ``decomp_hint`` (decomp-side explicit tag) wins when FX didn't set one.
+    - ``m2m.op`` <- effective hint; ``m2m.family`` <- family_of(hint), backfilled only
+      when a decomposition didn't already set an (authoritative) family. This makes
+      family tagging 100% consistent regardless of whether each decomposition remembered.
 
     Idempotent: won't overwrite an existing attribute.
     """
@@ -97,6 +150,15 @@ def _forward_fx_meta(
     effective_hint = fx_hint or decomp_hint
     if effective_hint and "m2m._pattern_hint" not in op.attributes:
         op.attributes["m2m._pattern_hint"] = StringAttr(str(effective_hint))
+    # canonical two-level taxonomy (matchable by downstream passes):
+    #   m2m.op     = fine op-kind (the hint)            -- preserved as-is
+    #   m2m.family = coarse family from the fixed map   -- AUTHORITATIVE: overwrite any
+    #     ad-hoc family a decomposition set, so the whole module uses ONE vocabulary.
+    if effective_hint and "m2m.op" not in op.attributes:
+        op.attributes["m2m.op"] = StringAttr(str(effective_hint))
+    fam = family_of(effective_hint)
+    if fam is not None:
+        op.attributes["m2m.family"] = StringAttr(fam)  # authoritative coarse family
 
     if isinstance(fx_meta, dict):
         if fx_meta.get("_compgen_transpose_absorbed") and "m2m.transpose_absorbed" not in op.attributes:
