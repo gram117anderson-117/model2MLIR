@@ -115,6 +115,38 @@ def _attach_region_id(op: Operation, region_id: str) -> None:
     op.attributes["m2m.region_id"] = StringAttr(region_id)
 
 
+def _emit_reshape(source: SSAValue, out_shape: list[int], elem: Any):
+    """Emit a real ``tensor.reshape`` to ``out_shape`` (a logical reshape).
+
+    Covers view/reshape/unsqueeze/squeeze/flatten -- all logical reshapes to a
+    statically-known output shape. Returns ``(ops, result_ssa)``, or ``None`` when
+    the output shape has a dynamic dim (can't build a static shape tensor), so the
+    caller falls back to an opaque placeholder.
+    """
+    if any(d < 0 for d in out_shape):
+        return None
+
+    from xdsl.dialects.arith import ConstantOp
+    from xdsl.dialects.builtin import IntegerAttr
+    from xdsl.dialects.tensor import FromElementsOp, ReshapeOp
+
+    ops: list[Operation] = []
+    dim_ssas: list[SSAValue] = []
+    for d in out_shape:
+        c = ConstantOp(IntegerAttr(int(d), i64), i64)
+        ops.append(c)
+        dim_ssas.append(c.result)
+
+    shape_type = TensorType(i64, [len(out_shape)])
+    from_elems = FromElementsOp(dim_ssas[0], *dim_ssas[1:], result_type=shape_type)
+    ops.append(from_elems)
+
+    result_type = TensorType(elem, out_shape)
+    reshape = ReshapeOp(source, from_elems.results[0], result_type)
+    ops.append(reshape)
+    return ops, reshape.results[0]
+
+
 # ============================================================================
 # Decomposition functions
 # ============================================================================
@@ -808,27 +840,29 @@ def decompose_div_tensor(operands, meta, node_name):
 # ---- layout / structural (preserve shape metadata; no compute) ----
 
 
+def _reshape_decomp(operands, meta, node_name, *, hint: str, prefix: str):
+    """Shared logical-reshape decomposition (view/reshape/unsqueeze/squeeze/flatten)."""
+    val: Any = meta["val"]
+    elem = _element_type_from_meta(meta)
+    out_shape = _static_shape(val.shape)
+    emitted = _emit_reshape(operands[0], out_shape, elem)
+    if emitted is None:
+        return _opaque_decomp(f"aten_{prefix}", operands[:1], meta, "layout", pattern_hint=hint)
+    ops, result = emitted
+    rid = _next_region_id(prefix)
+    for op in ops:
+        _attach_region_id(op, rid)
+    return DecompResult(ops=ops, result=result, region_ids=[rid], pattern_hint=hint)
+
+
 def decompose_view(operands, meta, node_name):
-    """aten.view.default(input, shape) -> tensor reshape (opaque MVP)."""
-    # view's shape is a scalar-list operand; keep only the tensor operand.
-    return _opaque_decomp(
-        "aten_view",
-        operands[:1],
-        meta,
-        "layout",
-        pattern_hint="view",
-    )
+    """aten.view.default(input, shape) -> tensor.reshape."""
+    return _reshape_decomp(operands, meta, node_name, hint="view", prefix="view")
 
 
 def decompose_unsqueeze(operands, meta, node_name):
-    """aten.unsqueeze.default(input, dim) -> insert a size-1 dim."""
-    return _opaque_decomp(
-        "aten_unsqueeze",
-        operands[:1],
-        meta,
-        "layout",
-        pattern_hint="unsqueeze",
-    )
+    """aten.unsqueeze.default(input, dim) -> tensor.reshape inserting a size-1 dim."""
+    return _reshape_decomp(operands, meta, node_name, hint="unsqueeze", prefix="unsqueeze")
 
 
 def decompose_expand(operands, meta, node_name):
