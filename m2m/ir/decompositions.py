@@ -179,9 +179,21 @@ def _broadcast_map(operand_shape, result_shape):
     r, s = len(result_shape), len(operand_shape)
     if list(operand_shape) == list(result_shape):
         return AffineMap.identity(r)
-    if s <= r and list(operand_shape) == list(result_shape)[r - s :]:
-        return AffineMap(r, 0, tuple(AffineExpr.dimension(r - s + i) for i in range(s)))
-    return None
+    if s > r:
+        return None
+    # Right-align the operand to the result; leading dims broadcast (dropped), and within
+    # the aligned region a size-1 operand dim broadcasts via a constant-0 index.
+    offset = r - s
+    exprs = []
+    for i in range(s):
+        od, rd = operand_shape[i], result_shape[offset + i]
+        if od == rd:
+            exprs.append(AffineExpr.dimension(offset + i))
+        elif od == 1:
+            exprs.append(AffineExpr.constant(0))
+        else:
+            return None
+    return AffineMap(r, 0, tuple(exprs))
 
 
 def _elementwise(inputs: list[SSAValue], result_type: TensorType, scalar_build, input_maps=None):
@@ -1157,14 +1169,25 @@ def decompose_unsqueeze(operands, meta, node_name):
 
 
 def decompose_expand(operands, meta, node_name):
-    """aten.expand.default(input, sizes, implicit?) -> broadcast."""
-    return _opaque_decomp(
-        "aten_expand",
-        operands[:1],
-        meta,
-        "layout",
-        pattern_hint="expand",
-    )
+    """aten.expand.default(input, sizes) -> broadcast copy via linalg.generic."""
+    val: Any = meta["val"]
+    out_shape = _static_shape(val.shape)
+    elem = _element_type_from_meta(meta)
+    if operands and _t_elem(operands[0]) == elem and not any(d < 0 for d in out_shape):
+        bm = _broadcast_map(_shape_of(operands[0]) or [], out_shape)
+        if bm is not None:
+            em = _elementwise(
+                [operands[0]], TensorType(elem, out_shape),
+                lambda args, oe: ([], args[0]),  # identity copy
+                input_maps=[bm],
+            )
+            if em is not None:
+                ops, res = em
+                rid = _next_region_id("expand")
+                for op in ops:
+                    _attach_region_id(op, rid)
+                return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="expand")
+    return _opaque_decomp("aten_expand", operands[:1], meta, "layout", pattern_hint="expand")
 
 
 def decompose_cat(operands, meta, node_name):
