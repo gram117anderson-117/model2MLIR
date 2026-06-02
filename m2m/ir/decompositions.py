@@ -1917,6 +1917,14 @@ def decompose_unsqueeze(operands, meta, node_name):
     return _reshape_decomp(operands, meta, node_name, hint="unsqueeze", prefix="unsqueeze")
 
 
+def decompose_squeeze(operands, meta, node_name):
+    """aten.squeeze[.dim[s]](input, ...) -> tensor.reshape dropping size-1 dims.
+
+    Pure layout op; the target shape comes from meta['val'], so squeeze.default
+    (drop all 1s), squeeze.dim, and squeeze.dims all share the reshape path."""
+    return _reshape_decomp(operands, meta, node_name, hint="squeeze", prefix="squeeze")
+
+
 def decompose_expand(operands, meta, node_name):
     """aten.expand.default(input, sizes) -> broadcast copy via linalg.generic."""
     val: Any = meta["val"]
@@ -3660,6 +3668,9 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     # layout / structural
     "aten.view.default": decompose_view,
     "aten.unsqueeze.default": decompose_unsqueeze,
+    "aten.squeeze.default": decompose_squeeze,
+    "aten.squeeze.dim": decompose_squeeze,
+    "aten.squeeze.dims": decompose_squeeze,
     "aten.expand.default": decompose_expand,
     "aten.cat.default": decompose_cat,
     "aten.split_with_sizes.default": decompose_split_with_sizes,
