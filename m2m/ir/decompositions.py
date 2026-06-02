@@ -2657,6 +2657,7 @@ def _pointwise(operands, meta, scalar_build, *, family: str, out_elem=None, prom
 
 # Compare / select family (cmp + select), all sharing the _pointwise core ----------
 _CMP_PREDICATE = {"eq": "oeq", "ne": "one", "lt": "olt", "le": "ole", "gt": "ogt", "ge": "oge"}
+_CMP_PREDICATE_INT = {"eq": "eq", "ne": "ne", "lt": "slt", "le": "sle", "gt": "sgt", "ge": "sge"}
 
 
 def decompose_where_self(operands, meta, node_name):
@@ -2677,13 +2678,18 @@ def _make_compare(kind: str):
     """aten.{eq,ne,lt,le,gt,ge}.{Tensor,Scalar} -> arith.cmpf (family: compare, i1 out)."""
     from xdsl.dialects.builtin import IntegerType
 
-    pred = _CMP_PREDICATE[kind]
+    pred_f = _CMP_PREDICATE[kind]
+    pred_i = _CMP_PREDICATE_INT[kind]
 
     def f(operands, meta, node_name):
-        from xdsl.dialects.arith import CmpfOp
+        from xdsl.dialects.arith import CmpfOp, CmpiOp
+        from xdsl.dialects.builtin import IntegerType as _IT
 
         def build(args, oe):
-            c = CmpfOp(args[0], args[1], pred)
+            if isinstance(args[0].type, _IT):  # integer compare
+                c = CmpiOp(args[0], args[1], pred_i)
+            else:
+                c = CmpfOp(args[0], args[1], pred_f)
             return [c], c.results[0]
 
         ops_in = list(operands)
