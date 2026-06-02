@@ -839,15 +839,75 @@ def decompose_native_layer_norm(operands, meta, node_name):
     )
 
 
+def _reduce(input_ssa, in_shape, dims, identity, combine_cls, elem):
+    """linalg.reduce over ``dims`` (rank drops). Returns (ops, result_ssa, reduced_shape).
+    ``identity``/``combine_cls`` define the monoid (0.0/AddfOp=sum, -inf/MaximumfOp=max)."""
+    from xdsl.dialects.arith import ConstantOp
+    from xdsl.dialects.builtin import DenseArrayBase, FloatAttr
+    from xdsl.dialects.linalg import ReduceOp, YieldOp
+    from xdsl.dialects.tensor import SplatOp
+    from xdsl.ir import Block, Region
+
+    dims = sorted(d % len(in_shape) for d in dims)
+    reduced_shape = [s for i, s in enumerate(in_shape) if i not in dims]
+    c0 = ConstantOp(FloatAttr(float(identity), elem), elem)
+    init = SplatOp(c0.result, [], TensorType(elem, reduced_shape))
+    blk = Block(arg_types=[elem, elem])
+    comb = combine_cls(blk.args[0], blk.args[1])
+    blk.add_op(comb)
+    blk.add_op(YieldOp(comb.results[0]))
+    red = ReduceOp(input_ssa, init.results[0], DenseArrayBase.from_list(i64, dims), Region(blk))
+    return [c0, init, red], red.results[0], reduced_shape
+
+
+def _keepdim_reshape(ops, ssa, reduced_shape, keep_shape, elem):
+    """Reshape a reduced tensor back to its keepdim shape (size-1 in reduced dims)."""
+    if reduced_shape == keep_shape:
+        return ssa
+    re = _emit_reshape(ssa, keep_shape, elem)
+    if re is None:
+        return None
+    ops.extend(re[0])
+    return re[1]
+
+
 def decompose_softmax(operands, meta, node_name):
-    """aten._softmax.default(input, dim, half_to_float)."""
-    return _opaque_decomp(
-        "aten_softmax",
-        operands,
-        meta,
-        "softmax",
-        pattern_hint="softmax",
-    )
+    """aten._softmax(input, dim, _) -> max/sub/exp/sum/div (family: softmax)."""
+    from xdsl.dialects.arith import AddfOp, DivfOp, MaximumfOp, SubfOp
+    from xdsl.dialects.math import ExpOp
+
+    x = operands[0]
+    in_shape = _shape_of(x)
+    if in_shape is None or any(d < 0 for d in in_shape):
+        return _opaque_decomp("aten_softmax", operands, meta, "softmax", pattern_hint="softmax")
+    elem = _t_elem(x)
+    dim = int(_fx_arg(meta, 1, -1)) % len(in_shape)
+    keep = list(in_shape)
+    keep[dim] = 1
+    rt = TensorType(elem, in_shape)
+    id_map = _broadcast_map(in_shape, in_shape)
+    keep_map = _broadcast_map(keep, in_shape)
+
+    ops, mx, rsh = _reduce(x, in_shape, [dim], float("-inf"), MaximumfOp, elem)
+    mx = _keepdim_reshape(ops, mx, rsh, keep, elem)
+    sub = _elementwise([x, mx], rt, _bin_build(SubfOp), input_maps=[id_map, keep_map]) if mx is not None else None
+    if sub is None:
+        return _opaque_decomp("aten_softmax", operands, meta, "softmax", pattern_hint="softmax")
+    ops += sub[0]
+    ex = _elementwise([sub[1]], rt, _un_build(ExpOp))
+    ops += ex[0]
+    o2, s, rsh2 = _reduce(ex[1], in_shape, [dim], 0.0, AddfOp, elem)
+    ops += o2
+    s = _keepdim_reshape(ops, s, rsh2, keep, elem)
+    div = _elementwise([ex[1], s], rt, _bin_build(DivfOp), input_maps=[id_map, keep_map]) if s is not None else None
+    if div is None:
+        return _opaque_decomp("aten_softmax", operands, meta, "softmax", pattern_hint="softmax")
+    ops += div[0]
+    rid = _next_region_id("softmax")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("softmax")
+    return DecompResult(ops=ops, result=div[1], region_ids=[rid], pattern_hint="softmax")
 
 
 def decompose_rsqrt(operands, meta, node_name):
@@ -927,14 +987,48 @@ def _make_fill(value_idx: int):
 
 
 def decompose_mean_dim(operands, meta, node_name):
-    """aten.mean.dim(input, dims, keepdim?, dtype?) -> linalg.reduce (MVP: opaque)."""
-    return _opaque_decomp(
-        "aten_mean_dim",
-        operands,
-        meta,
-        "reduce",
-        pattern_hint="reduce_mean",
-    )
+    """aten.mean.dim(input, dims, keepdim?) -> sum-reduce / count (family: reduce)."""
+    from xdsl.dialects.arith import AddfOp, DivfOp
+
+    x = operands[0]
+    in_shape = _shape_of(x)
+    if in_shape is None or any(d < 0 for d in in_shape):
+        return _opaque_decomp("aten_mean_dim", operands, meta, "reduce", pattern_hint="reduce_mean")
+    elem = _t_elem(x)
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    dims = _fx_arg(meta, 1, None)
+    if dims is None:
+        dims = list(range(len(in_shape)))
+    elif isinstance(dims, int):
+        dims = [dims]
+    else:
+        dims = list(dims)
+    dims = [d % len(in_shape) for d in dims]
+
+    ops, summ, rsh = _reduce(x, in_shape, dims, 0.0, AddfOp, elem)
+    count = 1
+    for d in dims:
+        count *= in_shape[d]
+    rt = TensorType(elem, rsh)
+    sp = _splat_scalar(float(count), rt)
+    if sp is None:
+        return _opaque_decomp("aten_mean_dim", operands, meta, "reduce", pattern_hint="reduce_mean")
+    ops += sp[0]
+    dv = _elementwise([summ, sp[1]], rt, _bin_build(DivfOp))
+    if dv is None:
+        return _opaque_decomp("aten_mean_dim", operands, meta, "reduce", pattern_hint="reduce_mean")
+    ops += dv[0]
+    res = dv[1]
+    if rsh != out_shape:  # keepdim -> reshape to insert size-1 dims
+        res = _keepdim_reshape(ops, res, rsh, out_shape, elem)
+        if res is None:
+            return _opaque_decomp("aten_mean_dim", operands, meta, "reduce", pattern_hint="reduce_mean")
+    rid = _next_region_id("reduce")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("reduce")
+    return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="reduce_mean")
 
 
 def decompose_convolution(operands, meta, node_name):
