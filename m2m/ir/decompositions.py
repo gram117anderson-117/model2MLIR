@@ -1016,9 +1016,14 @@ def _reduce(input_ssa, in_shape, dims, identity, combine_cls, elem):
     from xdsl.dialects.tensor import SplatOp
     from xdsl.ir import Block, Region
 
+    from xdsl.dialects.builtin import IntegerAttr, IntegerType
+
     dims = sorted(d % len(in_shape) for d in dims)
     reduced_shape = [s for i, s in enumerate(in_shape) if i not in dims]
-    c0 = ConstantOp(FloatAttr(float(identity), elem), elem)
+    if isinstance(elem, IntegerType):
+        c0 = ConstantOp(IntegerAttr(int(identity), elem), elem)
+    else:
+        c0 = ConstantOp(FloatAttr(float(identity), elem), elem)
     init = SplatOp(c0.result, [], TensorType(elem, reduced_shape))
     blk = Block(arg_types=[elem, elem])
     comb = combine_cls(blk.args[0], blk.args[1])
@@ -1833,7 +1838,6 @@ def decompose_arange(operands, meta, node_name):
     empty = EmptyOp([], out_t)
     blk = Block(arg_types=[elem])
     idx = IndexOp(0)
-    blk.add_op(idx)
     body = [idx]
     is_int = isinstance(elem, IntegerType)
     if is_int:
@@ -1875,13 +1879,15 @@ def decompose_arange(operands, meta, node_name):
 
 def decompose_sum_dim(operands, meta, node_name):
     """aten.sum.dim_IntList(input, dims, keepdim?) -> linalg.reduce add (family reduce)."""
-    from xdsl.dialects.arith import AddfOp
+    from xdsl.dialects.arith import AddfOp, AddiOp
+    from xdsl.dialects.builtin import IntegerType
 
     x = operands[0]
     in_shape = _shape_of(x)
     if in_shape is None or any(d < 0 for d in in_shape):
         return _opaque_decomp("aten_sum", operands[:1], meta, "reduce", pattern_hint="reduce_sum")
     elem = _t_elem(x)
+    add_cls = AddiOp if isinstance(elem, IntegerType) else AddfOp
     val: Any = meta["val"]
     out_shape = _static_shape(getattr(val, "shape", []))
     dims = _fx_arg(meta, 1, None)
@@ -1892,7 +1898,7 @@ def decompose_sum_dim(operands, meta, node_name):
     else:
         dims = list(dims)
     dims = [d % len(in_shape) for d in dims]
-    ops, summ, rsh = _reduce(x, in_shape, dims, 0.0, AddfOp, elem)
+    ops, summ, rsh = _reduce(x, in_shape, dims, 0, add_cls, elem)
     res = summ
     if rsh != out_shape:
         res = _keepdim_reshape(ops, res, rsh, out_shape, elem)
