@@ -2242,11 +2242,76 @@ def decompose_bucketize(operands, meta, node_name):
 
 
 def decompose_index_tensor(operands, meta, node_name):
-    """aten.index.Tensor — multi-dim gather. Operand 0 is source; index
-    tensors arrive via meta['_fx_args'][1] as a list."""
-    # Forward only the source SSA value; the index list is a Python list of
-    # tensors that the kernel will receive via the contract metadata.
-    return _opaque_decomp("aten_index", operands[:1], meta, "gather", pattern_hint="gather")
+    """aten.index.Tensor(self, [idx0, idx1, ...]) — advanced integer-array gather.
+
+    Lowered (family ``gather``) as a ``linalg.generic`` over the output (advanced-index
+    broadcast) shape: each output coordinate reads the broadcast index tensors and does a
+    ``tensor.extract`` from ``self``. Handles the full-indexing case (one integer index
+    tensor per source dim). Boolean-mask indexing (``self[mask]``) yields a data-dependent
+    shape that static lowering can't express, so it stays an opaque placeholder."""
+    from xdsl.dialects.builtin import IntegerType
+
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("aten_index", operands[:1], meta, "gather", pattern_hint="gather")
+    source = operands[0]
+    idxs = list(operands[1:])
+    src_shape = _shape_of(source)
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    out_elem = source.type.element_type
+
+    def bail():
+        return _opaque_decomp("aten_index", operands[:1], meta, "gather", pattern_hint="gather")
+
+    if not idxs or any(not isinstance(t.type, TensorType) for t in idxs):
+        return bail()
+    # boolean-mask indexing -> data-dependent (dynamic) output: not statically lowerable
+    if any(isinstance(t.type.element_type, IntegerType) and t.type.element_type.width.data == 1 for t in idxs):
+        return bail()
+    if src_shape is None or any(d < 0 for d in src_shape) or any(d < 0 for d in out_shape):
+        return bail()
+    # only the full-indexing case (one integer index per source dim)
+    if len(idxs) != len(src_shape):
+        return bail()
+    out_rank = len(out_shape)
+    maps = [_broadcast_map(_shape_of(t) or [], out_shape) for t in idxs]
+    if any(m is None for m in maps):
+        return bail()
+
+    from xdsl.dialects.arith import IndexCastOp
+    from xdsl.dialects.builtin import AffineMapAttr, IndexType
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import EmptyOp, ExtractOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineMap
+
+    out_t = TensorType(out_elem, out_shape)
+    empty = EmptyOp([], out_t)
+    idx_elems = [t.type.element_type for t in idxs]
+    blk = Block(arg_types=[*idx_elems, out_elem])
+    coords = []
+    for a in blk.args[:len(idxs)]:
+        ic = IndexCastOp(a, IndexType())
+        blk.add_op(ic)
+        coords.append(ic.results[0])
+    ext = ExtractOp(source, coords, out_elem)
+    blk.add_op(ext)
+    blk.add_op(YieldOp(ext.results[0]))
+
+    gen = GenericOp(
+        inputs=idxs,
+        outputs=[empty.results[0]],
+        body=Region(blk),
+        indexing_maps=[AffineMapAttr(m) for m in maps] + [AffineMapAttr(AffineMap.identity(out_rank))],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * out_rank,
+        result_types=[out_t],
+    )
+    ops = [empty, gen]
+    rid = _next_region_id("gather")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("gather")
+    return DecompResult(ops=ops, result=gen.results[0], region_ids=[rid], pattern_hint="index_gather")
 
 
 def decompose_compare(operands, meta, node_name):
