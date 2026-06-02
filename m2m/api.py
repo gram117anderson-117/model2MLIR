@@ -36,6 +36,7 @@ class ConversionResult:
     module: ModuleOp | None = None
     path_taken: str = "failed"
     output_type: str = "linalg-on-tensors"
+    frontend: str = "torch"
     diagnostics: list[str] = field(default_factory=list)
 
     @property
@@ -74,6 +75,21 @@ def convert(
     """
     if backend == "torch_mlir":
         allow_fallback = False
+
+    # Frontend dispatch: torch nn.Module / ExportedProgram -> torch path;
+    # any other callable -> jax path (StableHLO), when jax is available.
+    import torch
+
+    _is_torch = isinstance(model, torch.nn.Module) or type(model).__name__ == "ExportedProgram"
+    if not _is_torch:
+        try:
+            import jax  # noqa: F401
+
+            from m2m.frontends.jax import convert_jax
+
+            return convert_jax(model, example_inputs)
+        except ImportError:
+            pass  # no jax; fall through and let the torch path try (will error clearly)
     if quantization is not None:
         # Quantized (tensor-subclass) weights are swapped by .to()/.eval() during
         # capture; disable swap-on-conversion process-wide so capture uses copy

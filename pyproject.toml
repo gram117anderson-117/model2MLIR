@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 quant = ["torchao>=0.16"]
+jax = ["jax"]
 dev = ["pytest"]
 # Example workloads (LLMs / VLAs). Heavy; install on demand.
 examples = ["transformers>=4.44", "accelerate>=0.33"]

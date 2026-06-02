@@ -45,13 +45,17 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         tuple(inputs),
         output_type=args.output_type,
         quantization=_make_quant(args.quant),
+        backend=getattr(args, "backend", "auto"),
     )
     if not result.ok:
         sys.stderr.write("conversion failed:\n  " + "\n  ".join(result.diagnostics) + "\n")
         return 1
     if args.out:
         Path(args.out).write_text(result.mlir_text)
-        sys.stderr.write(f"[{result.path_taken}] wrote {len(result.mlir_text)} chars to {args.out}\n")
+        sys.stderr.write(
+            f"[{result.frontend}/{result.path_taken}] {result.output_type}: "
+            f"wrote {len(result.mlir_text)} chars to {args.out}\n"
+        )
     else:
         sys.stdout.write(result.mlir_text)
     return 0
@@ -72,12 +76,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="m2m", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    pc = sub.add_parser("convert", help="convert a model to MLIR")
-    pc.add_argument("model", help="path to a .py exposing get_model_and_inputs()")
-    pc.add_argument("--out", help="output .mlir path (default: stdout)")
-    pc.add_argument("--output-type", default="linalg-on-tensors")
-    pc.add_argument("--quant", default=None, help="torchAO scheme name (e.g. int8_weight_only)")
-    pc.set_defaults(func=_cmd_convert)
+    # `convert` auto-detects torch vs jax; `lower-torch` / `lower-jax` are explicit
+    # aliases (same handler) matching the /m2m-lower-* skills.
+    for cmd, helptext in (
+        ("convert", "convert a model to MLIR (auto-detect torch/jax)"),
+        ("lower-torch", "lower a PyTorch model (loader: get_model_and_inputs) to MLIR"),
+        ("lower-jax", "lower a JAX function (loader: get_model_and_inputs -> (fn, inputs)) to StableHLO"),
+    ):
+        pc = sub.add_parser(cmd, help=helptext)
+        pc.add_argument("model", help="path to a .py exposing get_model_and_inputs()")
+        pc.add_argument("--out", help="output .mlir path (default: stdout)")
+        pc.add_argument("--output-type", default="linalg-on-tensors")
+        pc.add_argument("--backend", default="auto", choices=["auto", "torch_mlir", "fx_importer"])
+        pc.add_argument("--quant", default=None, help="torchAO scheme name (e.g. int8_weight_only)")
+        pc.set_defaults(func=_cmd_convert)
 
     pv = sub.add_parser("coverage", help="report op coverage for a model")
     pv.add_argument("model", help="path to a .py exposing get_model_and_inputs()")
