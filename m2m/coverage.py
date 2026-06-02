@@ -96,4 +96,95 @@ def validate_op(
     )
 
 
-__all__ = ["OpValidation", "opaque_report", "validate_op"]
+def dialect_op_histogram(mlir_text: str) -> dict[str, int]:
+    """Multiset of ``dialect.op`` names in the MLIR (e.g. {'linalg.generic': 3})."""
+    ops = re.findall(r"\b([a-z_]+\.[a-z_][a-z_0-9]*)\b", mlir_text)
+    keep = {"linalg", "tensor", "arith", "math", "func", "scf", "cf", "complex", "bufferization"}
+    return dict(Counter(o for o in ops if o.split(".")[0] in keep and o != "func.func"))
+
+
+@dataclass
+class OpDiff:
+    op: str
+    ours_lowered: bool
+    ours_opaque: dict[str, int]
+    golden_ok: bool                       # torch-mlir produced a lowering
+    golden_ops: dict[str, int] = field(default_factory=dict)   # the TARGET lowering
+    our_ops: dict[str, int] = field(default_factory=dict)
+    result_type_match: bool = False       # our result type == torch-mlir's
+    golden_mlir: str = ""
+    error: str | None = None
+
+    @property
+    def verdict(self) -> str:
+        if not self.golden_ok:
+            return "no-oracle"            # torch-mlir can't lower it either
+        if not self.ours_lowered:
+            return "TODO: implement (oracle available)"
+        return "ok" if self.result_type_match else "mismatch"
+
+
+def golden_lowering(fn: Callable[..., torch.Tensor], example_inputs: tuple[torch.Tensor, ...]):
+    """Lower a single op via torch-mlir (the oracle). Returns mlir_text or None."""
+    import m2m
+
+    try:
+        r = m2m.convert(_SingleOp(fn).eval(), example_inputs, backend="torch_mlir")
+        return r.mlir_text or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _result_type(mlir_text: str) -> str | None:
+    m = re.search(r"->\s*(tensor<[^>]+>)\s*\{", mlir_text) or re.search(r"return\s+%\w+\s*:\s*(tensor<[^>]+>)", mlir_text)
+    return m.group(1) if m else None
+
+
+def differential_op(
+    fn: Callable[..., torch.Tensor],
+    example_inputs: tuple[torch.Tensor, ...],
+    *,
+    name: str,
+) -> OpDiff:
+    """Differential test one op: our FXImporter output vs torch-mlir's golden lowering.
+
+    - ``verdict == "TODO: implement (oracle available)"``: we emit an opaque placeholder
+      but torch-mlir shows the target linalg -- use ``golden_ops`` / ``golden_mlir`` as the
+      spec for writing the emitter.
+    - ``verdict == "ok"``: our emitter lowered and its result type matches the oracle.
+    - ``verdict == "no-oracle"``: torch-mlir can't lower it either (truly novel op).
+    """
+    import m2m
+
+    ours = validate_op(fn, example_inputs, name=name)
+    golden = golden_lowering(fn, example_inputs)
+    golden_ok = golden is not None
+    golden_hist = dialect_op_histogram(golden) if golden else {}
+    our_text = ""
+    try:
+        our_text = m2m.convert(_SingleOp(fn).eval(), example_inputs, backend="fx_importer").mlir_text
+    except Exception:  # noqa: BLE001
+        pass
+    rt_match = bool(golden) and _result_type(our_text) is not None and _result_type(our_text) == _result_type(golden)
+    return OpDiff(
+        op=name,
+        ours_lowered=ours.lowered,
+        ours_opaque=ours.opaque_calls,
+        golden_ok=golden_ok,
+        golden_ops=golden_hist,
+        our_ops=dialect_op_histogram(our_text),
+        result_type_match=rt_match,
+        golden_mlir=golden or "",
+        error=ours.error,
+    )
+
+
+__all__ = [
+    "OpDiff",
+    "OpValidation",
+    "dialect_op_histogram",
+    "differential_op",
+    "golden_lowering",
+    "opaque_report",
+    "validate_op",
+]
