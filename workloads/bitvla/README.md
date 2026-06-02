@@ -25,28 +25,38 @@ through each `.forward`; bi-directional attention is a static mask). Risks:
   numpy, image processor) — kept host-side by design.
 
 ## Venv (dedicated)
+The `fx_importer` backend uses m2m's OWN FXImporter (no torch-mlir wheel needed).
+m2m requires `enum.StrEnum` -> Python **3.11+**. torchao 0.17 needs `torch>=2.8`
+(`torch.utils._pytree.register_constant`) and `torch.int1` (`torch>=2.6`), so the
+whole stack is pinned to torch 2.8 / torchvision 0.23.
 ```bash
 cd /scratch/agustin/projects/bitvla_capture
-uv venv --python 3.10
-# Install the VENDORED transformers fork (editable) + OFT deps:
+uv venv --python 3.11
+# VENDORED transformers fork (hardcodes BitNet + Siglip + use_bi_attn) + OFT deps:
 uv pip install -e /scratch/agustin/projects/BitVLA/transformers
-uv pip install numpy timm tokenizers accelerate
-# m2m + torch-mlir:
-uv pip install xdsl structlog ml_dtypes
-uv pip install --pre torch-mlir \
-  --extra-index-url https://download.pytorch.org/whl/nightly/cpu \
-  -f https://github.com/llvm/torch-mlir-release/releases/expanded_assets/dev-wheels
+uv pip install "torch==2.8.0" "torchvision==0.23.0" --index-url https://download.pytorch.org/whl/cpu
+uv pip install numpy timm accelerate
+# m2m + deps (NOTE: torchao 0.17 / torch 2.8):
 uv pip install -e /scratch/agustin/projects/model2MLIR --no-deps
+uv pip install xdsl structlog ml_dtypes "torchao==0.17.0"
 ```
 Note: `bitvla_for_action_prediction` imports `prismatic.vla.constants` and
-`prismatic.training.train_utils` at MODULE LOAD time (the loader adds
-`openvla-oft/` to `sys.path`). Importing the `prismatic` package runs
-`prismatic/__init__.py` -> `from .models import ... load`, which can pull heavy
-deps (timm, draccus, etc.). If install is too heavy, the lean fix is to stub the
-two symbols the module actually needs before import:
-`prismatic.vla.constants.{ACTION_DIM,NUM_ACTIONS_CHUNK,ACTION_PROPRIO_NORMALIZATION_TYPE,NormalizationType}`
-and `prismatic.training.train_utils.{get_current_action_mask,get_next_actions_mask}`
-— none are exercised by the captured inner-VLM forward.
+`prismatic.training.train_utils` at MODULE LOAD time. Importing the real
+`prismatic` package runs `prismatic/__init__.py -> from .models import ... load`,
+which pulls heavy deps (draccus, etc.) that fail. The loader's
+`_install_prismatic_stubs()` pre-registers lean stub modules in `sys.modules`
+(the constants + two mask fns) so the real package __init__ never runs — none of
+those symbols are exercised by the captured inner-VLM forward.
+
+`BitNet` registration: the vendored fork hardcodes `BitNetForCausalLM` +
+`SiglipVisionModel` inside `transformers/models/llava/` (no AutoModel.register
+needed). The loader just builds a `Bitvla_Config(text_config={"model_type":
+"BitNet", ...})`; the fork's `LlavaConfig.__init__` routes that to its bundled
+`BitNetConfig`. The loader also sets a top-level `vocab_size` on the config
+(`BitVLAForActionPrediction.__init__` reads `config.vocab_size`, which LlavaConfig
+does not surface) and resolves the parent `LlavaForConditionalGeneration.forward`
+ONCE at construction time (importing it inside `forward` trips dynamo on the
+transformers `_LazyModule`).
 
 ## Run
 ```bash
@@ -60,7 +70,26 @@ print(r.path_taken, r.mlir_text.count('linalg.'))"
 ```
 
 ## Status
-- BLOCKER: needs the `BitNet` model_type registered in transformers (custom modeling
-  code from the BitVLA repo, or a newer transformers). Config build raises KeyError('BitNet').
-- Scaffold only; not yet captured. Validate the vendored-fork install + that
-  `LlavaForConditionalGeneration.forward(..., use_bi_attn=True)` traces cleanly.
+CAPTURED (all 3 formats, BITVLA_LLM_LAYERS=2, seq=32, hidden=256, vocab=1024).
+Input: inputs_embeds [1,32,256] f32 + attention_mask [1,32] i64 -> logits [1,32,1024].
+
+- **fp32** `bitvla.mlir`: ok, path=fx_importer, linalg=812, total_opaque=16.
+- **int8** `bitvla_int8.mlir`: ok, path=fx_importer, linalg=816, total_opaque=16.
+- **fp8** `bitvla_fp8.mlir`: ok, path=fx_importer, linalg=815, total_opaque=16.
+
+Opaque histogram (identical across all 3): `aten_mean_default`x4,
+`aten_mean_default_1`x4, `aten_mean_default_2`x4, `aten_mean_default_3`x2,
+`aten_slice_Tensor`x2. The `aten.mean`s are BitLinear's W1.58 absmean weight-quant
+reductions (`weight.abs().mean()`); the importer leaves the reduction opaque.
+
+BitNet x torchao caveat: the task's full-model `int8_weight_only` /
+`float8_weight_only_e4m3` schemes FAIL on this model — every `BitLinear.forward`
+runs `WeightQuant.apply(self.weight)` -> `weight.abs().mean()` in-graph, and
+torchao's weight subclasses do not implement `aten.abs`
+(`AffineQuantizedTensor`/`Float8Tensor` dispatch error). BitNet already does its
+own in-graph W1.58 quant, so stacking torchao weight-only on the BitLinears is
+both impossible and redundant. The int8/fp8 .mlir here therefore quantize ONLY the
+one plain `nn.Linear` in the captured path — `lm_head` — via
+`QuantizationConfig(scheme="none", per_module={"lm_head": <scheme>})`; the int8
+file carries `i8` lm_head weights, the fp8 file carries `f8` lm_head weights, and
+the BitLinear W1.58 math stays intact.

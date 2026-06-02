@@ -33,19 +33,76 @@ from __future__ import annotations
 
 import os
 import sys
+import types
+from enum import Enum
 
 import torch
 from torch import nn
 
-# Make the OFT bitvla package + the prismatic package importable.
-# NOTE: bitvla_for_action_prediction imports `prismatic.vla.constants` and
-# `prismatic.training.train_utils` at MODULE LOAD time, so `openvla-oft/` must be
-# on sys.path even though we never run the host-side path that uses them.
+# Make the OFT bitvla *modeling* code importable. The modeling file uses flat
+# imports (`from configuration_bit_vla import ...`, `from bitvla_for_action_prediction
+# import ...`), so both the package dir and its `model/` subdir go on sys.path.
 _BITVLA_PKG = "/scratch/agustin/projects/BitVLA/openvla-oft/bitvla"
-_OFT_ROOT = "/scratch/agustin/projects/BitVLA/openvla-oft"
-for _p in (_BITVLA_PKG, _OFT_ROOT):
+_BITVLA_MODEL = "/scratch/agustin/projects/BitVLA/openvla-oft/bitvla/model"
+for _p in (_BITVLA_PKG, _BITVLA_MODEL):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+
+def _install_prismatic_stubs() -> None:
+    """Pre-register lean stub `prismatic.*` modules in sys.modules.
+
+    `bitvla_for_action_prediction` imports `prismatic.vla.constants` and
+    `prismatic.training.train_utils` at MODULE LOAD time. Importing the real
+    `prismatic` package runs `prismatic/__init__.py -> from .models import load`,
+    which pulls heavy deps (draccus, etc.). None of those symbols are exercised by
+    the captured inner-VLM forward, so we stub exactly what the module needs and
+    block the real package's __init__ from ever running.
+    """
+    if "prismatic" in sys.modules:
+        return
+
+    prismatic = types.ModuleType("prismatic")
+    prismatic.__path__ = []  # mark as package so submodule imports resolve here
+    vla = types.ModuleType("prismatic.vla")
+    vla.__path__ = []
+    training = types.ModuleType("prismatic.training")
+    training.__path__ = []
+
+    constants = types.ModuleType("prismatic.vla.constants")
+
+    class NormalizationType(str, Enum):
+        NORMAL = "normal"
+        BOUNDS = "bounds"
+        BOUNDS_Q99 = "bounds_q99"
+
+    constants.NormalizationType = NormalizationType
+    constants.ACTION_DIM = 7
+    constants.NUM_ACTIONS_CHUNK = 8
+    constants.ACTION_PROPRIO_NORMALIZATION_TYPE = NormalizationType.BOUNDS_Q99
+    constants.IGNORE_INDEX = -100
+    constants.ACTION_TOKEN_BEGIN_IDX = 31743
+    constants.STOP_INDEX = 2
+
+    train_utils = types.ModuleType("prismatic.training.train_utils")
+
+    def get_current_action_mask(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("host-side path; not part of the captured forward")
+
+    def get_next_actions_mask(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("host-side path; not part of the captured forward")
+
+    train_utils.get_current_action_mask = get_current_action_mask
+    train_utils.get_next_actions_mask = get_next_actions_mask
+
+    sys.modules["prismatic"] = prismatic
+    sys.modules["prismatic.vla"] = vla
+    sys.modules["prismatic.vla.constants"] = constants
+    sys.modules["prismatic.training"] = training
+    sys.modules["prismatic.training.train_utils"] = train_utils
+
+
+_install_prismatic_stubs()
 
 
 class _VLMLogits(nn.Module):
@@ -54,11 +111,17 @@ class _VLMLogits(nn.Module):
     def __init__(self, vla: nn.Module) -> None:
         super().__init__()
         self.vla = vla
-
-    def forward(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        # Resolve the parent Llava forward ONCE, at construction time, outside the
+        # dynamo trace. `BitVLAForActionPrediction.forward` is the (non-exportable)
+        # host-side action path; the capture unit is the inner VLM forward, which is
+        # exactly `LlavaForConditionalGeneration.forward`. Importing it inside
+        # `forward` trips dynamo on the transformers `_LazyModule`.
         from transformers import LlavaForConditionalGeneration
 
-        out = LlavaForConditionalGeneration.forward(
+        self._vlm_forward = LlavaForConditionalGeneration.forward
+
+    def forward(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        out = self._vlm_forward(
             self.vla,
             input_ids=None,
             attention_mask=attention_mask,
@@ -115,6 +178,10 @@ def get_model_and_inputs():
         vision_feature_select_strategy="full",
         norm_stats={},
         n_action_bins=256,
+        # The vendored BitVLAForActionPrediction.__init__ reads `config.vocab_size`
+        # directly (it normally comes from a real checkpoint config); LlavaConfig
+        # does not surface it at top level, so set it to match the text config.
+        vocab_size=text_config["vocab_size"],
     )
 
     from bitvla_for_action_prediction import BitVLAForActionPrediction

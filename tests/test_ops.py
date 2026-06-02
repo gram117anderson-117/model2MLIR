@@ -76,6 +76,12 @@ CASES = [
     ("index_partial_lead", lambda s, i: s[i], (torch.randn(4, 8), torch.tensor([0, 2, 1]))),
     ("index_none_lead", lambda s, i: s[:, i], (torch.randn(4, 8), torch.tensor([0, 2, 1]))),
     ("index_mid", lambda s, i: s[:, i, :], (torch.randn(2, 5, 7), torch.tensor([0, 1, 2]))),
+    ("bitwise_not_bool", lambda a: ~(a > 0), X),
+    ("bitwise_not_int", lambda a: ~a, (torch.randint(0, 100, (4, 8), dtype=torch.int32),)),
+    ("repeat_tile", lambda a: a.repeat(2, 3), X),
+    ("repeat_prepend", lambda a: a.repeat(2, 1, 1), (torch.randn(3, 8),)),
+    ("mean_full", lambda a: a.mean(), X),                 # mean.default -> scalar
+    ("mean_absmean", lambda a: a.abs().mean(), X),        # BitNet W1.58 absmean
 ]
 
 # Data-dependent ops: output has a dynamic (?) dim, so shape can't match eager exactly --

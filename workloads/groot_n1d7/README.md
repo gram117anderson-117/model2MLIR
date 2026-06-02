@@ -58,8 +58,18 @@ print(r.path_taken, r.mlir_text.count('linalg.'))"
 ```
 
 ## Status
-- Scaffold only — not yet captured. Random-init action head, fp32.
-- Open items: confirm `diffusers` ModelMixin/ConfigMixin import the DiT cleanly without
-  pulling a large dep tree; the `AlternateVLDiT` SDPA attention may need
-  `_attn_implementation="eager"` style handling for a clean trace (see pi0.5).
-- int8/fp8: pending.
+- CAPTURED. Random-init action head (no checkpoint / no backbone), DiT 16 layers,
+  877M params. fp32 + int8 + fp8 all `ok=True` via `fx_importer`.
+- Venv built with Python **3.11** (m2m needs `enum.StrEnum`, 3.11+; the 3.10 pin in
+  GR00T's `pyproject.toml` is only for the full flash-attn backbone, not the head).
+  Pinned `transformers==4.57.3` (5.x makes `PretrainedConfig` a dataclass, which breaks
+  `Gr00tN1d7Config`'s field ordering) and **`torchao==0.11.0`** (0.17 + torch 2.7.1 fails
+  fp8 export: `Float8Tensor` FakeTensor lacks `tensor_data_names` under dynamo when
+  `timestep_encoder` does `next(self.parameters()).dtype`; int8/fp32 unaffected).
+  Extra runtime dep: `tyro` (pulled by `gr00t/configs/model/__init__.py`).
+- The loader pre-seeds a lightweight `sys.modules["gr00t.model"]` stub so importing the
+  leaf head module does NOT run `gr00t/model/__init__.py` (which eagerly imports the
+  dataset/pipeline stack -> pandas etc., none needed for the head).
+- Per-format results (default 16 DiT layers): each `ok=True`, 1 opaque op
+  `aten_bitwise_not_default(tensor<1x64xi1>) -> tensor<1x64xi1>` (the `~image_mask` in
+  `AlternateVLDiT.forward`). linalg.: fp32=2257, int8=2721, fp8=2489.

@@ -22,7 +22,7 @@ action expert you only need torch + timm (`Mlp`) + numpy. Capturing the full VLA
 ```bash
 git clone https://github.com/thu-ml/RDT2 /scratch/agustin/projects/RDT2
 cd /scratch/agustin/projects/RDT2
-uv venv --python 3.10
+uv venv --python 3.11   # m2m imports enum.StrEnum, which needs Python 3.11+
 uv pip install torch timm==1.0.15 numpy==1.26.4
 # frontend (FXImporter mode; a matching cp310 torch-mlir wheel can be added too)
 uv pip install xdsl structlog ml_dtypes
@@ -58,8 +58,14 @@ Env: `M2M_RDT2_DEPTH=N` (number of RDT blocks; default 2 smoke, real default = 1
   so it is not hit.
 
 ## Status
-- BLOCKER: the scaffolded example inputs mismatch the model internally (torch.export
-  fails with a 128-vs-8 broadcast); the loader's kv/x_pos_emb shapes need correcting
-  against RDT2's actual forward signature before capture. Not an m2m coverage gap.
-- fp32: scaffolded, not yet captured (depth=2 smoke recommended first).
-- int8/fp8: pending.
+- Loader fixed: the `lang_c_kv` cache tensors must be laid out as
+  `(B, n_kv_heads, seq_len, head_size)`, NOT `(B, seq_len, n_kv_heads, head_size)`.
+  In `model.py` each (k, v) pair is `.transpose(1, 2)`'d before CrossAttention, whose
+  `repeat_kv` then expects `(B, seq_len, n_kv_heads, head_size)`; working back through
+  that transpose, the fed-in cache must be `(B, n_kv_heads, seq_len, head_size)`. With
+  that fix eager + torch.export both succeed (output `(1, 24, 20)`). The earlier
+  128-vs-8 broadcast was purely this shape error, not an m2m coverage gap.
+- Captured at depth=2 (M2M_RDT2_DEPTH=2), Python 3.11 venv (m2m needs StrEnum / 3.11+).
+- fp32 -> rdt2.mlir       : ok=True, opaque=0, linalg=499
+- int8 -> rdt2_int8.mlir  : ok=True, opaque=0, linalg=591
+- fp8  -> rdt2_fp8.mlir   : ok=True, opaque=0, linalg=568

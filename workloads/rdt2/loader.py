@@ -113,13 +113,16 @@ def get_model_and_inputs():
     # state_c: adapted proprio state token (B, 1, D) -- state_adaptor output.
     state_c = torch.randn(b, 1, hidden_size, dtype=dtype)
 
-    # lang_c_kv: per-block (k, v) from the Qwen2.5-VL cache. As consumed in
-    # model.py the pair is transposed via .transpose(1, 2), i.e. each tensor is
-    # (B, seq_len, n_kv_heads, head_size). One (k, v) pair per RDT block.
+    # lang_c_kv: per-block (k, v) from the Qwen2.5-VL cache. In model.py each
+    # pair is `.transpose(1, 2)`'d to (B, n_kv_heads, seq_len, head_size) BEFORE
+    # being handed to CrossAttention, whose `repeat_kv` then expects layout
+    # (B, seq_len, n_kv_heads, head_size). Working back through that transpose,
+    # the cache tensors fed in must be (B, n_kv_heads, seq_len, head_size).
+    # One (k, v) pair per RDT block.
     kv = []
     for _ in range(depth):
-        kv.append(torch.randn(b, lang_len, n_kv_heads, head_size, dtype=dtype))  # k
-        kv.append(torch.randn(b, lang_len, n_kv_heads, head_size, dtype=dtype))  # v
+        kv.append(torch.randn(b, n_kv_heads, lang_len, head_size, dtype=dtype))  # k
+        kv.append(torch.randn(b, n_kv_heads, lang_len, head_size, dtype=dtype))  # v
 
     inputs = (x, t, state_c, *kv)
     return RDT2DenoiseStep(model).eval(), inputs

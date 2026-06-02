@@ -47,12 +47,17 @@ the repo on `sys.path` (no `pip install -e` of olmo needed) via `MOLMOACT_REPO`.
 # molmoact already cloned (shallow, LFS skipped):
 #   GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://github.com/allenai/molmoact /scratch/agustin/projects/molmoact
 uv venv --python 3.11 --directory /scratch/agustin/projects/model2MLIR/workloads/molmoact
-# minimal capture deps:
-uv pip install "torch==2.7.*" "transformers>=4.51" einops numpy
-# frontend (FXImporter mode):
-uv pip install xdsl structlog ml_dtypes
+# minimal capture deps. NOTE: transformers MUST be 4.5x, NOT 5.x:
+# transformers 5.x removed the "default" key from ROPE_INIT_FUNCTIONS, and the
+# model file does ROPE_INIT_FUNCTIONS["default"] -> KeyError. 4.53.3 verified working.
+uv pip install "torch==2.7.*" "transformers==4.53.*" einops numpy
+# frontend (FXImporter mode) + quant:
+uv pip install xdsl structlog ml_dtypes torchao
 uv pip install -e /scratch/agustin/projects/model2MLIR --no-deps
 ```
+
+NOTE: invoke the workload venv explicitly (`./.venv/bin/python`); `uv run` from this
+dir walks up and picks the parent `model2MLIR/.venv` instead.
 
 ## Run
 ```bash
@@ -67,11 +72,11 @@ print(r.path_taken, r.mlir_text.count('linalg.'))"
 ```
 
 ## Status
-- Scaffold only — not yet captured. Random-init LLM decoder, fp32, vocab shrunk by default
-  (full 152064 vocab is a ~2 GB fp32 embedding + lm_head).
-- Open items: confirm transformers version vs the model file's imports
-  (`GradientCheckpointingLayer`, `ROPE_INIT_FUNCTIONS`); the custom `qk_norm`/`rope_scaling`
-  paths may need to stay on the eager attention path for a clean trace.
+- CAPTURED (random-init LLM decoder; 4 layers, vocab 4096, seq 8; eager attention; no hub
+  download). All 3 formats clean (ok=True, 0 opaque aten ops, fx_importer path):
+  - fp32 -> molmoact.mlir       (470 linalg., ~214 KB)
+  - int8 -> molmoact_int8.mlir  (554 linalg., ~276 KB, int8_weight_only)
+  - fp8  -> molmoact_fp8.mlir   (521 linalg., ~226 KB, float8_weight_only_e4m3)
+- transformers pinned to 4.53.3 (5.x breaks on ROPE_INIT_FUNCTIONS["default"], see Venv).
 - The ViT backbone (`MolmoActVisionBackbone`) and the MolmoAct2 flow-matching head are
   separate future capture units.
-- int8/fp8: pending.

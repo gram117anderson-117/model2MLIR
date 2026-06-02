@@ -2879,7 +2879,28 @@ def decompose_slice_tensor(operands, meta, node_name):
     in_shape = list(src.type.get_shape())
     val: Any = meta["val"]
     out_shape = _static_shape(getattr(val, "shape", []))
-    if any(d < 0 for d in in_shape) or any(d < 0 for d in out_shape) or len(out_shape) != len(in_shape):
+    elem = _t_elem(src)
+    if any(d < 0 for d in in_shape) or any(d < 0 for d in out_shape):
+        return _opaque_decomp("aten_slice", operands[:1], meta, "layout", pattern_hint="slice")
+    # Rank divergence (our upstream select/squeeze collapsed size-1 dims that torch kept):
+    # if element counts match, the slice is layout-only here -> reconcile via a reshape to
+    # the meta shape rather than emitting an opaque placeholder.
+    if len(out_shape) != len(in_shape):
+        n_in = 1
+        for d in in_shape:
+            n_in *= d
+        n_out = 1
+        for d in out_shape:
+            n_out *= d
+        if n_in == n_out:
+            emitted = _emit_reshape(src, list(out_shape), elem)
+            if emitted is not None:
+                ops, res = emitted
+                rid = _next_region_id("slice")
+                for op in ops:
+                    _attach_region_id(op, rid)
+                    op.attributes["m2m.family"] = StringAttr("slice")
+                return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="slice")
         return _opaque_decomp("aten_slice", operands[:1], meta, "layout", pattern_hint="slice")
 
     rank = len(in_shape)
@@ -3606,6 +3627,92 @@ def decompose_logical_not(operands, meta, node_name):
     return _opaque_decomp("aten_logical_not", operands[:1], meta, "logical", pattern_hint="logical_not")
 
 
+def decompose_bitwise_not(operands, meta, node_name):
+    """aten.bitwise_not.default(x) -> x XOR all-ones (family bitwise). For i1 this is
+    boolean NOT; for wider integers it flips every bit (~x)."""
+    from xdsl.dialects.arith import ConstantOp, XOrIOp
+    from xdsl.dialects.builtin import IntegerAttr, IntegerType
+
+    def build(args, oe):
+        if not isinstance(oe, IntegerType):
+            return None  # bitwise_not is integer-only; bail to opaque
+        allones = 1 if oe.width.data == 1 else -1  # all-ones bit pattern for this width
+        c = ConstantOp(IntegerAttr(allones, oe), oe)
+        x = XOrIOp(args[0], c.results[0])
+        return [c, x], x.results[0]
+
+    real = _pointwise(operands[:1], meta, build, family="bitwise")
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_bitwise_not", operands[:1], meta, "bitwise", pattern_hint="bitwise_not")
+
+
+def decompose_repeat(operands, meta, node_name):
+    """aten.repeat(input, repeats) -> tile each dim by ``repeats`` (family ``tile``).
+
+    repeats has length >= input rank; extra leading entries prepend new tiled dims.
+    Lowered as a gather linalg.generic: out[coords] = input[coords_i % in_dim_i], with
+    the input dims right-aligned to the output. An all-ones repeat (no growth) is the
+    identity and forwards the operand unchanged."""
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("aten_repeat", operands[:1], meta, "tile", pattern_hint="repeat")
+    src = operands[0]
+    in_shape = _shape_of(src)
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    elem = src.type.element_type
+    if in_shape is None or any(d < 0 for d in in_shape) or any(d < 0 for d in out_shape):
+        return _opaque_decomp("aten_repeat", operands[:1], meta, "tile", pattern_hint="repeat")
+    if out_shape == list(in_shape):
+        return DecompResult(ops=[], result=src, pattern_hint="repeat")  # identity tile
+    R = len(in_shape)
+    out_rank = len(out_shape)
+    if out_rank < R:
+        return _opaque_decomp("aten_repeat", operands[:1], meta, "tile", pattern_hint="repeat")
+    offset = out_rank - R
+
+    from xdsl.dialects.arith import ConstantOp, RemUIOp
+    from xdsl.dialects.builtin import AffineMapAttr, IndexType, IntegerAttr
+    from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import EmptyOp, ExtractOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineMap
+
+    out_t = TensorType(elem, out_shape)
+    empty = EmptyOp([], out_t)
+    blk = Block(arg_types=[elem])
+    coords = []
+    for i in range(R):
+        out_dim = offset + i
+        ix = IndexOp(out_dim)
+        blk.add_op(ix)
+        if out_shape[out_dim] != in_shape[i]:   # tiled: wrap the index modulo the input extent
+            c = ConstantOp(IntegerAttr(in_shape[i], IndexType()), IndexType())
+            rem = RemUIOp(ix.results[0], c.results[0])
+            blk.add_op(c)
+            blk.add_op(rem)
+            coords.append(rem.results[0])
+        else:
+            coords.append(ix.results[0])
+    ext = ExtractOp(src, coords, elem)
+    blk.add_op(ext)
+    blk.add_op(YieldOp(ext.results[0]))
+    gen = GenericOp(
+        inputs=[],
+        outputs=[empty.results[0]],
+        body=Region(blk),
+        indexing_maps=[AffineMapAttr(AffineMap.identity(out_rank))],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * out_rank,
+        result_types=[out_t],
+    )
+    ops = [empty, gen]
+    rid = _next_region_id("tile")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("tile")
+    return DecompResult(ops=ops, result=gen.results[0], region_ids=[rid], pattern_hint="repeat")
+
+
 def _make_math_unary(op_cls_name: str, hint: str):
     """Build a decomposition that lowers a pointwise unary op to linalg.generic{math.X}
     (the exact form torch-mlir produces), with an opaque fallback."""
@@ -3654,6 +3761,7 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.rsqrt.default": decompose_rsqrt,
     "aten.pow.Tensor_Scalar": decompose_pow_tensor_scalar,
     "aten.mean.dim": decompose_mean_dim,
+    "aten.mean.default": decompose_mean_dim,  # full reduction (dims=None -> all dims, scalar)
     "aten.convolution.default": decompose_convolution,
     # ``nn.Conv2d`` lowers to ``aten.conv2d.default`` after FX export
     # (not ``aten.convolution.default``). Same shape contract; same
@@ -3710,6 +3818,8 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.arange.default": decompose_arange,
     "aten.logical_not.default": decompose_logical_not,
     "aten.bitwise_and.Tensor": decompose_bitwise_and,
+    "aten.bitwise_not.default": decompose_bitwise_not,
+    "aten.repeat.default": decompose_repeat,
     "aten.any.dim": decompose_any_real,
     "aten.index.Tensor": decompose_index_tensor,
     # Comparisons + trig + scan (RoPE / mask construction)

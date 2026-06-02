@@ -22,9 +22,26 @@ Env:
 from __future__ import annotations
 
 import os
+import sys
+import types
 
 import torch
 from torch import nn
+
+# ``gr00t.model.__init__`` eagerly imports the full training/inference pipeline
+# (dataset factory -> pandas, HF backbone setup, etc.), none of which is needed
+# to instantiate the action-head DiT and all of which drags in heavy/optional
+# deps. We only need the pure-torch modules under ``gr00t/model/gr00t_n1d7/`` and
+# ``gr00t/model/modules/``. Pre-seed ``sys.modules`` with a lightweight package
+# stub for ``gr00t.model`` so importing its leaf submodules does NOT execute the
+# package ``__init__`` body. The subpackages (gr00t_n1d7, modules) resolve via
+# the real filesystem path recorded on the stub's ``__path__``.
+import gr00t  # safe: gr00t/__init__.py only installs opt-in HF patches
+if "gr00t.model" not in sys.modules:
+    _pkg_path = os.path.join(os.path.dirname(gr00t.__file__), "model")
+    _stub = types.ModuleType("gr00t.model")
+    _stub.__path__ = [_pkg_path]  # mark as a package so submodule imports work
+    sys.modules["gr00t.model"] = _stub
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead

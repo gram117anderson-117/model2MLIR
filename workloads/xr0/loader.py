@@ -27,10 +27,74 @@ Env:
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import sys
+import types
 
 import torch
 from torch import nn
+
+
+def _load_xr0_module() -> types.ModuleType:
+    """Import the real ``mibot.models.VLA.XR0`` module in isolation.
+
+    Importing ``mibot`` normally triggers ``mibot/__init__`` -> ``mibot.data``
+    -> ``lightning`` (a heavy training-only dep we don't need), and the full
+    ``mibot.models`` package which imports the Qwen3-VL backbone wiring. We only
+    need the pure-tensor DiT classes from ``XR0.py``. So we pre-register the
+    parent packages as lightweight stubs and load ``XR0.py`` directly from its
+    file, re-using the *real* class implementations without the download/lightning
+    side-effects. ``XR0.py`` only needs ``MIMODEL`` (an mmengine Registry) and
+    ``auto_cast`` from the mibot namespace, plus the real ``qwen3vl`` module
+    (pure transformers, no weights downloaded at import).
+    """
+    if "mibot.models.VLA.XR0" in sys.modules:
+        return sys.modules["mibot.models.VLA.XR0"]
+
+    xr0_root = "/scratch/agustin/projects/Xiaomi-Robotics-0/xr0"
+    from mmengine import Registry
+
+    # --- stub package tree so XR0.py's intra-package imports resolve ---
+    def _pkg(name: str) -> types.ModuleType:
+        mod = types.ModuleType(name)
+        mod.__path__ = []  # mark as package
+        sys.modules[name] = mod
+        return mod
+
+    mibot = _pkg("mibot")
+    mibot_models = _pkg("mibot.models")
+    mibot_models.MIMODEL = Registry("MIMODEL")  # XR0.py: from mibot.models import MIMODEL
+    mibot.models = mibot_models
+    _pkg("mibot.models.VLA")
+    _pkg("mibot.models.VLM")
+    mibot_utils = _pkg("mibot.utils")
+
+    # Real auto_cast (tiny, no heavy deps).
+    mu_spec = importlib.util.spec_from_file_location(
+        "mibot.utils.model_utils", f"{xr0_root}/mibot/utils/model_utils.py"
+    )
+    model_utils = importlib.util.module_from_spec(mu_spec)
+    sys.modules["mibot.utils.model_utils"] = model_utils
+    mu_spec.loader.exec_module(model_utils)
+    mibot_utils.model_utils = model_utils
+
+    # Real qwen3vl backbone module (pure transformers; no from_pretrained at import).
+    qv_spec = importlib.util.spec_from_file_location(
+        "mibot.models.VLM.qwen3vl", f"{xr0_root}/mibot/models/VLM/qwen3vl.py"
+    )
+    qwen3vl = importlib.util.module_from_spec(qv_spec)
+    sys.modules["mibot.models.VLM.qwen3vl"] = qwen3vl
+    qv_spec.loader.exec_module(qwen3vl)
+
+    # Real XR0 module.
+    xr0_spec = importlib.util.spec_from_file_location(
+        "mibot.models.VLA.XR0", f"{xr0_root}/mibot/models/VLA/XR0.py"
+    )
+    xr0_mod = importlib.util.module_from_spec(xr0_spec)
+    sys.modules["mibot.models.VLA.XR0"] = xr0_mod
+    xr0_spec.loader.exec_module(xr0_mod)
+    return xr0_mod
 
 # Real XR0 defaults (see xr0/mibot/models/VLA/XR0.py and configs/model).
 # Qwen3-VL-4B text config: hidden 2560, 36 layers, head_dim 128, 8 KV heads.
@@ -75,7 +139,10 @@ def _build_dit_head(dit_layers: int) -> nn.Module:
     download). We bypass that by constructing the lightweight sub-modules directly,
     re-using the real XR0 classes so dit_forward semantics are identical.
     """
-    from mibot.models.VLA.XR0 import DiT, MLPProjector, TimestepEmbedder
+    _xr0 = _load_xr0_module()
+    DiT = _xr0.DiT
+    MLPProjector = _xr0.MLPProjector
+    TimestepEmbedder = _xr0.TimestepEmbedder
     from transformers import Qwen3VLTextConfig
     from transformers.models.qwen3_vl.modeling_qwen3_vl import (
         Qwen3VLTextRotaryEmbedding,
@@ -98,6 +165,7 @@ def _build_dit_head(dit_layers: int) -> nn.Module:
             txt_cfg = Qwen3VLTextConfig(
                 hidden_size=_DIT_HIDDEN, head_dim=_HEAD_DIM, num_attention_heads=8,
                 num_key_value_heads=_KV_HEADS_DIT, num_hidden_layers=2,
+                rope_scaling={"rope_type": "default", "mrope_section": [16, 24, 24]},
             )
             self.rotary_emb = Qwen3VLTextRotaryEmbedding(txt_cfg)
 
@@ -105,9 +173,47 @@ def _build_dit_head(dit_layers: int) -> nn.Module:
         dit_forward = staticmethod(None)
 
     head = _DiTHead()
-    # Reuse the real, identical dit_forward implementation.
-    from mibot.models.VLA.XR0 import XR0
-    head.dit_forward = XR0.dit_forward.__get__(head, _DiTHead)
+
+    def dit_forward(
+        self,
+        noisy_action,
+        t,
+        action_mask,
+        state_embed,
+        position_embeds,
+        past_key_values,
+        attn_mask,
+        prefix_length: int = 0,
+    ):
+        """Capture-faithful copy of ``XR0.dit_forward`` (prefix_length==0 path).
+
+        Identical math to the upstream method; the ONLY change is the timestep
+        squeeze ``t[:, 0, 0]`` -> ``t.reshape(t.shape[0])``. The upstream double
+        rank-reducing ``select`` on a ``(B, 1, 1)`` tensor lowers to a chain that
+        collapses to a rank-0 SSA value, tripping a divide-by-rank in m2m's
+        ``aten.select.int`` decomposition. ``reshape`` is value-identical for a
+        ``(B, 1, 1)`` input and lowers cleanly. ``prefix_length`` is 0, so the
+        masked-assignment branch (also non-exportable) is excluded as designed.
+        """
+        t_embeds = self.t_embedder(t.reshape(t.shape[0]) * 1000)
+        t_embeds = self.t_projector(t_embeds).view(t_embeds.shape[0], 6, -1)
+
+        noisy_action = noisy_action * action_mask
+        noisy_action = self.action_projector(noisy_action)
+
+        sink = self.sink.weight[None].repeat(state_embed.shape[0], 1, 1)
+        hidden_states = torch.cat([sink, state_embed, noisy_action], dim=1).contiguous()
+
+        hidden_states = self.dit(hidden_states, past_key_values, attn_mask, position_embeds, t_embeds)
+
+        hidden_states = hidden_states[:, -noisy_action.shape[1]:, :]
+        output = self.action_output_layer(hidden_states)
+        return output
+
+    head.dit_forward = dit_forward.__get__(head, _DiTHead)
+    # TimestepEmbedder hardcodes self.dtype=bfloat16 for its sinusoidal embed;
+    # align it to fp32 so the embedding matches the fp32 MLP weights.
+    head.t_embedder.dtype = torch.float32
     return head.to(torch.float32).eval()
 
 

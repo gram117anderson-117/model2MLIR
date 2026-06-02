@@ -58,7 +58,26 @@ print(r.path_taken, r.mlir_text.count('linalg.'))"
 ```
 
 ## Status
-- Scaffold only; not yet captured. Validate that importing `mibot.models.VLA.XR0`
-  does not eagerly trigger the Qwen3-VL download (the loader imports the classes,
-  not `XR0()` itself; if module import side-effects download, import the sub-class
-  symbols directly).
+Captured in 3 formats (`backend="fx_importer"`, CPU, no download, random init,
+`XR0_DIT_LAYERS=2`). Importing `mibot` normally pulls `mibot.data` -> `lightning`
+and the Qwen3-VL backbone wiring, so the loader loads `XR0.py` in isolation via
+`importlib` with lightweight stub parent packages (`_load_xr0_module`), re-using
+the real `DiT`/`MLPProjector`/`TimestepEmbedder` classes. No weights downloaded.
+
+Two loader fixes were needed for export:
+- `t_embedder.dtype` forced to fp32 (upstream hardcodes bf16 for the sinusoidal
+  embedding, which mismatched the fp32 MLP weights).
+- `dit_forward`'s `t[:, 0, 0]` squeeze replaced with `t.reshape(t.shape[0])`: the
+  double rank-reducing `select` on a `(B,1,1)` tensor collapses to a rank-0 SSA
+  value and trips a divide-by-rank in m2m's `aten.select.int` decomposition.
+  `reshape` is value-identical and lowers cleanly.
+
+| format | file | ok | linalg | opaque | histogram |
+|--------|------|----|--------|--------|-----------|
+| fp32 | `xr0.mlir` | yes | 431 | 1 | `aten_repeat_default: 1` |
+| int8 | `xr0_int8.mlir` | yes | 507 | 1 | `aten_repeat_default: 1` |
+| fp8  | `xr0_fp8.mlir`  | yes | 488 | 1 | `aten_repeat_default: 1` |
+
+Single opaque op (all formats): `@aten_repeat_default(tensor<1x1x1024xf32>) ->
+tensor<1x1x1024xf32>` — the `sink.weight[None].repeat(B,1,1)` broadcast (identity
+at B=1).
