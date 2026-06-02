@@ -142,6 +142,7 @@ def bridge_fx_graph(
     output_type: str = "linalg-on-tensors",
     allow_fallback: bool = True,
     exported_program: Any | None = None,
+    use_torch_mlir: bool = True,
 ) -> BridgeResult:
     """Convert ``model`` + ``example_inputs`` into an xDSL ModuleOp.
 
@@ -169,7 +170,9 @@ def bridge_fx_graph(
     """
     result = BridgeResult(output_type=output_type)
 
-    fx_module = _try_torch_mlir_import()
+    fx_module = _try_torch_mlir_import() if use_torch_mlir else None
+    if not use_torch_mlir:
+        result.diagnostics.append("torch-mlir path disabled (use_torch_mlir=False); using FXImporter")
     if fx_module is not None:
         try:
             if exported_program is not None:
@@ -187,26 +190,31 @@ def bridge_fx_graph(
                 )
             # torch-mlir returns an MlirModule; serialize to text and
             # parse into xDSL.
+            # Elide large constant tensors AND resource blobs (model weights) so the
+            # emitted MLIR is compact structural IR, not gigabytes of weight data.
             mlir_text = mlir_module.operation.get_asm(
                 binary=False,
-                large_elements_limit=64,
+                large_elements_limit=16,
+                large_resource_limit=16,
                 enable_debug_info=False,
             )
-            result.mlir_text = mlir_text
-            module = _parse_mlir_text_to_xdsl(mlir_text)
-            if module is not None:
-                result.module = module
+            # torch-mlir's text IS the authoritative output: it lowers hundreds
+            # of ops straight to standard dialects (linalg/tensor/arith/...). Parsing
+            # it back into an xDSL ModuleOp is best-effort convenience only -- xDSL's
+            # parser doesn't register every standard op (e.g. tensor.extract_slice),
+            # and a parse miss must NOT trigger a fallback to the FXImporter.
+            if mlir_text:
+                result.mlir_text = mlir_text
                 result.path_taken = "torch_mlir"
+                result.module = _parse_mlir_text_to_xdsl(mlir_text)  # may be None
+                note = "parsed into xDSL" if result.module is not None else "xDSL re-parse skipped/failed (text is authoritative)"
                 result.diagnostics.append(
-                    f"torch-mlir path produced {len(mlir_text)} chars of {output_type} MLIR; parsed into xDSL"
+                    f"torch-mlir produced {len(mlir_text)} chars of {output_type} MLIR; {note}"
                 )
-                log.info(
-                    "torch_mlir_bridge.ok",
-                    path="torch_mlir",
-                    mlir_bytes=len(mlir_text),
-                )
+                log.info("torch_mlir_bridge.ok", path="torch_mlir", mlir_bytes=len(mlir_text),
+                         xdsl_parsed=result.module is not None)
                 return result
-            result.diagnostics.append("torch-mlir produced MLIR text but xDSL could not parse it")
+            result.diagnostics.append("torch-mlir produced no MLIR text")
         except Exception as exc:  # noqa: BLE001
             result.diagnostics.append(f"torch-mlir path raised: {exc}")
             log.warning("torch_mlir_bridge.torch_mlir_failed", error=str(exc))

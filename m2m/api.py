@@ -40,7 +40,8 @@ class ConversionResult:
 
     @property
     def ok(self) -> bool:
-        return self.module is not None
+        # The MLIR text is the deliverable; the xDSL ModuleOp is best-effort.
+        return bool(self.mlir_text) and self.path_taken != "failed"
 
 
 def convert(
@@ -52,6 +53,7 @@ def convert(
     func_name: str = "forward",
     allow_fallback: bool = True,
     decompose: bool = True,
+    backend: str = "auto",
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -65,7 +67,13 @@ def convert(
         func_name: name of the public func in the emitted MLIR.
         allow_fallback: fall back to the decomposition-based FXImporter when
             torch-mlir is unavailable or fails (default True).
+        backend: "auto" (try torch-mlir, then FXImporter), "torch_mlir" (torch-mlir
+            only, no fallback), or "fx_importer" (skip torch-mlir entirely). Use
+            "fx_importer" for models whose torch-mlir lowering OOMs (e.g. the
+            vision-heavy VLAs) -- an OOM SIGKILL can't be caught for fallback.
     """
+    if backend == "torch_mlir":
+        allow_fallback = False
     if quantization is not None:
         # Quantized (tensor-subclass) weights are swapped by .to()/.eval() during
         # capture; disable swap-on-conversion process-wide so capture uses copy
@@ -86,8 +94,13 @@ def convert(
     if decompose:
         try:
             from m2m.capture.torch_export import capture_frontend_artifact
+            from m2m.ir.torchmlir_decomps import torch_mlir_gap_decompositions
 
-            artifact = capture_frontend_artifact(model, tuple(example_inputs))
+            artifact = capture_frontend_artifact(
+                model,
+                tuple(example_inputs),
+                export_decomposition_table=torch_mlir_gap_decompositions(),
+            )
             exported_program = artifact.exported_program or artifact.original_exported_program
         except Exception:  # noqa: BLE001 - bridge will re-export as a fallback
             exported_program = None
@@ -99,6 +112,7 @@ def convert(
         output_type=output_type,
         allow_fallback=allow_fallback,
         exported_program=exported_program,
+        use_torch_mlir=(backend != "fx_importer"),
     )
     mlir_text = result.mlir_text or (module_to_text(result.module) if result.module is not None else "")
     return ConversionResult(

@@ -27,3 +27,6 @@ tmp/
 *.swp
 .idea/
 .vscode/
+
+# generated MLIR captures
+workloads/**/*.mlir
