@@ -2171,6 +2171,76 @@ def decompose_any_dim(operands, meta, node_name):
     return _opaque_decomp("aten_any_dim", operands[:1], meta, "bool_reduce", pattern_hint="bool_reduce")
 
 
+def decompose_bucketize(operands, meta, node_name):
+    """aten.bucketize.Tensor(input, boundaries, *, right=False) — searchsorted.
+
+    out[*s] = #{b : boundaries[b] < input[*s]}  (right=False, the default)
+            = #{b : boundaries[b] <= input[*s]} (right=True)
+    Emitted as a counting reduction ``linalg.generic`` (family ``search``): a parallel
+    loop per input dim plus one reduction over the (sorted) boundary axis, accumulating
+    a +1 each time the predicate holds."""
+    if len(operands) < 2 or not isinstance(operands[0].type, TensorType) \
+            or not isinstance(operands[1].type, TensorType):
+        return _opaque_decomp("aten_bucketize", operands[:2], meta, "search", pattern_hint="bucketize")
+    x, bnd = operands[0], operands[1]
+    in_shape = _shape_of(x)
+    bnd_shape = _shape_of(bnd)
+    if in_shape is None or bnd_shape is None or len(bnd_shape) != 1 \
+            or any(d < 0 for d in (*in_shape, *bnd_shape)):
+        return _opaque_decomp("aten_bucketize", operands[:2], meta, "search", pattern_hint="bucketize")
+
+    from xdsl.dialects.arith import AddiOp, CmpfOp, CmpiOp, ConstantOp, SelectOp
+    from xdsl.dialects.builtin import AffineMapAttr, IntegerAttr, IntegerType
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import SplatOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    right = bool(meta.get("_fx_kwargs", {}).get("right", False) or _fx_arg(meta, 3, False))
+    in_elem = x.type.element_type
+    out_elem = _element_type_from_meta(meta)
+    if not isinstance(out_elem, IntegerType):
+        out_elem = IntegerType(64)
+    rank = len(in_shape)
+    out_t = TensorType(out_elem, list(in_shape))
+
+    zero = ConstantOp(IntegerAttr(0, out_elem), out_elem)
+    one = ConstantOp(IntegerAttr(1, out_elem), out_elem)
+    init = SplatOp(zero.result, [], out_t)
+
+    in_map = AffineMap(rank + 1, 0, tuple(AffineExpr.dimension(d) for d in range(rank)))
+    bnd_map = AffineMap(rank + 1, 0, (AffineExpr.dimension(rank),))
+    out_map = in_map
+
+    is_int = isinstance(in_elem, IntegerType)
+    # predicate: boundaries[b] < input (right=False) or <= input (right=True)
+    pred_kind = ("sle" if right else "slt") if is_int else ("ole" if right else "olt")
+    blk = Block(arg_types=[in_elem, in_elem, out_elem])
+    pred = CmpiOp(blk.args[1], blk.args[0], pred_kind) if is_int \
+        else CmpfOp(blk.args[1], blk.args[0], pred_kind)   # arg0=input, arg1=boundary
+    inc = SelectOp(pred.results[0], one.result, zero.result)
+    acc = AddiOp(blk.args[2], inc.results[0])
+    for op in (pred, inc, acc):
+        blk.add_op(op)
+    blk.add_op(YieldOp(acc.results[0]))
+
+    iters = [IteratorTypeAttr(IteratorType.PARALLEL)] * rank + [IteratorTypeAttr(IteratorType.REDUCTION)]
+    gen = GenericOp(
+        inputs=[x, bnd],
+        outputs=[init.results[0]],
+        body=Region(blk),
+        indexing_maps=[AffineMapAttr(in_map), AffineMapAttr(bnd_map), AffineMapAttr(out_map)],
+        iterator_types=iters,
+        result_types=[out_t],
+    )
+    ops = [zero, one, init, gen]
+    rid = _next_region_id("search")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("search")
+    return DecompResult(ops=ops, result=gen.results[0], region_ids=[rid], pattern_hint="bucketize")
+
+
 def decompose_index_tensor(operands, meta, node_name):
     """aten.index.Tensor — multi-dim gather. Operand 0 is source; index
     tensors arrive via meta['_fx_args'][1] as a list."""
@@ -3319,6 +3389,8 @@ DECOMPOSITION_TABLE.update(
         "aten.max.dim": _make_dim_extremum(is_min=False, indices_only=False),
         "aten.argmin.default": _make_dim_extremum(is_min=True, indices_only=True),
         "aten.argmax.default": _make_dim_extremum(is_min=False, indices_only=True),
+        "aten.bucketize.Tensor": decompose_bucketize,
+        "aten.searchsorted.Tensor": decompose_bucketize,
     }
 )
 for _k in ("eq", "ne", "lt", "le", "gt", "ge"):
