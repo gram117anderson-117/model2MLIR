@@ -286,15 +286,15 @@ def decompose_linear(
     x = operands[0]  # input: [M, K]
     w = operands[1]  # weight: [N, K]
 
-    # Get result type from metadata
+    # Get result type from metadata (preserve operand dtype, e.g. bf16)
     val: Any = meta["val"]
-    result_type = TensorType(Float32Type(), _static_shape(val.shape))
+    result_type = TensorType(_t_elem(x), _static_shape(val.shape))
 
     # Step 1: Transpose weight [N, K] -> [K, N]
     w_type = w.type
     assert isinstance(w_type, TensorType)
     w_shape = w_type.get_shape()
-    wt_type = TensorType(Float32Type(), [w_shape[1], w_shape[0]])
+    wt_type = TensorType(_t_elem(w), [w_shape[1], w_shape[0]])
     wt_empty = _make_empty(wt_type)
     ops.append(wt_empty)
 
@@ -386,6 +386,14 @@ def _shape_of(ssa: SSAValue) -> list[int] | None:
     if isinstance(t, TensorType):
         return list(t.get_shape())
     return None
+
+
+def _t_elem(ssa: SSAValue):
+    """Element type of a tensor SSA value (so matmul/transpose preserve dtype rather than
+    hardcoding f32). Mismatched matmul operand dtypes are caught by the importer's
+    verify-fallback -> opaque."""
+    t = ssa.type
+    return t.element_type if isinstance(t, TensorType) else Float32Type()
 
 
 def _binary_elementwise(operands, meta, op_name, scalar_build):
@@ -616,7 +624,7 @@ def decompose_mm(
 ) -> DecompResult:
     """Decompose aten.mm.default(a, b) -> linalg.matmul."""
     val: Any = meta["val"]
-    result_type = TensorType(Float32Type(), _static_shape(val.shape))
+    result_type = TensorType(_t_elem(operands[0]), _static_shape(val.shape))
 
     mm_empty = _make_empty(result_type)
     matmul = MatmulOp(
@@ -637,7 +645,7 @@ def decompose_transpose(
 ) -> DecompResult:
     """Decompose aten.t.default(input) -> linalg.transpose."""
     val: Any = meta["val"]
-    result_type = TensorType(Float32Type(), _static_shape(val.shape))
+    result_type = TensorType(_t_elem(operands[0]), _static_shape(val.shape))
 
     t_empty = _make_empty(result_type)
     perm = DenseArrayBase.from_list(i64, [1, 0])
@@ -694,7 +702,7 @@ def decompose_addmm(
     from xdsl.dialects.func import CallOp
 
     val: Any = meta["val"]
-    result_type = TensorType(Float32Type(), _static_shape(val.shape))
+    result_type = TensorType(_t_elem(operands[1]), _static_shape(val.shape))
     ops: list[Operation] = []
     region_ids: list[str] = []
 
@@ -754,7 +762,7 @@ def _opaque_decomp(
     # about; auxiliary outputs (mean / rstd / etc.) are folded away.
     if isinstance(val, (tuple, list)) and val:
         val = val[0]
-    result_type = TensorType(Float32Type(), _static_shape(val.shape))
+    result_type = TensorType(_t_elem(operands[1]), _static_shape(val.shape))
     rid = _next_region_id(region_prefix)
     call = CallOp(op_name, operands, [result_type])
     _attach_region_id(call, rid)
@@ -769,7 +777,7 @@ def _opaque_decomp(
 def decompose_bmm(operands, meta, node_name):
     """aten.bmm.default(a, b) -> linalg.batch_matmul."""
     val: Any = meta["val"]
-    result_type = TensorType(Float32Type(), _static_shape(val.shape))
+    result_type = TensorType(_t_elem(operands[0]), _static_shape(val.shape))
 
     # We don't have a dedicated BatchMatmulOp in the xdsl dialect here;
     # emit as opaque call but with a canonical hint so the propagation
@@ -1225,7 +1233,7 @@ def decompose_matmul(operands, meta, node_name):
             and len(list(lhs_type.get_shape())) == 2
             and len(list(rhs_type.get_shape())) == 2
         ):
-            result_type = TensorType(Float32Type(), _static_shape(shape))
+            result_type = TensorType(_t_elem(operands[0]), _static_shape(shape))
             init = _make_empty(result_type)
             mm = MatmulOp(
                 inputs=[lhs, rhs],
