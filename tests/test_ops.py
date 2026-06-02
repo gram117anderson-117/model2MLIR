@@ -69,6 +69,17 @@ CASES = [
     ("to_copy_bool2int", lambda a: (a > 0).to(torch.int64), X),
     ("rsub_scalar", lambda a: 1.0 - a, X),            # reverse sub: scalar - tensor
     ("rdiv_scalar", lambda a: 2.0 / (a.abs() + 1), X),
+    ("bucketize", lambda a: torch.bucketize(a, torch.linspace(-1, 1, 7)), X),
+    ("index_gather", lambda s, i0, i1: s[i0, i1],
+     (torch.randn(4, 8), torch.zeros(1, 1, dtype=torch.int64), torch.arange(8).view(1, 8))),
+]
+
+# Data-dependent ops: output has a dynamic (?) dim, so shape can't match eager exactly --
+# assert only that they lower to standard dialects (scf + tensor) with no opaque calls.
+DYNAMIC_CASES = [
+    ("bool_mask_gather", lambda x, m: x[m], (torch.arange(8), torch.tensor([True, False] * 4))),
+    ("masked_scatter", _masked_scatter := (lambda s, src, m: s.clone().index_put_((m,), src[m])),
+     (torch.zeros(8, dtype=torch.int64), torch.arange(8), torch.tensor([True, False] * 4))),
 ]
 
 
@@ -78,3 +89,11 @@ def test_op_lowers_to_standard_dialects(name, fn, inputs):
     assert v.error is None, v.error
     assert v.lowered, f"{name} left opaque calls: {v.opaque_calls}"
     assert v.shape_ok, f"{name} result type {v.mlir_result_type} != eager {v.eager_shape}"
+
+
+@pytest.mark.parametrize("name,fn,inputs", DYNAMIC_CASES, ids=[c[0] for c in DYNAMIC_CASES])
+def test_dynamic_op_lowers_to_standard_dialects(name, fn, inputs):
+    """Data-dependent ops lower to scf+tensor with a dynamic (?) dim -- no opaque calls."""
+    v = validate_op(fn, inputs, name=name)
+    assert v.error is None, v.error
+    assert v.lowered, f"{name} left opaque calls: {v.opaque_calls}"

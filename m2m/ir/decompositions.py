@@ -2241,6 +2241,86 @@ def decompose_bucketize(operands, meta, node_name):
     return DecompResult(ops=ops, result=gen.results[0], region_ids=[rid], pattern_hint="bucketize")
 
 
+def _flatten_1d(ssa, shape, elem, ops):
+    """Collapse a tensor to 1-D [numel] (no-op if already 1-D). Appends to ``ops``,
+    returns (flat_ssa, numel) or (None, 0) if the reshape can't be emitted."""
+    numel = 1
+    for d in shape:
+        numel *= d
+    if len(shape) == 1:
+        return ssa, numel
+    emitted = _emit_reshape(ssa, [numel], elem)
+    if emitted is None:
+        return None, 0
+    ops.extend(emitted[0])
+    return emitted[1], numel
+
+
+def _bool_mask_gather(source, mask, shape, elem):
+    """src[mask] (full boolean mask) -> tensor<?xELEM> via stream compaction.
+
+    Counts the True entries (dynamic extent), allocates a tensor<?> of that size, then
+    an scf.for/scf.if loop copies each selected element into the next write slot
+    (tensor.insert). Family ``mask_gather`` -- a genuinely data-dependent op expressed
+    with a dynamic dimension rather than bailed to opaque."""
+    from xdsl.dialects.arith import AddiOp, ConstantOp, IndexCastOp
+    from xdsl.dialects.builtin import DYNAMIC_INDEX, IndexType, IntegerAttr, i64
+    from xdsl.dialects.linalg import ReduceOp  # noqa: F401 (via _reduce)
+    from xdsl.dialects.scf import ForOp, IfOp
+    from xdsl.dialects.scf import YieldOp as ScfYield
+    from xdsl.dialects.tensor import EmptyOp, ExtractOp, InsertOp
+    from xdsl.ir import Block, Region
+
+    ops: list[Operation] = []
+    src_flat, numel = _flatten_1d(source, shape, elem, ops)
+    mask_flat, _ = _flatten_1d(mask, shape, mask.type.element_type, ops)
+    if src_flat is None or mask_flat is None:
+        return _opaque_decomp("aten_index", [source], {"val": None}, "gather", pattern_hint="gather")
+
+    # count = sum(mask as i64) -> index
+    cast = _cast_tensor(mask_flat, [numel], i64)
+    if cast is None:
+        return _opaque_decomp("aten_index", [source], {"val": None}, "gather", pattern_hint="gather")
+    ops += cast[0]
+    from xdsl.dialects.arith import AddiOp as _AddiOp
+    rops, summ, _ = _reduce(cast[1], [numel], [0], 0, _AddiOp, i64)
+    ops += rops
+    cnt_ext = ExtractOp(summ, [], i64)
+    cnt_idx = IndexCastOp(cnt_ext.results[0], IndexType())
+    ops += [cnt_ext, cnt_idx]
+
+    dyn_t = TensorType(elem, [DYNAMIC_INDEX])
+    c0 = ConstantOp(IntegerAttr(0, IndexType()), IndexType())
+    c1 = ConstantOp(IntegerAttr(1, IndexType()), IndexType())
+    cN = ConstantOp(IntegerAttr(numel, IndexType()), IndexType())
+    init = EmptyOp([cnt_idx.results[0]], dyn_t)
+    ops += [c0, c1, cN, init]
+
+    # loop body: (iv, acc: tensor<?>, wp: index)
+    body = Block(arg_types=[IndexType(), dyn_t, IndexType()])
+    iv, acc, wp = body.args
+    m = ExtractOp(mask_flat, [iv], mask.type.element_type)
+    body.add_op(m)
+    then_blk = Block()
+    v = ExtractOp(src_flat, [iv], elem)
+    ins = InsertOp(v.results[0], acc, [wp])
+    wp2 = AddiOp(wp, c1.results[0])
+    then_blk.add_ops([v, ins, wp2, ScfYield(ins.results[0], wp2.results[0])])
+    else_blk = Block()
+    else_blk.add_op(ScfYield(acc, wp))
+    iff = IfOp(m.results[0], [dyn_t, IndexType()], Region(then_blk), Region(else_blk))
+    body.add_op(iff)
+    body.add_op(ScfYield(iff.results[0], iff.results[1]))
+    floop = ForOp(c0.results[0], cN.results[0], c1.results[0], [init.results[0], c0.results[0]], Region(body))
+    ops.append(floop)
+
+    rid = _next_region_id("mask_gather")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("mask_gather")
+    return DecompResult(ops=ops, result=floop.results[0], region_ids=[rid], pattern_hint="mask_gather")
+
+
 def decompose_index_tensor(operands, meta, node_name):
     """aten.index.Tensor(self, [idx0, idx1, ...]) — advanced integer-array gather.
 
@@ -2265,8 +2345,12 @@ def decompose_index_tensor(operands, meta, node_name):
 
     if not idxs or any(not isinstance(t.type, TensorType) for t in idxs):
         return bail()
-    # boolean-mask indexing -> data-dependent (dynamic) output: not statically lowerable
-    if any(isinstance(t.type.element_type, IntegerType) and t.type.element_type.width.data == 1 for t in idxs):
+    # boolean-mask indexing src[mask]: data-dependent #True -> a dynamic (?) output dim.
+    # Lowered by stream compaction (scf.for + scf.if + tensor.insert) into tensor<?xELEM>.
+    if len(idxs) == 1 and isinstance(idxs[0].type.element_type, IntegerType) \
+            and idxs[0].type.element_type.width.data == 1:
+        if src_shape is not None and _shape_of(idxs[0]) == src_shape and not any(d < 0 for d in src_shape):
+            return _bool_mask_gather(source, idxs[0], src_shape, out_elem)
         return bail()
     if src_shape is None or any(d < 0 for d in src_shape) or any(d < 0 for d in out_shape):
         return bail()
@@ -2312,6 +2396,78 @@ def decompose_index_tensor(operands, meta, node_name):
         _attach_region_id(op, rid)
         op.attributes["m2m.family"] = StringAttr("gather")
     return DecompResult(ops=ops, result=gen.results[0], region_ids=[rid], pattern_hint="index_gather")
+
+
+def decompose_index_put(operands, meta, node_name):
+    """aten.index_put(self, [mask], values, accumulate=False) — masked scatter.
+
+    For a single boolean mask: self[mask] = values, where values is the (dynamic-length)
+    compacted set of replacements. Lowered (family ``mask_scatter``) by an scf.for/scf.if
+    loop that walks self in flat order, consuming ``values`` sequentially at each True
+    position (tensor.insert) -- the output keeps self's static shape; only the consumed
+    ``values`` tensor carries the dynamic (?) dim."""
+    if len(operands) < 3 or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+    self_t, mask, values = operands[0], operands[1], operands[2]
+    self_shape = _shape_of(self_t)
+    elem = self_t.type.element_type
+    from xdsl.dialects.builtin import IntegerType
+
+    if self_shape is None or any(d < 0 for d in self_shape) \
+            or not isinstance(mask.type, TensorType) \
+            or not isinstance(mask.type.element_type, IntegerType) or mask.type.element_type.width.data != 1 \
+            or _shape_of(mask) != self_shape:
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+
+    from xdsl.dialects.arith import AddiOp, ConstantOp
+    from xdsl.dialects.builtin import IndexType, IntegerAttr
+    from xdsl.dialects.scf import ForOp, IfOp
+    from xdsl.dialects.scf import YieldOp as ScfYield
+    from xdsl.dialects.tensor import ExtractOp, InsertOp
+    from xdsl.ir import Block, Region
+
+    ops: list[Operation] = []
+    self_flat, numel = _flatten_1d(self_t, self_shape, elem, ops)
+    mask_flat, _ = _flatten_1d(mask, self_shape, mask.type.element_type, ops)
+    if self_flat is None or mask_flat is None:
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+
+    c0 = ConstantOp(IntegerAttr(0, IndexType()), IndexType())
+    c1 = ConstantOp(IntegerAttr(1, IndexType()), IndexType())
+    cN = ConstantOp(IntegerAttr(numel, IndexType()), IndexType())
+    ops += [c0, c1, cN]
+
+    flat_t = TensorType(elem, [numel])
+    body = Block(arg_types=[IndexType(), flat_t, IndexType()])
+    iv, acc, rp = body.args            # induction var, running self, read pointer into values
+    m = ExtractOp(mask_flat, [iv], mask.type.element_type)
+    body.add_op(m)
+    then_blk = Block()
+    v = ExtractOp(values, [rp], elem)
+    ins = InsertOp(v.results[0], acc, [iv])
+    rp2 = AddiOp(rp, c1.results[0])
+    then_blk.add_ops([v, ins, rp2, ScfYield(ins.results[0], rp2.results[0])])
+    else_blk = Block()
+    else_blk.add_op(ScfYield(acc, rp))
+    iff = IfOp(m.results[0], [flat_t, IndexType()], Region(then_blk), Region(else_blk))
+    body.add_op(iff)
+    body.add_op(ScfYield(iff.results[0], iff.results[1]))
+    floop = ForOp(c0.results[0], cN.results[0], c1.results[0], [self_flat, c0.results[0]], Region(body))
+    ops.append(floop)
+
+    result = floop.results[0]
+    if len(self_shape) != 1:
+        back = _emit_reshape(result, list(self_shape), elem)
+        if back is None:
+            return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+        ops += back[0]
+        result = back[1]
+
+    rid = _next_region_id("mask_scatter")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("mask_scatter")
+    return DecompResult(ops=ops, result=result, region_ids=[rid], pattern_hint="index_put")
 
 
 def decompose_compare(operands, meta, node_name):
@@ -3456,6 +3612,9 @@ DECOMPOSITION_TABLE.update(
         "aten.argmax.default": _make_dim_extremum(is_min=False, indices_only=True),
         "aten.bucketize.Tensor": decompose_bucketize,
         "aten.searchsorted.Tensor": decompose_bucketize,
+        "aten.index_put.default": decompose_index_put,
+        "aten.index_put_.default": decompose_index_put,
+        "aten._index_put_impl.default": decompose_index_put,
     }
 )
 for _k in ("eq", "ne", "lt", "le", "gt", "ge"):
