@@ -73,9 +73,23 @@ If a new op shows up opaque, add its decomposition (one entry in
 far have needed at most one new op each (RDT=`squeeze`, GR00T=`bitwise_not`, xr0=`repeat`,
 BitVLA=`mean.default`).
 
-## Models
-`tiny_llama, pi05, smolvla, rdt, rdt2, molmoact, openvla, xr0, bitvla, groot_n1d7` — each with
-a `loader.py` + `capture.toml`. Per-model environment notes are in each `workloads/<model>/README.md`.
+## Models & status
+Each has a `loader.py` + `capture.toml`; per-model env notes in `workloads/<model>/README.md`.
 ```bash
 python workloads/capture.py --all     # capture/refresh all 10 in fp32+int8+fp8
 ```
+
+| Model | fp32 | int8 | fp8 | notes |
+|---|---|---|---|---|
+| tiny_llama | 0 | 0 | 0 | |
+| smolvla | 0 | 0 | 0 | |
+| rdt | 0 | 0 | 0 | |
+| rdt2 | 0 | 0 | 0 | |
+| molmoact | 0 | 0 | 0 | |
+| openvla | 0 | 0 | 0 | real DINO+SigLIP+Llama stack, no 14 GB download |
+| xr0 | 0 | 0 | 0 | |
+| bitvla | 0 | 0 | 0 | int8/fp8 quantize lm_head only (BitNet W1.58 stays) |
+| groot_n1d7 | 0 | 0 | 0 | |
+| pi05 | 0 | 357* | 357* | *torchao-0.11 (openpi's torch-2.7.1 pin) retains SDPA + a few ops on the **quantized** export, which doesn't route through the gap-decomp table. fp32 is 0 opaque. Fix: newer torch/torchao in the openpi venv, or wire the gap decomps into the quant export path. |
+
+"0" = 0 opaque ops. Re-run `capture.py <model>` to regenerate after converter changes.
