@@ -1,4 +1,4 @@
-"""pi0.5 (PyTorch) capture loader for model2mlir.
+"""pi0.5 (PyTorch) capture loader for m2m.
 
 Builds the real pi0.5 architecture (PaliGemma gemma_2b + gemma_300m action expert,
 pi05=True) with random init (no checkpoint download), and exposes a single

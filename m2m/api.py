@@ -1,0 +1,146 @@
+"""Public conversion API: PyTorch / torchAO model -> MLIR (linalg-on-tensors).
+
+`convert()` is the one call most users want. It runs the torch-mlir bridge
+(torch-mlir primary path, decomposition-based FXImporter fallback) and returns
+the MLIR text plus diagnostics about which path was taken and what coverage was
+needed.
+
+The self-updating coverage loop lives under `m2m.capture.unsupported`;
+`coverage_report()` surfaces it for a given model.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from xdsl.dialects.builtin import ModuleOp
+
+from m2m.capture.torch_mlir_bridge import bridge_fx_graph, module_to_text
+from m2m.capture.torchao_pipeline import QuantizationConfig, apply_quantization
+
+
+@dataclass
+class ConversionResult:
+    """Outcome of converting a model to MLIR.
+
+    Attributes:
+        mlir_text: the emitted MLIR (linalg-on-tensors by default).
+        module: the parsed xDSL ModuleOp, or None on failure.
+        path_taken: "torch_mlir" | "fx_importer" | "failed".
+        output_type: the MLIR output dialect requested.
+        diagnostics: human-readable diagnostic strings from the bridge.
+    """
+
+    mlir_text: str = ""
+    module: ModuleOp | None = None
+    path_taken: str = "failed"
+    output_type: str = "linalg-on-tensors"
+    diagnostics: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.module is not None
+
+
+def convert(
+    model: Any,
+    example_inputs: tuple[Any, ...],
+    *,
+    output_type: str = "linalg-on-tensors",
+    quantization: QuantizationConfig | None = None,
+    func_name: str = "forward",
+    allow_fallback: bool = True,
+    decompose: bool = True,
+) -> ConversionResult:
+    """Convert a PyTorch model to MLIR.
+
+    Args:
+        model: a torch.nn.Module (or an ExportedProgram, which torch-mlir accepts).
+        example_inputs: tuple of example tensors the artifact will be called with.
+        output_type: torch-mlir output dialect. "linalg-on-tensors" is the default
+            and the level merlin ingests. Pass "torch" for the raw Torch dialect.
+        quantization: optional torchAO QuantizationConfig applied before export, so
+            quantization is captured end-to-end.
+        func_name: name of the public func in the emitted MLIR.
+        allow_fallback: fall back to the decomposition-based FXImporter when
+            torch-mlir is unavailable or fails (default True).
+    """
+    if quantization is not None:
+        # Quantized (tensor-subclass) weights are swapped by .to()/.eval() during
+        # capture; disable swap-on-conversion process-wide so capture uses copy
+        # semantics and doesn't trip the weakref guard.
+        import torch
+
+        try:
+            torch.__future__.set_swap_module_params_on_conversion(False)
+        except Exception:  # noqa: BLE001
+            pass
+        model = apply_quantization(model, quantization)
+
+    # Decompose-first: capture an ExportedProgram and run decompositions so
+    # composite ops torch-mlir can't legalize (e.g. aten.diff) are lowered
+    # away before torch-mlir sees them. Falls back to letting the bridge
+    # re-export the module if capture fails.
+    exported_program = None
+    if decompose:
+        try:
+            from m2m.capture.torch_export import capture_frontend_artifact
+
+            artifact = capture_frontend_artifact(model, tuple(example_inputs))
+            exported_program = artifact.exported_program or artifact.original_exported_program
+        except Exception:  # noqa: BLE001 - bridge will re-export as a fallback
+            exported_program = None
+
+    result = bridge_fx_graph(
+        model,
+        tuple(example_inputs),
+        func_name=func_name,
+        output_type=output_type,
+        allow_fallback=allow_fallback,
+        exported_program=exported_program,
+    )
+    mlir_text = result.mlir_text or (module_to_text(result.module) if result.module is not None else "")
+    return ConversionResult(
+        mlir_text=mlir_text,
+        module=result.module,
+        path_taken=result.path_taken,
+        output_type=output_type,
+        diagnostics=list(result.diagnostics),
+    )
+
+
+def coverage_report(
+    model: Any,
+    example_inputs: tuple[Any, ...],
+    *,
+    quantization: QuantizationConfig | None = None,
+) -> dict[str, Any]:
+    """Capture the model and report op-coverage: which ops are unsupported and
+    what the self-updating loop resolved for each.
+
+    Returns a dict with the decomposition targets applied and the list of
+    unsupported-op resolutions (target + verification status).
+    """
+    from m2m.capture.torch_export import capture_frontend_artifact
+
+    if quantization is not None:
+        model = apply_quantization(model, quantization)
+
+    artifact = capture_frontend_artifact(model, example_inputs, quantization_config=quantization)
+    return {
+        "valid": artifact.validation.valid,
+        "num_ops": getattr(artifact.validation, "num_ops", None),
+        "decomposition_targets": list(artifact.decomposition_targets),
+        "unsupported": [
+            {
+                "target": r.target,
+                "strategy": getattr(r.classification, "strategy", None),
+                "eager_reference_ok": getattr(r.verification, "eager_reference_ok", None),
+            }
+            for r in artifact.unsupported_resolutions
+        ],
+    }
+
+
+__all__ = ["ConversionResult", "convert", "coverage_report"]

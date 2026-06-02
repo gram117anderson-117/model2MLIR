@@ -11,7 +11,7 @@ live in separate folders). The general recipe for a hard-stack model:
    torch-mlir; install the torch-mlir wheel too if a matching cp/torch wheel exists).
 3. Capture only the tensor compute (e.g. one flow-matching `denoise_step`); run host-side
    preprocessing eagerly outside the graph.
-4. `model2mlir convert workloads/<model>/loader.py --out workloads/<model>/<model>.mlir`
+4. `m2m convert workloads/<model>/loader.py --out workloads/<model>/<model>.mlir`
 
 ## Status (fp32 unless noted)
 

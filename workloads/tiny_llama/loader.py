@@ -1,12 +1,12 @@
 """TinyLlama (1.1B) causal-LM example -> MLIR.
 
-    model2mlir coverage examples/tiny_llama.py
-    model2mlir convert  examples/tiny_llama.py --out /tmp/tinyllama.mlir
-    model2mlir convert  examples/tiny_llama.py --quant int8_weight_only --out /tmp/tinyllama_int8.mlir
+    m2m coverage examples/tiny_llama.py
+    m2m convert  examples/tiny_llama.py --out /tmp/tinyllama.mlir
+    m2m convert  examples/tiny_llama.py --quant int8_weight_only --out /tmp/tinyllama_int8.mlir
 
 Env:
-    TORCH2MLIR_LLAMA_LAYERS=N   truncate to N decoder layers (fast smoke; default: full)
-    TORCH2MLIR_SEQ=N            sequence length for the example input (default 8)
+    M2M_LLAMA_LAYERS=N   truncate to N decoder layers (fast smoke; default: full)
+    M2M_SEQ=N            sequence length for the example input (default 8)
 
 Weights are loaded from the local HF cache (TinyLlama/TinyLlama-1.1B-Chat-v1.0).
 """
@@ -36,8 +36,8 @@ class _LogitsOnly(nn.Module):
 def get_model_and_inputs() -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    n_layers = os.environ.get("TORCH2MLIR_LLAMA_LAYERS")
-    seq = int(os.environ.get("TORCH2MLIR_SEQ", "8"))
+    n_layers = os.environ.get("M2M_LLAMA_LAYERS")
+    seq = int(os.environ.get("M2M_SEQ", "8"))
 
     if n_layers:
         # Fast smoke path: real Llama architecture, fewer layers, random init.

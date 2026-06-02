@@ -1,4 +1,4 @@
-"""smolVLA (lerobot) capture loader for model2mlir.
+"""smolVLA (lerobot) capture loader for m2m.
 
 Builds smolVLA's VLAFlowMatching (SmolVLM2-500M backbone + action expert) and exposes
 one flow-matching denoise step (prefix embed + one expert pass) as the capture unit,

@@ -23,9 +23,9 @@ uv pip install -e /scratch/agustin/projects/model2MLIR --no-deps
 ```bash
 cd /scratch/agustin/projects/openpi
 uv run --no-sync python -c "
-import model2mlir, sys; sys.path.insert(0,'/scratch/agustin/projects/model2MLIR/workloads/pi05')
+import m2m, sys; sys.path.insert(0,'/scratch/agustin/projects/model2MLIR/workloads/pi05')
 from loader import get_model_and_inputs
-m,i=get_model_and_inputs(); r=model2mlir.convert(m,i)
+m,i=get_model_and_inputs(); r=m2m.convert(m,i)
 open('/scratch/agustin/projects/model2MLIR/workloads/pi05/pi05.mlir','w').write(r.mlir_text)
 print(r.path_taken, r.mlir_text.count('linalg.'))"
 ```
