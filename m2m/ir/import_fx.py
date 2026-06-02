@@ -390,6 +390,12 @@ class FXImporter:
                     verify_err = None
                     try:
                         for op in result.ops:
+                            # CallOp placeholders are opaque-by-design; their external
+                            # decl is added below (ensure_external_decl), so don't verify
+                            # them here -- verifying an undeclared callee would wrongly
+                            # reject a decomposition that mixes real ops + opaque calls.
+                            if isinstance(op, CallOp):
+                                continue
                             op.verify()
                     except Exception as verr:  # noqa: BLE001
                         verify_err = verr

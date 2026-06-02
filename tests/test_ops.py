@@ -38,6 +38,11 @@ CASES = [
     ("floor", torch.floor, X),
     ("log", lambda a: torch.log(a.abs() + 1), X),
     ("gelu", torch.nn.functional.gelu, X),
+    ("permute3d", lambda a: a.permute(0, 2, 1), (torch.randn(2, 3, 4),)),
+    ("clone", torch.clone, X),
+    ("mul_bcast", lambda a, b: a * b, (torch.randn(4, 8), torch.randn(8))),
+    ("mm", torch.mm, (torch.randn(4, 8), torch.randn(8, 16))),
+    ("addmm", lambda b, x, w: torch.addmm(b, x, w), (torch.randn(16), torch.randn(4, 8), torch.randn(8, 16))),
 ]
 
 

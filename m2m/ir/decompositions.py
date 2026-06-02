@@ -719,12 +719,33 @@ def decompose_addmm(
     region_ids.append(matmul_rid)
     ops.append(matmul)
 
-    bias_add = CallOp("aten_bias_add", [operands[0], matmul.results[0]], [result_type])
+    # Bias add (broadcast): bias [N] over matmul result [M, N] via linalg.generic.
+    from xdsl.dialects.arith import AddfOp
+
+    out_shape = _static_shape(val.shape)
+    mm_res = matmul.results[0]
+    elem = result_type.element_type
+    mb = _broadcast_map(_shape_of(operands[0]) or [], out_shape)
+    if mb is not None and _t_elem(operands[0]) == elem and not any(d < 0 for d in out_shape):
+        em = _elementwise(
+            [mm_res, operands[0]], result_type, _bin_build(AddfOp),
+            input_maps=[_broadcast_map(out_shape, out_shape), mb],
+        )
+        if em is not None:
+            add_ops, res = em
+            add_rid = _next_region_id("add")
+            for op in add_ops:
+                _attach_region_id(op, add_rid)
+            region_ids.append(add_rid)
+            ops.extend(add_ops)
+            return DecompResult(ops=ops, result=res, region_ids=region_ids, pattern_hint="addmm")
+
+    # Fallback: keep the real matmul, opaque bias add.
+    bias_add = CallOp("aten_bias_add", [operands[0], mm_res], [result_type])
     add_rid = _next_region_id("add")
     _attach_region_id(bias_add, add_rid)
     region_ids.append(add_rid)
     ops.append(bias_add)
-
     return DecompResult(ops=ops, result=bias_add.res[0], region_ids=region_ids)
 
 
@@ -1928,6 +1949,11 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.gelu.default": decompose_gelu,
     "aten.add.Tensor": decompose_add_tensor,
     "aten.mul.Tensor": decompose_mul_tensor,
+    # scalar overloads route to the same emitters (scalar is splatted)
+    "aten.add.Scalar": decompose_add_tensor,
+    "aten.mul.Scalar": decompose_mul_tensor,
+    "aten.sub.Scalar": decompose_sub_tensor,
+    "aten.div.Scalar": decompose_div_tensor,
     "aten.mm.default": decompose_mm,
     "aten.permute.default": decompose_permute,
     "aten.t.default": decompose_transpose,
