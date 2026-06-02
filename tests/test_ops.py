@@ -58,6 +58,15 @@ CASES = [
     ("softmax", lambda a: torch.softmax(a, -1), X),
     ("layer_norm", lambda a: torch.nn.functional.layer_norm(a, (8,), torch.ones(8), torch.zeros(8)), X),
     ("bmm", torch.bmm, (torch.randn(2, 4, 8), torch.randn(2, 8, 16))),
+    # scan / arg-reduce / dtype-edge families
+    ("cumsum", lambda a: torch.cumsum(a, -1), X),
+    ("cumsum_bool", lambda a: torch.cumsum(a > 0, -1), X),
+    ("min_dim_vals", lambda a: torch.min(a, dim=1, keepdim=True)[0], X),
+    ("min_dim_idx", lambda a: torch.min(a, dim=1)[1], X),
+    ("argmax", lambda a: torch.argmax(a, dim=-1), X),
+    ("sum_bool_keepdim", lambda a: (a > 0).sum(0, keepdim=True), (torch.randn(8),)),
+    ("reciprocal_int", lambda a: torch.reciprocal(a), (torch.tensor([2, 3, 4]),)),
+    ("to_copy_bool2int", lambda a: (a > 0).to(torch.int64), X),
 ]
 
 

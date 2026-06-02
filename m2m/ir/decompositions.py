@@ -136,12 +136,30 @@ def _emit_reshape(source: SSAValue, out_shape: list[int], elem: Any):
     if not isinstance(src_type, TensorType):
         return None
     in_shape = list(src_type.get_shape())
-    if not in_shape or not out_shape or any(d < 0 for d in (*in_shape, *out_shape)):
+    if any(d < 0 for d in (*in_shape, *out_shape)):
         return None
     if in_shape == out_shape:
         return [], source  # identity reshape
 
     from xdsl.dialects.tensor import CollapseShapeOp, ExpandShapeOp
+
+    # rank-0 (scalar) endpoints: a full reduction yields a 0-D tensor that a keepdim
+    # reshape must turn back into an all-ones shape (and vice-versa). expand/collapse
+    # can't bridge rank-0, so reshape a single-element tensor via extract + from_elements.
+    if not in_shape or not out_shape:
+        from xdsl.dialects.arith import ConstantOp
+        from xdsl.dialects.builtin import IndexType, IntegerAttr
+        from xdsl.dialects.tensor import ExtractOp, FromElementsOp
+
+        cops: list[Operation] = []
+        idxs = []
+        for _ in in_shape:  # all source dims are size 1
+            c = ConstantOp(IntegerAttr(0, IndexType()), IndexType())
+            cops.append(c)
+            idxs.append(c.results[0])
+        ext = ExtractOp(source, idxs, elem)
+        fe = FromElementsOp(ext.results[0], result_type=TensorType(elem, out_shape))
+        return [*cops, ext, fe], fe.results[0]
 
     numel = 1
     for d in in_shape:
@@ -204,7 +222,7 @@ def _cast_scalar_arg(x, dst):
     src = x.type
     if src == dst:
         return [], x
-    from xdsl.dialects.arith import ExtFOp, ExtSIOp, FPToSIOp, SIToFPOp, TruncFOp, TruncIOp
+    from xdsl.dialects.arith import ExtFOp, ExtSIOp, ExtUIOp, FPToSIOp, SIToFPOp, TruncFOp, TruncIOp
     from xdsl.dialects.builtin import AnyFloat, IntegerType
 
     if isinstance(src, AnyFloat) and isinstance(dst, AnyFloat):
@@ -214,10 +232,26 @@ def _cast_scalar_arg(x, dst):
     elif isinstance(src, AnyFloat) and isinstance(dst, IntegerType):
         op = FPToSIOp(x, dst)
     elif isinstance(src, IntegerType) and isinstance(dst, IntegerType):
-        op = TruncIOp(x, dst) if dst.width.data < src.width.data else ExtSIOp(x, dst)
+        if dst.width.data < src.width.data:
+            op = TruncIOp(x, dst)
+        # widening: bool (i1) zero-extends (True->1), signed ints sign-extend
+        elif src.width.data == 1:
+            op = ExtUIOp(x, dst)
+        else:
+            op = ExtSIOp(x, dst)
     else:
         return [], x  # can't bridge; leave as-is (importer verify-fallback handles it)
     return [op], op.results[0]
+
+
+def _cast_tensor(x: SSAValue, shape, dst_elem):
+    """Elementwise cast a whole tensor to ``dst_elem`` (family ``cast``). Returns
+    ``(ops, result_ssa)`` or ``None`` if shapes are dynamic. A no-op (``([], x)``)
+    when the element type already matches."""
+    if x.type.element_type == dst_elem:  # type: ignore[union-attr]
+        return [], x
+    rt = TensorType(dst_elem, list(shape))
+    return _elementwise([x], rt, lambda args, oe: _cast_scalar_arg(args[0], oe))
 
 
 def _elementwise(inputs: list[SSAValue], result_type: TensorType, scalar_build, input_maps=None, promote=False):
@@ -288,23 +322,11 @@ def _splat_scalar(scalar: Any, result_type: TensorType):
 
 
 def _cast_scalar_build(target_elem):
-    """scalar_build for a dtype cast: float trunc/ext or int<->float, picked by types."""
-    from xdsl.dialects.arith import ExtFOp, FPToSIOp, SIToFPOp, TruncFOp
-    from xdsl.dialects.builtin import AnyFloat, IntegerType
+    """scalar_build for a dtype cast: float trunc/ext, int<->float, or int<->int
+    (bool zero-extends), picked by types -- delegates to ``_cast_scalar_arg``."""
 
     def build(args, out_elem):
-        x = args[0]
-        src = x.type
-        dst = target_elem
-        if isinstance(src, AnyFloat) and isinstance(dst, AnyFloat):
-            op = TruncFOp(x, dst) if dst.bitwidth < src.bitwidth else ExtFOp(x, dst)
-        elif isinstance(src, IntegerType) and isinstance(dst, AnyFloat):
-            op = SIToFPOp(x, dst)
-        elif isinstance(src, AnyFloat) and isinstance(dst, IntegerType):
-            op = FPToSIOp(x, dst)
-        else:
-            op = ExtFOp(x, dst)  # best-effort
-        return [op], op.results[0]
+        return _cast_scalar_arg(args[0], target_elem)
 
     return build
 
@@ -1731,16 +1753,23 @@ def _reshape_decomp(operands, meta, node_name, *, hint: str, prefix: str):
     val: Any = meta["val"]
     src_type = operands[0].type
     meta_elem = _element_type_from_meta(meta)
-    # reshape preserves dtype (source elem must == result elem), AND the result must
-    # match the meta dtype the downstream consumers expect. Only emit when source SSA
-    # dtype and meta dtype agree; otherwise fall back to opaque (typed from meta).
-    if not isinstance(src_type, TensorType) or src_type.element_type != meta_elem:
+    if not isinstance(src_type, TensorType):
         return _opaque_decomp(f"aten_{prefix}", operands[:1], meta, "layout", pattern_hint=hint)
     out_shape = _static_shape(val.shape)
-    emitted = _emit_reshape(operands[0], out_shape, meta_elem)
+    # reshape preserves dtype. When the meta dtype disagrees with the source SSA dtype
+    # (a fused reshape+cast, e.g. bool unsqueeze captured as i64), reshape in the source
+    # dtype then cast the result to the meta dtype.
+    src_elem = src_type.element_type
+    emitted = _emit_reshape(operands[0], out_shape, src_elem)
     if emitted is None:
         return _opaque_decomp(f"aten_{prefix}", operands[:1], meta, "layout", pattern_hint=hint)
     ops, result = emitted
+    if src_elem != meta_elem:
+        cast = _cast_tensor(result, out_shape, meta_elem)
+        if cast is None:
+            return _opaque_decomp(f"aten_{prefix}", operands[:1], meta, "layout", pattern_hint=hint)
+        ops += cast[0]
+        result = cast[1]
     rid = _next_region_id(prefix)
     for op in ops:
         _attach_region_id(op, rid)
@@ -1791,18 +1820,33 @@ def decompose_cat(operands, meta, node_name):
     if (
         len(operands) >= 1
         and not any(d < 0 for d in out_shape)
-        and all(isinstance(o.type, TensorType) and o.type.element_type == elem for o in operands)
+        and all(isinstance(o.type, TensorType) for o in operands)
     ):
         dim = int(_fx_arg(meta, 1, 0) or 0)
         if dim < 0:
             dim += len(out_shape)
         from xdsl.dialects.tensor import ConcatOp
 
-        op = ConcatOp(inputs=list(operands), dim=dim, result_type=TensorType(elem, out_shape))
+        # tensor.concat requires a uniform element type; torch.cat promotes mixed
+        # dtypes (e.g. f32 + bf16 -> bf16). Cast each input to the result dtype first.
+        ops: list = []
+        casted: list = []
+        for o in operands:
+            if o.type.element_type == elem:
+                casted.append(o)
+                continue
+            c = _cast_tensor(o, o.type.get_shape(), elem)
+            if c is None:
+                return _opaque_decomp("aten_cat", operands, meta, "layout", pattern_hint="cat")
+            ops += c[0]
+            casted.append(c[1])
+        op = ConcatOp(inputs=casted, dim=dim, result_type=TensorType(elem, out_shape))
+        ops.append(op)
         rid = _next_region_id("cat")
-        _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("concat")
-        return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="cat")
+        for o in ops:
+            _attach_region_id(o, rid)
+            o.attributes["m2m.family"] = StringAttr("concat")
+        return DecompResult(ops=ops, result=op.results[0], region_ids=[rid], pattern_hint="cat")
     return _opaque_decomp("aten_cat", operands, meta, "layout", pattern_hint="cat")
 
 
@@ -2036,9 +2080,20 @@ def decompose_sum_dim(operands, meta, node_name):
     if in_shape is None or any(d < 0 for d in in_shape):
         return _opaque_decomp("aten_sum", operands[:1], meta, "reduce", pattern_hint="reduce_sum")
     elem = _t_elem(x)
-    add_cls = AddiOp if isinstance(elem, IntegerType) else AddfOp
     val: Any = meta["val"]
     out_shape = _static_shape(getattr(val, "shape", []))
+    # torch sums in the output dtype (e.g. bool sum -> i64 counts); cast first so the
+    # accumulation doesn't overflow/diverge from the captured result dtype.
+    out_elem = _element_type_from_meta(meta)
+    ops: list = []
+    if out_elem != elem:
+        cast = _cast_tensor(x, in_shape, out_elem)
+        if cast is None:
+            return _opaque_decomp("aten_sum", operands[:1], meta, "reduce", pattern_hint="reduce_sum")
+        ops += cast[0]
+        x = cast[1]
+        elem = out_elem
+    add_cls = AddiOp if isinstance(elem, IntegerType) else AddfOp
     dims = _fx_arg(meta, 1, None)
     if dims is None:
         dims = list(range(len(in_shape)))
@@ -2047,7 +2102,8 @@ def decompose_sum_dim(operands, meta, node_name):
     else:
         dims = list(dims)
     dims = [d % len(in_shape) for d in dims]
-    ops, summ, rsh = _reduce(x, in_shape, dims, 0, add_cls, elem)
+    rops, summ, rsh = _reduce(x, in_shape, dims, 0, add_cls, elem)
+    ops += rops
     res = summ
     if rsh != out_shape:
         res = _keepdim_reshape(ops, res, rsh, out_shape, elem)
@@ -2066,9 +2122,11 @@ def decompose_reciprocal(operands, meta, node_name):
     from xdsl.dialects.builtin import FloatAttr
 
     def build(args, oe):
+        # reciprocal of an integer tensor yields float (e.g. 1/i64 -> f32): cast first.
+        cops, x = _cast_scalar_arg(args[0], oe)
         c = ConstantOp(FloatAttr(1.0, oe), oe)
-        d = DivfOp(c.results[0], args[0])
-        return [c, d], d.results[0]
+        d = DivfOp(c.results[0], x)
+        return [*cops, c, d], d.results[0]
 
     real = _pointwise(operands[:1], meta, build, family="elementwise")
     if real is not None:
@@ -2134,8 +2192,219 @@ def decompose_sin(operands, meta, node_name):
 
 
 def decompose_cumsum(operands, meta, node_name):
-    """aten.cumsum.default — prefix sum along dim."""
-    return _opaque_decomp("aten_cumsum", operands[:1], meta, "scan", pattern_hint="cumsum")
+    """aten.cumsum.default(input, dim) — prefix sum along ``dim``.
+
+    Lowered as a single masked-reduction ``linalg.generic`` (family ``scan``):
+    out[..., i, ...] = sum_j (j <= i) ? x[..., j, ...] : 0
+    Adds a parallel loop per dim plus one reduction loop ``j`` over the scan dim,
+    using ``linalg.index`` to compare i vs j. Handles a dtype change (e.g. bool
+    ``cumsum`` -> i64 counts) by casting the read element to the output dtype."""
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("aten_cumsum", operands[:1], meta, "scan", pattern_hint="cumsum")
+    x = operands[0]
+    in_shape = _shape_of(x)
+    if in_shape is None or any(d < 0 for d in in_shape):
+        return _opaque_decomp("aten_cumsum", operands[:1], meta, "scan", pattern_hint="cumsum")
+
+    from xdsl.dialects.arith import (
+        AddfOp,
+        AddiOp,
+        CmpiOp,
+        ConstantOp,
+        ExtSIOp,
+        ExtUIOp,
+        SelectOp,
+    )
+    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr, IntegerAttr, IntegerType
+    from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import SplatOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    rank = len(in_shape)
+    dim = int(_fx_arg(meta, 1, -1) or 0) % rank
+    in_elem = x.type.element_type
+    out_elem = _element_type_from_meta(meta)
+    out_shape = list(in_shape)
+    out_t = TensorType(out_elem, out_shape)
+
+    # zero accumulator init (splat over the full result shape)
+    if isinstance(out_elem, IntegerType):
+        zero = ConstantOp(IntegerAttr(0, out_elem), out_elem)
+    else:
+        zero = ConstantOp(FloatAttr(0.0, out_elem), out_elem)
+    init = SplatOp(zero.result, [], out_t)
+
+    # loop dims: rank parallel (i0..i_{rank-1}) + 1 reduction (j, the last)
+    in_exprs = [AffineExpr.dimension(d) for d in range(rank)]
+    in_exprs[dim] = AffineExpr.dimension(rank)          # read position uses j at the scan dim
+    in_map = AffineMap(rank + 1, 0, tuple(in_exprs))
+    out_map = AffineMap(rank + 1, 0, tuple(AffineExpr.dimension(d) for d in range(rank)))
+
+    blk = Block(arg_types=[in_elem, out_elem])
+    i_idx = IndexOp(dim)
+    j_idx = IndexOp(rank)
+    cond = CmpiOp(j_idx.results[0], i_idx.results[0], "ule")   # j <= i (lower-triangular mask)
+    body = [i_idx, j_idx, cond]
+    # cast the read element to the accumulator dtype if needed
+    src = blk.args[0]
+    if in_elem != out_elem:
+        if isinstance(in_elem, IntegerType) and isinstance(out_elem, IntegerType):
+            cast = ExtUIOp(src, out_elem) if in_elem.width.data == 1 else ExtSIOp(src, out_elem)
+            body.append(cast)
+            src = cast.results[0]
+        else:
+            # non-int/int dtype change is uncommon for cumsum; bail to opaque
+            return _opaque_decomp("aten_cumsum", operands[:1], meta, "scan", pattern_hint="cumsum")
+    masked = SelectOp(cond.results[0], src, zero.result)
+    add = AddiOp(blk.args[1], masked.results[0]) if isinstance(out_elem, IntegerType) \
+        else AddfOp(blk.args[1], masked.results[0])
+    body += [masked, add]
+    for op in body:
+        blk.add_op(op)
+    blk.add_op(YieldOp(add.results[0]))
+
+    iters = [IteratorTypeAttr(IteratorType.PARALLEL)] * rank + [IteratorTypeAttr(IteratorType.REDUCTION)]
+    gen = GenericOp(
+        inputs=[x],
+        outputs=[init.results[0]],
+        body=Region(blk),
+        indexing_maps=[AffineMapAttr(in_map), AffineMapAttr(out_map)],
+        iterator_types=iters,
+        result_types=[out_t],
+    )
+    ops = [zero, init, gen]
+    rid = _next_region_id("scan")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("scan")
+    return DecompResult(ops=ops, result=gen.results[0], region_ids=[rid], pattern_hint="cumsum")
+
+
+def _arg_reduce(x, dim, keepdim, val_elem, *, is_min):
+    """Combined value+index reduction over ``dim`` (the argmin/argmax kernel).
+
+    Emits ONE two-output ``linalg.generic`` (family ``arg_reduce``): it threads a
+    running (best_value, best_index) pair, updating both when a strictly-better
+    element is seen (strict ``<``/``>`` keeps the first extremum, matching torch).
+    Returns ``(ops, values_ssa, indices_ssa)`` with both reshaped to keepdim shape
+    when requested, or ``None`` if shapes are dynamic."""
+    in_shape = _shape_of(x)
+    if in_shape is None or any(d < 0 for d in in_shape):
+        return None
+    rank = len(in_shape)
+    dim = dim % rank
+    reduced_shape = [s for i, s in enumerate(in_shape) if i != dim]
+
+    from xdsl.dialects.arith import CmpfOp, CmpiOp, ConstantOp, IndexCastOp, SelectOp
+    from xdsl.dialects.builtin import (
+        AffineMapAttr,
+        FloatAttr,
+        IndexType,
+        IntegerAttr,
+        IntegerType,
+    )
+    from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import SplatOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    is_int = isinstance(val_elem, IntegerType)
+    idx_elem = IntegerType(64)
+    val_t = TensorType(val_elem, reduced_shape)
+    idx_t = TensorType(idx_elem, reduced_shape)
+
+    # accumulator seeds: +inf/INT_MAX for min, -inf/INT_MIN for max; index 0
+    if is_int:
+        bits = val_elem.width.data
+        seed = (1 << (bits - 1)) - 1 if is_min else -(1 << (bits - 1))
+        vseed = ConstantOp(IntegerAttr(seed, val_elem), val_elem)
+    else:
+        vseed = ConstantOp(FloatAttr(float("inf") if is_min else float("-inf"), val_elem), val_elem)
+    iseed = ConstantOp(IntegerAttr(0, idx_elem), idx_elem)
+    vinit = SplatOp(vseed.result, [], val_t)
+    iinit = SplatOp(iseed.result, [], idx_t)
+
+    in_map = AffineMap.identity(rank)
+    out_exprs = tuple(AffineExpr.dimension(d) for d in range(rank) if d != dim)
+    out_map = AffineMap(rank, 0, out_exprs)
+
+    blk = Block(arg_types=[val_elem, val_elem, idx_elem])
+    idx = IndexOp(dim)
+    idx_cast = IndexCastOp(idx.results[0], idx_elem)
+    pred_kind = ("slt" if is_min else "sgt") if is_int else ("olt" if is_min else "ogt")
+    pred = CmpiOp(blk.args[0], blk.args[1], pred_kind) if is_int \
+        else CmpfOp(blk.args[0], blk.args[1], pred_kind)
+    new_val = SelectOp(pred.results[0], blk.args[0], blk.args[1])
+    new_idx = SelectOp(pred.results[0], idx_cast.results[0], blk.args[2])
+    for op in (idx, idx_cast, pred, new_val, new_idx):
+        blk.add_op(op)
+    blk.add_op(YieldOp(new_val.results[0], new_idx.results[0]))
+
+    iters = [IteratorTypeAttr(IteratorType.PARALLEL if d != dim else IteratorType.REDUCTION)
+             for d in range(rank)]
+    gen = GenericOp(
+        inputs=[x],
+        outputs=[vinit.results[0], iinit.results[0]],
+        body=Region(blk),
+        indexing_maps=[AffineMapAttr(in_map), AffineMapAttr(out_map), AffineMapAttr(out_map)],
+        iterator_types=iters,
+        result_types=[val_t, idx_t],
+    )
+    ops = [vseed, iseed, vinit, iinit, gen]
+    values, indices = gen.results[0], gen.results[1]
+
+    if keepdim:
+        keep = list(in_shape)
+        keep[dim] = 1
+        vr = _emit_reshape(values, keep, val_elem)
+        ir = _emit_reshape(indices, keep, idx_elem)
+        if vr is None or ir is None:
+            return None
+        ops += vr[0]
+        ops += ir[0]
+        values, indices = vr[1], ir[1]
+
+    rid = _next_region_id("arg_reduce")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("arg_reduce")
+    return ops, values, indices
+
+
+def _make_dim_extremum(is_min, indices_only):
+    """Build a decomposition for min.dim/max.dim (values+indices) or argmin/argmax
+    (indices only) over a single dim."""
+    name = ("aten_argmin" if is_min else "aten_argmax") if indices_only \
+        else ("aten_min_dim" if is_min else "aten_max_dim")
+
+    def decompose(operands, meta, node_name):
+        if not operands or not isinstance(operands[0].type, TensorType):
+            return _opaque_decomp(name, operands[:1], meta, "arg_reduce", pattern_hint=name)
+        x = operands[0]
+        in_shape = _shape_of(x)
+        if in_shape is None:
+            return _opaque_decomp(name, operands[:1], meta, "arg_reduce", pattern_hint=name)
+        dim_arg = _fx_arg(meta, 1, None)
+        if dim_arg is None:
+            return _opaque_decomp(name, operands[:1], meta, "arg_reduce", pattern_hint=name)
+        dim = int(dim_arg)
+        keepdim = bool(_fx_arg(meta, 2, False))
+        # value element type: from the values output (tuple meta) or the input
+        v = meta.get("val")
+        vmeta = v[0] if isinstance(v, (tuple, list)) and v else v
+        val_elem = _element_type_from_meta({"val": vmeta}) if not indices_only else x.type.element_type
+        if indices_only:
+            val_elem = x.type.element_type
+        out = _arg_reduce(x, dim, keepdim, val_elem, is_min=is_min)
+        if out is None:
+            return _opaque_decomp(name, operands[:1], meta, "arg_reduce", pattern_hint=name)
+        ops, values, indices = out
+        if indices_only:
+            return DecompResult(ops=ops, result=indices, pattern_hint=name)
+        return DecompResult(ops=ops, result=values, results=[values, indices], pattern_hint=name)
+
+    return decompose
 
 
 def decompose_slice_tensor(operands, meta, node_name):
@@ -3033,6 +3302,10 @@ DECOMPOSITION_TABLE.update(
         "aten.select.int": decompose_select_int,
         "aten.min.other": _make_minmax("MinimumfOp", "minimum"),
         "aten.max.other": _make_minmax("MaximumfOp", "maximum"),
+        "aten.min.dim": _make_dim_extremum(is_min=True, indices_only=False),
+        "aten.max.dim": _make_dim_extremum(is_min=False, indices_only=False),
+        "aten.argmin.default": _make_dim_extremum(is_min=True, indices_only=True),
+        "aten.argmax.default": _make_dim_extremum(is_min=False, indices_only=True),
     }
 )
 for _k in ("eq", "ne", "lt", "le", "gt", "ge"):
