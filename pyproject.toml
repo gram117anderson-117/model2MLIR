@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "model2mlir"
+version = "0.0.1"
+description = "Self-updating PyTorch/torchAO -> MLIR (linalg-on-tensors) frontend, built on torch-mlir"
+requires-python = ">=3.10"
+readme = "README.md"
+dependencies = [
+    "torch>=2.4",
+    "xdsl>=0.24",
+    "structlog>=24.1",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+quant = ["torchao>=0.16"]
+dev = ["pytest"]
+# Example workloads (LLMs / VLAs). Heavy; install on demand.
+examples = ["transformers>=4.44", "accelerate>=0.33"]
+vla = ["lerobot"]
+# torch-mlir is brought in via the third_party submodule source build
+# (build_tools/scripts/build_torch_mlir.sh), not as a PyPI dependency.
+
+[project.scripts]
+model2mlir = "model2mlir.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
