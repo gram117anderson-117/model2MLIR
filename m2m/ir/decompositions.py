@@ -1071,6 +1071,30 @@ def _identity_decomp(operands, meta, node_name):
     return _opaque_decomp("aten_identity", operands[:1], meta, "identity", pattern_hint="identity")
 
 
+def decompose_copy(operands, meta, node_name):
+    """aten.copy.default(self, src) -> broadcast src to self's shape (family: copy)."""
+    if len(operands) >= 2:
+        src = operands[1]
+        real = _pointwise([src], meta, lambda args, oe: ([], args[0]), family="copy")
+        if real is not None:
+            return real
+    return _opaque_decomp("aten_copy", operands[:1], meta, "copy", pattern_hint="copy")
+
+
+def decompose_pow_tensor_tensor(operands, meta, node_name):
+    """aten.pow.Tensor_Tensor(a, b) -> math.powf via linalg.generic (family: pow)."""
+    from xdsl.dialects.math import PowFOp
+
+    def build(args, oe):
+        p = PowFOp(args[0], args[1])
+        return [p], p.results[0]
+
+    real = _pointwise(operands[:2], meta, build, family="pow")
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_pow", operands[:2], meta, "pow", pattern_hint="pow")
+
+
 def decompose_empty(operands, meta, node_name):
     """aten.empty.memory_format / empty_like / new_empty -> tensor.empty (uninitialized)."""
     val: Any = meta["val"]
@@ -1596,8 +1620,11 @@ def decompose_matmul(operands, meta, node_name):
 
 
 def decompose_to_copy(operands, meta, node_name):
-    """aten._to_copy.default — dtype cast via linalg.generic (arith.trunc/ext/sitofp)."""
+    """aten._to_copy.default — dtype cast (linalg.generic arith.trunc/ext/sitofp), or
+    identity when the dtype is unchanged (device-only copy -> no cast op)."""
     target_elem = _element_type_from_meta(meta)
+    if operands and isinstance(operands[0].type, TensorType) and operands[0].type.element_type == target_elem:
+        return DecompResult(ops=[], result=operands[0], pattern_hint="identity")
     real = _unary_elementwise(operands, meta, "dtype_cast", _cast_scalar_build(target_elem), out_elem=target_elem)
     if real is not None:
         return real
@@ -2562,6 +2589,11 @@ DECOMPOSITION_TABLE.update(
         "aten.scalar_tensor.default": _make_fill(0),
         "aten.full.default": _make_fill(1),
         "aten.full_like.default": _make_fill(1),
+        # copy / pow / minmax extras
+        "aten.copy.default": decompose_copy,
+        "aten.pow.Tensor_Tensor": decompose_pow_tensor_tensor,
+        "aten.min.other": _make_minmax("MinimumfOp", "minimum"),
+        "aten.max.other": _make_minmax("MaximumfOp", "maximum"),
     }
 )
 for _k in ("eq", "ne", "lt", "le", "gt", "ge"):
