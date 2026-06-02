@@ -100,24 +100,28 @@ def _inner_capture(model: str, formats: list[str], level: str) -> None:
     sys.path.insert(0, str(model_dir))
     from loader import get_model_and_inputs  # type: ignore
 
-    mdl, inputs = get_model_and_inputs()
     suffix = {"fp32": "", "int8": "_int8", "fp8": "_fp8"}
     results = {}
     for fmt in formats:
-        q = _quant_for(cfg, fmt)
-        r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=q, level=level)
-        path = model_dir / f"{model}{suffix[fmt]}.mlir"
-        path.write_text(r.mlir_text)
-        opaque = opaque_report(r.mlir_text)
-        results[fmt] = {
-            "ok": r.ok,
-            "opaque": sum(opaque.values()),
-            "opaque_detail": opaque,
-            "linalg": r.mlir_text.count("linalg."),
-            "families": len(family_histogram(r.mlir_text)),
-            "path": str(path),
-            "bytes": len(r.mlir_text),
-        }
+        try:
+            # re-build the model per format: torchao quantize_ mutates in place, so reusing
+            # one instance across formats would double-quantize.
+            mdl, inputs = get_model_and_inputs()
+            q = _quant_for(cfg, fmt)
+            r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=q, level=level)
+            path = model_dir / f"{model}{suffix[fmt]}.mlir"
+            path.write_text(r.mlir_text)
+            opaque = opaque_report(r.mlir_text)
+            results[fmt] = {
+                "ok": r.ok, "opaque": sum(opaque.values()), "opaque_detail": opaque,
+                "linalg": r.mlir_text.count("linalg."),
+                "families": len(family_histogram(r.mlir_text)),
+                "path": str(path), "bytes": len(r.mlir_text),
+            }
+        except Exception as exc:  # noqa: BLE001 - one format failing must not sink the others
+            import traceback
+            results[fmt] = {"ok": False, "opaque": -1, "error": str(exc)[:400],
+                            "trace": traceback.format_exc()[-600:]}
     print("__CAPTURE_RESULT__ " + json.dumps(results))
 
 
@@ -173,11 +177,15 @@ def main(argv: list[str] | None = None) -> int:
         try:
             res = _run_one(model, formats, args.level, build=not args.no_venv)
             for fmt, r in res.items():
-                status = "OK " if (r["ok"] and r["opaque"] == 0) else "!! "
-                if not (r["ok"] and r["opaque"] == 0):
+                clean = r["ok"] and r["opaque"] == 0
+                if not clean:
                     failures += 1
-                print(f"{status}{model:14s} {fmt:5s} opaque={r['opaque']:<3d} "
-                      f"linalg={r['linalg']:<5d} families={r['families']:<3d} -> {r['path']}")
+                if "error" in r:
+                    print(f"!! {model:14s} {fmt:5s} ERROR: {r['error']}")
+                else:
+                    print(f"{'OK ' if clean else '!! '}{model:14s} {fmt:5s} "
+                          f"opaque={r['opaque']:<4d} linalg={r['linalg']:<5d} "
+                          f"families={r['families']:<3d} -> {r['path']}")
         except Exception as exc:  # noqa: BLE001
             failures += 1
             print(f"!! {model:14s} FAILED: {str(exc)[:300]}")

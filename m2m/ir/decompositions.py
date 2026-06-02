@@ -2089,19 +2089,30 @@ def decompose_contiguous(operands, meta, node_name):
 
 
 def decompose_transpose_int(operands, meta, node_name):
-    """aten.transpose.int(input, dim0, dim1) -> shape-swapped tensor.
+    """aten.transpose.int(input, dim0, dim1) -> linalg.transpose swapping two dims.
 
-    ``dim0`` / ``dim1`` are scalar ints and don't appear as SSA
-    operands. The result's shape comes from ``meta['val'].shape``
-    which already reflects the transposition.
-    """
-    return _opaque_decomp(
-        "aten_transpose",
-        operands[:1],
-        meta,
-        "layout",
-        pattern_hint="transpose",
-    )
+    A transpose is a permutation that swaps dim0/dim1 (identity elsewhere); emit it the
+    same way as permute (family layout)."""
+    operand_type = operands[0].type if operands else None
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    meta_elem = _element_type_from_meta(meta)
+    if not isinstance(operand_type, TensorType) or operand_type.element_type != meta_elem \
+            or any(d < 0 for d in out_shape):
+        return _opaque_decomp("aten_transpose", operands[:1], meta, "layout", pattern_hint="transpose")
+    rank = len(operand_type.get_shape())
+    d0 = int(_fx_arg(meta, 1, 0)) % rank
+    d1 = int(_fx_arg(meta, 2, 1)) % rank
+    perm = list(range(rank))
+    perm[d0], perm[d1] = perm[d1], perm[d0]
+    result_type = TensorType(meta_elem, out_shape)
+    empty = _make_empty(result_type)
+    transpose = TransposeOp(input=operands[0], init=empty.results[0],
+                            permutation=DenseArrayBase.from_list(i64, perm), result=result_type)
+    rid = _next_region_id("transpose")
+    _attach_region_id(transpose, rid)
+    return DecompResult(ops=[empty, transpose], result=transpose.results[0],
+                        region_ids=[rid], pattern_hint="transpose")
 
 
 def decompose_matmul(operands, meta, node_name):
@@ -2169,6 +2180,41 @@ def decompose_to_copy(operands, meta, node_name):
     if real is not None:
         return real
     return _opaque_decomp("aten_to_dtype", operands[:1], meta, "cast", pattern_hint="dtype_cast")
+
+
+def decompose_access_subclass_inner_tensor(operands, meta, node_name):
+    """export.access_subclass_inner_tensor(subclass, name) — extract a named inner tensor
+    (e.g. ``qdata`` i8 weights, ``scale`` f32) from a torchao tensor-subclass weight.
+
+    Older torchao (0.11, forced by torch 2.7.1) leaves this unfolded in the exported graph;
+    newer torchao lifts the inner tensors as plain inputs. The inner tensor is a distinct
+    (elided) weight component, so we materialize a typed value for it (family ``quant_param``).
+    Downstream dtype-cast + matmul (+ the QDQ fold) then lower normally."""
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    elem = _element_type_from_meta(meta)
+    if any(d < 0 for d in out_shape):
+        return _opaque_decomp("aten_subclass_inner", operands[:1], meta, "quant_param",
+                              pattern_hint="quant_param")
+    op = _make_empty(TensorType(elem, out_shape))
+    rid = _next_region_id("quant_param")
+    _attach_region_id(op, rid)
+    op.attributes["m2m.family"] = StringAttr("quantize")
+    return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="quant_param")
+
+
+def decompose_square(operands, meta, node_name):
+    """aten.square.default(x) -> x * x via linalg.generic (family elementwise)."""
+    from xdsl.dialects.arith import MulfOp
+
+    def build(args, oe):
+        m = MulfOp(args[0], args[0])
+        return [m], m.results[0]
+
+    real = _pointwise(operands[:1], meta, build, family="elementwise")
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_square", operands[:1], meta, "elementwise", pattern_hint="square")
 
 
 def decompose_where_self(operands, meta, node_name):
@@ -3853,6 +3899,13 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "quantized_decomposed.dequantize_per_group_along_last_dim.default": decompose_dequantize_per_group,
     # --- wave 7: TinyLlama opaque-tail closure (10 new families) ---
     "aten._to_copy.default": decompose_to_copy,
+    "aten.to.dtype": decompose_to_copy,           # dtype cast (quantization dequant path)
+    "aten.to.dtype_layout": decompose_to_copy,
+    # in-place arithmetic variants (functionalized) -- same lowering as out-of-place
+    "aten.add_.Tensor": decompose_add_tensor,
+    "aten.mul_.Tensor": decompose_mul_tensor,
+    "aten.sub_.Tensor": decompose_sub_tensor,
+    "aten.square.default": decompose_square,
     "aten.where.self": decompose_where_self,
     "aten.scalar_tensor.default": decompose_scalar_tensor,
     "aten.full_like.default": decompose_full_like,
@@ -3929,6 +3982,8 @@ DECOMPOSITION_TABLE.update(
         "aten.index_put.default": decompose_index_put,
         "aten.index_put_.default": decompose_index_put,
         "aten._index_put_impl.default": decompose_index_put,
+        # torchao tensor-subclass inner-tensor access (older torchao export)
+        "export.access_subclass_inner_tensor.default": decompose_access_subclass_inner_tensor,
         # true-quantized (non-QDQ) integer ops
         "aten._int_mm.default": decompose_int_mm,
         "aten.amin.default": _make_amin_amax(is_min=True),

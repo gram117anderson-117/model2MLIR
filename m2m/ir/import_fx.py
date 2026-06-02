@@ -122,7 +122,7 @@ _reg("scan", "cumsum")
 _reg("search", "bucketize")
 _reg("quantize", "quantize_per_tensor", "quantize_per_channel", "quantize_per_group",
      "dequantize_per_tensor", "dequantize_per_channel", "dequantize_per_group",
-     "choose_qparams_per_tensor", "choose_qparams_per_channel")
+     "choose_qparams_per_tensor", "choose_qparams_per_channel", "dequantize", "quant_param")
 
 
 def family_of(hint: str | None) -> str | None:

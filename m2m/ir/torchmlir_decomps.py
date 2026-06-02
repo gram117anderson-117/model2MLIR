@@ -36,9 +36,44 @@ def _empty_permuted(size, physical_layout, *, dtype=None, layout=None, device=No
     )
 
 
+def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
+          scale=None, enable_gqa=False):
+    """aten.scaled_dot_product_attention -> the math reference, so export expands it into
+    matmul/softmax/(mask) that m2m lowers. Quantized graphs retain SDPA where fp32 does
+    not; expanding it here covers both."""
+    import math
+
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = (1.0 / math.sqrt(query.size(-1))) if scale is None else scale
+    attn = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
+    if is_causal:
+        mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
+        attn = attn.masked_fill(~mask, float("-inf"))
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn = attn.masked_fill(~attn_mask, float("-inf"))
+        else:
+            attn = attn + attn_mask
+    attn = torch.softmax(attn, dim=-1)
+    return torch.matmul(attn, value)
+
+
+def _dropout(input, p=0.5, train=False):
+    """aten.dropout in inference (train=False) is the identity."""
+    return input
+
+
+def _chunk(input, chunks, dim=0):
+    """aten.chunk -> tensor_split (slices); export lowers the slices to ops m2m handles."""
+    return torch.tensor_split(input, chunks, dim=dim)
+
+
 # op-overload -> decomposition function. Extend as new torch-mlir gap ops surface.
 _GAP_DECOMPS: dict[Any, Any] = {
     _aten.empty_permuted.default: _empty_permuted,
+    _aten.scaled_dot_product_attention.default: _sdpa,
+    _aten.dropout.default: _dropout,
+    _aten.chunk.default: _chunk,
 }
 
 
