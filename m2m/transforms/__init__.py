@@ -7,5 +7,6 @@
 from __future__ import annotations
 
 from m2m.transforms.expand_ext import EXPANDERS, expand_to_linalg
+from m2m.transforms.fuse_qdq import fuse_qdq
 
-__all__ = ["EXPANDERS", "expand_to_linalg"]
+__all__ = ["EXPANDERS", "expand_to_linalg", "fuse_qdq"]

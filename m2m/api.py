@@ -56,6 +56,7 @@ def convert(
     decompose: bool = True,
     backend: str = "auto",
     level: str = "linalg-on-tensors",
+    preserve_qdq: bool = True,
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -159,6 +160,18 @@ def convert(
                 # serialize the mixed-precision map as "pattern=scheme;pattern=scheme"
                 mixed = ";".join(f"{k}={v}" for k, v in per_module.items())
                 result.module.attributes["m2m.quantization_mixed"] = StringAttr(mixed)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Preserve QDQ: fold the implicit weight-dequant (dtype_cast -> mul scale) into an
+    # explicit quant_ext.dequantize op so the quantization is first-class/matchable. Only
+    # meaningful for the FXImporter path (we have a module) and when quantizing. Verify-
+    # guarded inside fuse_qdq -> never regresses the portable output.
+    if preserve_qdq and quantization is not None and result.module is not None:
+        try:
+            from m2m.transforms import fuse_qdq
+
+            result.module = fuse_qdq(result.module)
         except Exception:  # noqa: BLE001
             pass
 

@@ -1,0 +1,96 @@
+"""QDQ-preservation pass: fold a lowered weight dequant into a ``quant_ext.dequantize`` op.
+
+torchao weight-only int8/fp8 lowers its dequant to a `dtype_cast` (int->float) generic feeding
+a `mul` (x scale) generic -- the quantization semantics are *implicit* in two generics. This
+pass recognizes that pair via the taxonomy tags (`m2m.op == "dtype_cast"` then `"mul"`) and
+rewrites it to an explicit ``quant_ext.dequantize_per_{tensor,channel}`` op, so the
+quantization is first-class and matchable (a target-aware fuse can then map it to a native
+quantized matmul). Symmetric weight-only -> zero_point = 0.
+
+Safe by construction: the whole module is verified after rewriting; on ANY failure the
+original (unfused) module is returned, so this can never regress the portable output.
+"""
+
+from __future__ import annotations
+
+from xdsl.dialects.arith import ConstantOp
+from xdsl.dialects.builtin import IntegerAttr, IntegerType, ModuleOp, StringAttr, TensorType
+from xdsl.dialects.linalg import GenericOp, MatmulOp
+from xdsl.dialects.tensor import SplatOp
+from xdsl.rewriter import InsertPoint, Rewriter
+
+from m2m.ir.quant.ops import DequantizePerChannelOp, DequantizePerTensorOp
+
+
+def _tag(op) -> str | None:
+    a = op.attributes.get("m2m.op")
+    return a.data if isinstance(a, StringAttr) else None
+
+
+def _producer(value):
+    """The op that defines ``value`` (None for block args)."""
+    from xdsl.ir import Operation
+
+    owner = getattr(value, "owner", None)
+    return owner if isinstance(owner, Operation) else None
+
+
+def fuse_qdq(module: ModuleOp) -> ModuleOp:
+    """Fold `dtype_cast(int->float) -> mul(scale)` weight-dequant pairs into
+    `quant_ext.dequantize_*`. Verify-guarded: runs on a clone and returns it only if it
+    still verifies; otherwise returns the original module unchanged (never regresses)."""
+    work = module.clone()
+    try:
+        _fuse(work)
+        work.verify()
+        return work
+    except Exception:  # noqa: BLE001
+        return module
+
+
+def _fuse(module: ModuleOp) -> None:
+    """Recognize torchao's post-matmul weight dequant and move the scale onto the weight:
+
+        mul( matmul(x, dtype_cast(w_i8 -> f32)), scale[N] )   (scale is per-output-channel)
+      ==  matmul(x, quant_ext.dequantize_per_channel(w_i8, scale, zp, axis=last))
+
+    Valid because the scale broadcasts over the matmul's output channels, which equals the
+    weight's trailing (column) dim. Rewires by replacing the cast's single use (the matmul's
+    RHS) with the dequantize, and the mul's uses with the matmul result."""
+    for mul in list(module.walk()):
+        if not isinstance(mul, GenericOp) or _tag(mul) != "mul" or len(mul.inputs) != 2:
+            continue
+        # one input is a matmul result, the other is the per-channel scale
+        a, b = mul.inputs
+        mm, scale = (_producer(a), b) if isinstance(_producer(a), MatmulOp) else (_producer(b), a)
+        if not isinstance(mm, MatmulOp) or not isinstance(scale.type, TensorType):
+            continue
+        rhs = mm.inputs[1]                       # weight operand (already f32, from the cast)
+        cast = _producer(rhs)
+        if not isinstance(cast, GenericOp) or _tag(cast) != "dtype_cast" or not cast.inputs:
+            continue
+        w_i8 = cast.inputs[0]                     # the integer weight
+        if not isinstance(w_i8.type, TensorType) or not isinstance(w_i8.type.element_type, IntegerType):
+            continue
+        if list(cast.results[0].uses) != [u for u in cast.results[0].uses if u.operation is mm] or \
+                len(list(cast.results[0].uses)) != 1:
+            continue  # the cast must feed only this matmul (safe to rewrite)
+
+        w_t = rhs.type                            # f32 weight type the matmul expects
+        w_rank = len(w_t.get_shape())
+        scale_shape = list(scale.type.get_shape())
+        zp_elem = IntegerType(32)
+        zero = ConstantOp(IntegerAttr(0, zp_elem), zp_elem)
+        zp = SplatOp(zero.result, [], TensorType(zp_elem, scale_shape))
+        deq = DequantizePerChannelOp(
+            operands=[w_i8, scale, zp.results[0]], result_types=[w_t],
+            properties={"axis": IntegerAttr(w_rank - 1, IntegerType(64)),
+                        "input_dtype": StringAttr(str(w_i8.type.element_type))},
+        )
+        deq.attributes["m2m.op"] = StringAttr("dequantize")
+        deq.attributes["m2m.family"] = StringAttr("quantize")
+        Rewriter.insert_op([zero, zp, deq], InsertPoint.before(cast))
+        cast.results[0].replace_all_uses_with(deq.results[0])   # matmul now reads the dequant
+        mul.results[0].replace_all_uses_with(mm.results[0])     # drop the post-matmul scale
+        Rewriter.erase_op(mul)
+        Rewriter.erase_op(cast)

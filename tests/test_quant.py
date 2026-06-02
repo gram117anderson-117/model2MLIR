@@ -44,6 +44,19 @@ def test_quant_scheme_lowers(scheme):
     assert "m2m.quantization" in r.mlir_text
 
 
+def test_int8_weight_only_preserves_qdq():
+    """preserve_qdq (default) folds the implicit weight dequant into explicit
+    quant_ext.dequantize ops so the quantization is first-class/matchable."""
+    r = m2m.convert(MLP().eval(), X, backend="fx_importer",
+                    quantization=QuantizationConfig(scheme="int8_weight_only"))
+    assert "quant_ext.dequantize" in r.mlir_text
+    assert sum(opaque_report(r.mlir_text).values()) == 0
+    # opting out leaves the unfused (still 0-opaque) form
+    r2 = m2m.convert(MLP().eval(), X, backend="fx_importer", preserve_qdq=False,
+                     quantization=QuantizationConfig(scheme="int8_weight_only"))
+    assert "quant_ext.dequantize" not in r2.mlir_text
+
+
 def test_true_int_matmul_present():
     """Dynamic-activation int8 lowers to a real i8->i32 integer matmul (no dequant roundtrip)."""
     r = m2m.convert(MLP().eval(), X, backend="fx_importer",
