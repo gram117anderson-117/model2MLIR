@@ -2472,30 +2472,64 @@ def decompose_index_tensor(operands, meta, node_name):
         return bail()
     if src_shape is None or any(d < 0 for d in src_shape) or any(d < 0 for d in out_shape):
         return bail()
-    # only the full-indexing case (one integer index per source dim)
-    if len(idxs) != len(src_shape):
+    R = len(src_shape)
+
+    # Recover the FULL index list (with None entries) from meta -- the importer drops
+    # None when flattening operands, so only meta knows which source dims are indexed.
+    index_list = _fx_arg(meta, 1)
+    if not isinstance(index_list, (list, tuple)):
+        index_list = [None] * (R - len(idxs)) + list(idxs)  # best-effort: assume trailing
+    # positions of the integer (non-None) indices, in source-dim order
+    int_positions = [d for d, e in enumerate(index_list) if e is not None]
+    if len(int_positions) != len(idxs) or not int_positions:
         return bail()
+    # require the integer indices to be CONTIGUOUS (numpy's adv-shape-inserted-at-first rule)
+    if int_positions != list(range(int_positions[0], int_positions[0] + len(int_positions))):
+        return bail()
+    p0 = int_positions[0]
+    pk = int_positions[-1]
+    k = len(idxs)
+
+    # advanced (broadcast) shape of the integer index tensors, and where it sits in output
     out_rank = len(out_shape)
-    maps = [_broadcast_map(_shape_of(t) or [], out_shape) for t in idxs]
-    if any(m is None for m in maps):
+    rank_adv = out_rank - (R - k)          # output dims contributed by the index broadcast
+    if rank_adv < 1 or p0 + rank_adv > out_rank:
+        return bail()
+    adv_shape = out_shape[p0:p0 + rank_adv]
+    # each index tensor broadcasts onto the adv block (output dims p0 .. p0+rank_adv-1)
+    base_maps = [_broadcast_map(_shape_of(t) or [], adv_shape) for t in idxs]
+    if any(m is None for m in base_maps):
         return bail()
 
     from xdsl.dialects.arith import IndexCastOp
     from xdsl.dialects.builtin import AffineMapAttr, IndexType
-    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
     from xdsl.dialects.tensor import EmptyOp, ExtractOp
     from xdsl.ir import Block, Region
     from xdsl.ir.affine import AffineMap
+
+    # lift each index map from the adv subspace (rank_adv dims, based at 0) to the full
+    # output space: select output dims p0..p0+rank_adv-1 as the adv coords, then apply
+    # the broadcast map. base_map(P(out_dims)) where P picks the adv block.
+    from xdsl.ir.affine import AffineExpr as _AE
+    _P = AffineMap(out_rank, 0, tuple(_AE.dimension(p0 + i) for i in range(rank_adv)))
+    maps = [m.compose(_P) for m in base_maps]
 
     out_t = TensorType(out_elem, out_shape)
     empty = EmptyOp([], out_t)
     idx_elems = [t.type.element_type for t in idxs]
     blk = Block(arg_types=[*idx_elems, out_elem])
-    coords = []
-    for a in blk.args[:len(idxs)]:
-        ic = IndexCastOp(a, IndexType())
-        blk.add_op(ic)
-        coords.append(ic.results[0])
+    # build the R source coordinates: free leading dims, gathered dims, free trailing dims
+    coords: list[Any] = [None] * R
+    for d in range(p0):                                  # free leading: output dim d == source dim d
+        ix = IndexOp(d); blk.add_op(ix); coords[d] = ix.results[0]
+    for j, a in enumerate(blk.args[:k]):                 # gathered dims p0..pk
+        ic = IndexCastOp(a, IndexType()); blk.add_op(ic); coords[p0 + j] = ic.results[0]
+    for s in range(pk + 1, R):                           # free trailing source dims
+        out_dim = p0 + rank_adv + (s - (pk + 1))
+        ix = IndexOp(out_dim); blk.add_op(ix); coords[s] = ix.results[0]
+    if any(c is None for c in coords):
+        return bail()
     ext = ExtractOp(source, coords, out_elem)
     blk.add_op(ext)
     blk.add_op(YieldOp(ext.results[0]))

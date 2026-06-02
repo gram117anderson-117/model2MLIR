@@ -72,6 +72,10 @@ CASES = [
     ("bucketize", lambda a: torch.bucketize(a, torch.linspace(-1, 1, 7)), X),
     ("index_gather", lambda s, i0, i1: s[i0, i1],
      (torch.randn(4, 8), torch.zeros(1, 1, dtype=torch.int64), torch.arange(8).view(1, 8))),
+    # generalized advanced indexing: partial / None-leading / mid-block (free dims preserved)
+    ("index_partial_lead", lambda s, i: s[i], (torch.randn(4, 8), torch.tensor([0, 2, 1]))),
+    ("index_none_lead", lambda s, i: s[:, i], (torch.randn(4, 8), torch.tensor([0, 2, 1]))),
+    ("index_mid", lambda s, i: s[:, i, :], (torch.randn(2, 5, 7), torch.tensor([0, 1, 2]))),
 ]
 
 # Data-dependent ops: output has a dynamic (?) dim, so shape can't match eager exactly --
