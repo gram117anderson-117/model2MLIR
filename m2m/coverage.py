@@ -116,12 +116,24 @@ class OpDiff:
     error: str | None = None
 
     @property
+    def canonical(self) -> bool:
+        """True when our op-kinds match the oracle's (same standard ops, not just same
+        result type) -- i.e. we used the canonical/proper form, not a hand-rolled
+        equivalent (e.g. tensor.reshape+constants instead of collapse/expand_shape).
+
+        Structural func.* boilerplate is ignored (it's not part of the op pattern)."""
+        skip = {"func.return", "func.func", "func.call"}
+        return {o for o in self.our_ops if o not in skip} == {o for o in self.golden_ops if o not in skip}
+
+    @property
     def verdict(self) -> str:
         if not self.golden_ok:
             return "no-oracle"            # torch-mlir can't lower it either
         if not self.ours_lowered:
             return "TODO: implement (oracle available)"
-        return "ok" if self.result_type_match else "mismatch"
+        if not self.result_type_match:
+            return "mismatch"
+        return "ok" if self.canonical else "ok (non-canonical ops)"
 
 
 def golden_lowering(fn: Callable[..., torch.Tensor], example_inputs: tuple[torch.Tensor, ...]):
