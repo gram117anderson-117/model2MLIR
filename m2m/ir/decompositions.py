@@ -487,11 +487,24 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
         if not isinstance(rhs.type, TensorType):
             return None
     elif len(operands) == 1:
-        sp = _splat_scalar(_fx_arg(meta, 1, 0), result_type)
+        # One tensor + one scalar. The scalar may be on EITHER side (e.g. the reverse
+        # subtraction `511 - arange`), so detect which arg is numeric and splat it on
+        # the matching side -- order matters for non-commutative ops (sub/div).
+        a0, a1 = _fx_arg(meta, 0, None), _fx_arg(meta, 1, None)
+        if isinstance(a0, (int, float)) and not isinstance(a0, bool) and not isinstance(a1, (int, float)):
+            scalar, scalar_left = a0, True
+        elif isinstance(a1, (int, float)) and not isinstance(a1, bool):
+            scalar, scalar_left = a1, False
+        else:
+            return None
+        sp = _splat_scalar(scalar, result_type)
         if sp is None:
             return None
-        pre, rhs = sp[0], sp[1]
-        lhs = operands[0]
+        pre = sp[0]
+        if scalar_left:
+            lhs, rhs = sp[1], operands[0]
+        else:
+            lhs, rhs = operands[0], sp[1]
     else:
         return None
 

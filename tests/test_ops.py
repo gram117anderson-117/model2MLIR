@@ -67,6 +67,8 @@ CASES = [
     ("sum_bool_keepdim", lambda a: (a > 0).sum(0, keepdim=True), (torch.randn(8),)),
     ("reciprocal_int", lambda a: torch.reciprocal(a), (torch.tensor([2, 3, 4]),)),
     ("to_copy_bool2int", lambda a: (a > 0).to(torch.int64), X),
+    ("rsub_scalar", lambda a: 1.0 - a, X),            # reverse sub: scalar - tensor
+    ("rdiv_scalar", lambda a: 2.0 / (a.abs() + 1), X),
 ]
 
 
