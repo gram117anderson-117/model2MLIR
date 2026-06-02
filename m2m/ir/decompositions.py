@@ -1812,8 +1812,113 @@ def decompose_full(operands, meta, node_name):
 
 
 def decompose_arange(operands, meta, node_name):
-    """aten.arange.start_step(start, end, step, ...) — index generator."""
-    return _opaque_decomp("aten_arange", [], meta, "arange", pattern_hint="arange")
+    """aten.arange[.start[_step]] -> 1-D iota via linalg.generic + linalg.index (family iota)."""
+    from xdsl.dialects.arith import AddiOp, ConstantOp, IndexCastOp, MuliOp, SIToFPOp
+    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr, IntegerAttr, IntegerType
+    from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import EmptyOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineMap
+
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    elem = _element_type_from_meta(meta)
+    if len(out_shape) != 1 or out_shape[0] < 0:
+        return _opaque_decomp("aten_arange", [], meta, "arange", pattern_hint="arange")
+    nargs = len(meta.get("_fx_args", ()))
+    start = _fx_arg(meta, 0, 0) if nargs >= 2 else 0
+    step = _fx_arg(meta, 2, 1) if nargs >= 3 else 1
+
+    out_t = TensorType(elem, out_shape)
+    empty = EmptyOp([], out_t)
+    blk = Block(arg_types=[elem])
+    idx = IndexOp(0)
+    blk.add_op(idx)
+    body = [idx]
+    is_int = isinstance(elem, IntegerType)
+    if is_int:
+        ic = IndexCastOp(idx.results[0], elem)
+        stepc = ConstantOp(IntegerAttr(int(step), elem), elem)
+        mul = MuliOp(ic.results[0], stepc.results[0])
+        startc = ConstantOp(IntegerAttr(int(start), elem), elem)
+        add = AddiOp(startc.results[0], mul.results[0])
+        body += [ic, stepc, mul, startc, add]
+        yield_v = add.results[0]
+    else:
+        ic = IndexCastOp(idx.results[0], i64)
+        f = SIToFPOp(ic.results[0], elem)
+        stepc = ConstantOp(FloatAttr(float(step), elem), elem)
+        from xdsl.dialects.arith import AddfOp, MulfOp
+
+        mul = MulfOp(f.results[0], stepc.results[0])
+        startc = ConstantOp(FloatAttr(float(start), elem), elem)
+        add = AddfOp(startc.results[0], mul.results[0])
+        body += [ic, f, stepc, mul, startc, add]
+        yield_v = add.results[0]
+    for op in body:
+        blk.add_op(op)
+    blk.add_op(YieldOp(yield_v))
+    gen = GenericOp(
+        inputs=[],
+        outputs=[empty.results[0]],
+        body=Region(blk),
+        indexing_maps=[AffineMapAttr(AffineMap.identity(1))],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)],
+        result_types=[out_t],
+    )
+    rid = _next_region_id("iota")
+    for op in (empty, gen):
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("iota")
+    return DecompResult(ops=[empty, gen], result=gen.results[0], region_ids=[rid], pattern_hint="arange")
+
+
+def decompose_sum_dim(operands, meta, node_name):
+    """aten.sum.dim_IntList(input, dims, keepdim?) -> linalg.reduce add (family reduce)."""
+    from xdsl.dialects.arith import AddfOp
+
+    x = operands[0]
+    in_shape = _shape_of(x)
+    if in_shape is None or any(d < 0 for d in in_shape):
+        return _opaque_decomp("aten_sum", operands[:1], meta, "reduce", pattern_hint="reduce_sum")
+    elem = _t_elem(x)
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    dims = _fx_arg(meta, 1, None)
+    if dims is None:
+        dims = list(range(len(in_shape)))
+    elif isinstance(dims, int):
+        dims = [dims]
+    else:
+        dims = list(dims)
+    dims = [d % len(in_shape) for d in dims]
+    ops, summ, rsh = _reduce(x, in_shape, dims, 0.0, AddfOp, elem)
+    res = summ
+    if rsh != out_shape:
+        res = _keepdim_reshape(ops, res, rsh, out_shape, elem)
+        if res is None:
+            return _opaque_decomp("aten_sum", operands[:1], meta, "reduce", pattern_hint="reduce_sum")
+    rid = _next_region_id("reduce")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("reduce")
+    return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="reduce_sum")
+
+
+def decompose_reciprocal(operands, meta, node_name):
+    """aten.reciprocal(x) -> 1/x via linalg.generic (family elementwise)."""
+    from xdsl.dialects.arith import ConstantOp, DivfOp
+    from xdsl.dialects.builtin import FloatAttr
+
+    def build(args, oe):
+        c = ConstantOp(FloatAttr(1.0, oe), oe)
+        d = DivfOp(c.results[0], args[0])
+        return [c, d], d.results[0]
+
+    real = _pointwise(operands[:1], meta, build, family="elementwise")
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_reciprocal", operands[:1], meta, "elementwise", pattern_hint="reciprocal")
 
 
 def decompose_logical_not(operands, meta, node_name):
@@ -1822,7 +1927,16 @@ def decompose_logical_not(operands, meta, node_name):
 
 
 def decompose_bitwise_and(operands, meta, node_name):
-    """aten.bitwise_and.Tensor — pointwise bitwise AND."""
+    """aten.bitwise_and.Tensor(a, b) -> arith.andi via linalg.generic (family bitwise)."""
+    from xdsl.dialects.arith import AndIOp
+
+    def build(args, oe):
+        op = AndIOp(args[0], args[1])
+        return [op], op.results[0]
+
+    real = _pointwise(operands[:2], meta, build, family="bitwise")
+    if real is not None:
+        return real
     return _opaque_decomp("aten_bitwise_and", operands[:2], meta, "bitwise", pattern_hint="bitwise_and")
 
 
@@ -2753,6 +2867,8 @@ DECOMPOSITION_TABLE.update(
         "aten.any.dims": decompose_any_real,
         "aten.reshape.default": decompose_view,
         "aten._unsafe_view.default": decompose_view,
+        "aten.sum.dim_IntList": decompose_sum_dim,
+        "aten.reciprocal.default": decompose_reciprocal,
         "aten.min.other": _make_minmax("MinimumfOp", "minimum"),
         "aten.max.other": _make_minmax("MaximumfOp", "maximum"),
     }
