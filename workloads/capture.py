@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Standardized model -> MLIR capture driver (stable + scalable to any model).
+
+Every model lives in ``workloads/<model>/`` with:
+  - ``loader.py``    : ``get_model_and_inputs() -> (nn.Module, tuple[Tensor, ...])``  [REQUIRED]
+  - ``capture.toml`` : venv / deps / env / upstream config                            [OPTIONAL]
+
+Because models need conflicting torch/transformers/torchao versions, each gets a dedicated
+venv (default ``workloads/<model>/.venv``). This driver:
+  1. ensures that venv exists (creates it + installs deps from capture.toml, idempotent);
+  2. runs the capture INSIDE that venv (subprocess) for each requested datatype/level;
+  3. writes ``<model>{,_int8,_fp8}.mlir`` and asserts 0 opaque ops;
+  4. prints a summary.
+
+Usage:
+  python workloads/capture.py <model> [--formats fp32,int8,fp8] [--level linalg-on-tensors|high-level]
+  python workloads/capture.py --all
+  python workloads/capture.py --list
+
+The same file is reused as the in-venv worker (``--_inner``); you never call that directly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent          # model2MLIR/
+WORKLOADS = REPO / "workloads"
+BASE_DEPS = ["xdsl", "structlog", "ml_dtypes", "torchao"]  # always needed by m2m
+SCHEME = {  # datatype/format -> torchao scheme (None = fp32, no quantization)
+    "fp32": None,
+    "int8": "int8_weight_only",
+    "fp8": "float8_weight_only_e4m3",
+}
+
+
+def _load_toml(model_dir: Path) -> dict:
+    f = model_dir / "capture.toml"
+    if not f.exists():
+        return {}
+    try:
+        import tomllib
+        return tomllib.loads(f.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _venv_python(model: str, cfg: dict) -> Path:
+    """Resolve the model's venv python. Default: workloads/<model>/.venv (the standard)."""
+    venv = cfg.get("venv", ".venv")
+    p = Path(venv)
+    if not p.is_absolute():
+        p = (WORKLOADS / model / p).resolve()
+    return p / "bin" / "python"
+
+
+def _ensure_venv(model: str, cfg: dict, *, build: bool) -> Path:
+    py = _venv_python(model, cfg)
+    if py.exists():
+        return py
+    if not build:
+        raise SystemExit(f"[{model}] venv missing at {py.parent.parent} (run without --no-venv to build)")
+    venv_dir = py.parent.parent
+    pyver = cfg.get("python", "3.12")
+    print(f"[{model}] creating venv {venv_dir} (python {pyver})", flush=True)
+    subprocess.run(["uv", "venv", str(venv_dir), "--python", pyver], check=True)
+    deps = list(cfg.get("deps", [])) + BASE_DEPS
+    if deps:
+        subprocess.run(["uv", "pip", "install", "--python", str(py), *deps], check=True)
+    subprocess.run(["uv", "pip", "install", "--python", str(py), "-e", str(REPO), "--no-deps"], check=True)
+    return py
+
+
+def _inner_capture(model: str, formats: list[str], level: str) -> None:
+    """Runs INSIDE the model's venv: capture each format, write .mlir, emit a JSON summary."""
+    import m2m
+    from m2m.capture.torchao_pipeline import QuantizationConfig
+    from m2m.coverage import family_histogram, opaque_report
+
+    model_dir = WORKLOADS / model
+    sys.path.insert(0, str(model_dir))
+    from loader import get_model_and_inputs  # type: ignore
+
+    mdl, inputs = get_model_and_inputs()
+    suffix = {"fp32": "", "int8": "_int8", "fp8": "_fp8"}
+    results = {}
+    for fmt in formats:
+        scheme = SCHEME[fmt]
+        q = QuantizationConfig(scheme=scheme) if scheme else None
+        r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=q, level=level)
+        path = model_dir / f"{model}{suffix[fmt]}.mlir"
+        path.write_text(r.mlir_text)
+        opaque = opaque_report(r.mlir_text)
+        results[fmt] = {
+            "ok": r.ok,
+            "opaque": sum(opaque.values()),
+            "opaque_detail": opaque,
+            "linalg": r.mlir_text.count("linalg."),
+            "families": len(family_histogram(r.mlir_text)),
+            "path": str(path),
+            "bytes": len(r.mlir_text),
+        }
+    print("__CAPTURE_RESULT__ " + json.dumps(results))
+
+
+def _run_one(model: str, formats: list[str], level: str, *, build: bool) -> dict:
+    cfg = _load_toml(WORKLOADS / model)
+    py = _ensure_venv(model, cfg, build=build)
+    env = dict(os.environ)
+    env.update({k: str(v) for k, v in cfg.get("env", {}).items()})
+    cmd = [str(py), str(Path(__file__).resolve()), "--_inner", model,
+           "--formats", ",".join(formats), "--level", level]
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    for line in proc.stdout.splitlines():
+        if line.startswith("__CAPTURE_RESULT__ "):
+            return json.loads(line[len("__CAPTURE_RESULT__ "):])
+    raise RuntimeError(f"[{model}] capture failed:\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}")
+
+
+def _all_models() -> list[str]:
+    return sorted(d.name for d in WORKLOADS.iterdir()
+                  if d.is_dir() and (d / "loader.py").exists())
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("model", nargs="?", help="model name (a workloads/<model>/ dir)")
+    ap.add_argument("--formats", default="fp32,int8,fp8", help="comma list of: fp32,int8,fp8")
+    ap.add_argument("--level", default="linalg-on-tensors", choices=["linalg-on-tensors", "high-level"])
+    ap.add_argument("--all", action="store_true", help="capture every model with a loader.py")
+    ap.add_argument("--list", action="store_true", help="list available models")
+    ap.add_argument("--no-venv", action="store_true", help="don't build missing venvs (fail instead)")
+    ap.add_argument("--_inner", dest="inner", action="store_true", help=argparse.SUPPRESS)
+    args = ap.parse_args(argv)
+
+    if args.list:
+        print("\n".join(_all_models()))
+        return 0
+
+    formats = [f.strip() for f in args.formats.split(",") if f.strip()]
+    bad = [f for f in formats if f not in SCHEME]
+    if bad:
+        raise SystemExit(f"unknown formats: {bad} (valid: {list(SCHEME)})")
+
+    if args.inner:  # in-venv worker
+        _inner_capture(args.model, formats, args.level)
+        return 0
+
+    models = _all_models() if args.all else ([args.model] if args.model else [])
+    if not models:
+        ap.error("give a model name or --all (or --list)")
+
+    failures = 0
+    for model in models:
+        try:
+            res = _run_one(model, formats, args.level, build=not args.no_venv)
+            for fmt, r in res.items():
+                status = "OK " if (r["ok"] and r["opaque"] == 0) else "!! "
+                if not (r["ok"] and r["opaque"] == 0):
+                    failures += 1
+                print(f"{status}{model:14s} {fmt:5s} opaque={r['opaque']:<3d} "
+                      f"linalg={r['linalg']:<5d} families={r['families']:<3d} -> {r['path']}")
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            print(f"!! {model:14s} FAILED: {str(exc)[:300]}")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

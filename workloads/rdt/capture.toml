@@ -1,0 +1,6 @@
+venv = "/scratch/agustin/projects/model2MLIR/.venv"
+python = "3.12"
+deps = ["timm"]
+upstream = "/scratch/agustin/projects/RoboticsDiffusionTransformer"
+[env]
+M2M_RDT_DEPTH = "2"

@@ -1,0 +1,6 @@
+venv = "/scratch/agustin/projects/bitvla_capture/.venv"
+python = "3.11"
+deps = ["torch==2.8.0", "torchvision==0.23.0", "numpy", "timm", "accelerate"]
+upstream = "/scratch/agustin/projects/BitVLA"
+[env]
+BITVLA_LLM_LAYERS = "2"

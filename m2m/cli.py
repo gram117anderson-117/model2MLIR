@@ -46,6 +46,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         output_type=args.output_type,
         quantization=_make_quant(args.quant),
         backend=getattr(args, "backend", "auto"),
+        level=getattr(args, "level", "linalg-on-tensors"),
     )
     if not result.ok:
         sys.stderr.write("conversion failed:\n  " + "\n  ".join(result.diagnostics) + "\n")
@@ -89,6 +90,8 @@ def main(argv: list[str] | None = None) -> int:
         pc.add_argument("--output-type", default="linalg-on-tensors")
         pc.add_argument("--backend", default="auto", choices=["auto", "torch_mlir", "fx_importer"])
         pc.add_argument("--quant", default=None, help="torchAO scheme name (e.g. int8_weight_only)")
+        pc.add_argument("--level", default="linalg-on-tensors",
+                        choices=["linalg-on-tensors", "high-level"], help="representation level")
         pc.set_defaults(func=_cmd_convert)
 
     pv = sub.add_parser("coverage", help="report op coverage for a model")

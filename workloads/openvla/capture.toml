@@ -1,0 +1,7 @@
+venv = "/scratch/agustin/projects/openvla_capture/.venv"
+python = "3.12"
+deps = ["transformers>=4.40", "timm", "tokenizers", "accelerate", "pillow", "numpy"]
+[env]
+M2M_OPENVLA_LLM_LAYERS = "2"
+M2M_OPENVLA_VIT_LAYERS = "2"
+M2M_OPENVLA_VOCAB = "512"
