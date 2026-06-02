@@ -58,5 +58,8 @@ Env: `M2M_RDT2_DEPTH=N` (number of RDT blocks; default 2 smoke, real default = 1
   so it is not hit.
 
 ## Status
+- BLOCKER: the scaffolded example inputs mismatch the model internally (torch.export
+  fails with a 128-vs-8 broadcast); the loader's kv/x_pos_emb shapes need correcting
+  against RDT2's actual forward signature before capture. Not an m2m coverage gap.
 - fp32: scaffolded, not yet captured (depth=2 smoke recommended first).
 - int8/fp8: pending.

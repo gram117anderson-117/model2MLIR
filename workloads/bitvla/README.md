@@ -60,5 +60,7 @@ print(r.path_taken, r.mlir_text.count('linalg.'))"
 ```
 
 ## Status
+- BLOCKER: needs the `BitNet` model_type registered in transformers (custom modeling
+  code from the BitVLA repo, or a newer transformers). Config build raises KeyError('BitNet').
 - Scaffold only; not yet captured. Validate the vendored-fork install + that
   `LlavaForConditionalGeneration.forward(..., use_bi_attn=True)` traces cleanly.

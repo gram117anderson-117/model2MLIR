@@ -45,5 +45,7 @@ Env: `M2M_RDT_DEPTH=N` (number of RDT blocks; default 2 smoke, real 1B = 28).
   Force eager/manual if the fused path traces poorly.
 
 ## Status
-- fp32: scaffolded, not yet captured (depth=2 smoke recommended first).
-- int8/fp8: pending.
+- fp32: **captured → 0 opaque ops** (depth=2; 526 linalg ops; FXImporter). The only
+  gap surfaced was `aten.squeeze.dims`, now lowered as a reshape — no other new ops needed.
+- Dependency: `uv pip install timm` (RDT's blocks import `timm.models.vision_transformer`).
+- int8/fp8: pending (apply a `QuantizationConfig` before capture).
