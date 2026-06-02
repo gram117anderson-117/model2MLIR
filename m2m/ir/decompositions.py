@@ -178,16 +178,6 @@ def _elementwise(inputs: list[SSAValue], result_type: TensorType, scalar_build):
     if any(d < 0 for d in shape):
         return None
 
-    # xDSL's bf16 constant/pack handling is unreliable (NotImplementedError / f32
-    # fallback), which yields invalid IR inside the generic body. A single invalid op
-    # fails the whole module, so bail to an opaque placeholder for bf16 elementwise.
-    from xdsl.dialects.builtin import BFloat16Type
-
-    if isinstance(result_type.element_type, BFloat16Type) or any(
-        isinstance(inp.type.element_type, BFloat16Type) for inp in inputs  # type: ignore[union-attr]
-    ):
-        return None
-
     from xdsl.dialects.builtin import AffineMapAttr
     from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
     from xdsl.dialects.tensor import EmptyOp
