@@ -52,6 +52,12 @@ CASES = [
     ("eq_scalar", lambda a: a == 0, X),
     ("logical_not", lambda a: torch.logical_not(a > 0), X),
     ("expand", lambda a: a.expand(4, 8), (torch.randn(1, 8),)),
+    ("slice", lambda a: a[:, 2:6], X),
+    ("pow2", lambda a: a ** 2, X),
+    ("mean", lambda a: a.mean(-1), X),
+    ("softmax", lambda a: torch.softmax(a, -1), X),
+    ("layer_norm", lambda a: torch.nn.functional.layer_norm(a, (8,), torch.ones(8), torch.zeros(8)), X),
+    ("bmm", torch.bmm, (torch.randn(2, 4, 8), torch.randn(2, 8, 16))),
 ]
 
 

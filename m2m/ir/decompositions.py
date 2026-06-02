@@ -808,35 +808,160 @@ def _opaque_decomp(
 
 
 def decompose_bmm(operands, meta, node_name):
-    """aten.bmm.default(a, b) -> linalg.batch_matmul."""
+    """aten.bmm.default(a[B,M,K], b[B,K,N]) -> batch matmul via linalg.generic (contraction)."""
+    if len(operands) < 2:
+        return _opaque_decomp("aten_bmm", operands, meta, "batch_matmul", pattern_hint="batch_matmul")
+    a, b = operands[0], operands[1]
+    sa, sb = _shape_of(a), _shape_of(b)
     val: Any = meta["val"]
-    result_type = TensorType(_t_elem(operands[0]), _static_shape(val.shape))
+    out_shape = _static_shape(getattr(val, "shape", []))
+    elem = _t_elem(a)
+    if (sa is None or sb is None or len(sa) != 3 or len(sb) != 3 or len(out_shape) != 3
+            or any(d < 0 for d in [*sa, *sb, *out_shape]) or _t_elem(b) != elem):
+        return _opaque_decomp("aten_bmm", operands, meta, "batch_matmul", pattern_hint="batch_matmul")
 
-    # We don't have a dedicated BatchMatmulOp in the xdsl dialect here;
-    # emit as opaque call but with a canonical hint so the propagation
-    # tags reach Recipe IR.
-    return _opaque_decomp(
-        "aten_bmm",
-        operands,
-        meta,
-        "batch_matmul",
-        pattern_hint="batch_matmul",
+    from xdsl.dialects.arith import AddfOp, ConstantOp, MulfOp
+    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import SplatOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    result_type = TensorType(elem, out_shape)
+    zero = ConstantOp(FloatAttr(0.0, elem), elem)
+    init = SplatOp(zero.result, [], result_type)
+    D = AffineExpr.dimension  # iteration dims: (b=0, m=1, n=2, k=3)
+    a_map = AffineMap(4, 0, (D(0), D(1), D(3)))
+    b_map = AffineMap(4, 0, (D(0), D(3), D(2)))
+    o_map = AffineMap(4, 0, (D(0), D(1), D(2)))
+    blk = Block(arg_types=[elem, elem, elem])
+    prod = MulfOp(blk.args[0], blk.args[1])
+    acc = AddfOp(blk.args[2], prod.results[0])
+    blk.add_op(prod)
+    blk.add_op(acc)
+    blk.add_op(YieldOp(acc.results[0]))
+    par, red = IteratorType.PARALLEL, IteratorType.REDUCTION
+    gen = GenericOp(
+        inputs=[a, b],
+        outputs=[init.results[0]],
+        body=Region(blk),
+        indexing_maps=[AffineMapAttr(a_map), AffineMapAttr(b_map), AffineMapAttr(o_map)],
+        iterator_types=[IteratorTypeAttr(par), IteratorTypeAttr(par), IteratorTypeAttr(par), IteratorTypeAttr(red)],
+        result_types=[result_type],
     )
+    rid = _next_region_id("matmul")
+    for op in (zero, init, gen):
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("matmul")
+    return DecompResult(ops=[zero, init, gen], result=gen.results[0], region_ids=[rid], pattern_hint="batch_matmul")
 
 
 def decompose_native_layer_norm(operands, meta, node_name):
     """aten.native_layer_norm.default(input, normalized_shape, weight, bias, eps).
 
-    Emits a func.call with pattern_hint='layer_norm' so
-    ``raise_special_ops`` picks it up.
+    Decomposes to mean/var/normalize/scale/shift (family: layer_norm). Returns the
+    normalized output as the primary result (getitem(_,0)); mean/rstd aux outputs are
+    folded away by the importer.
     """
-    return _opaque_decomp(
-        "aten_native_layer_norm",
-        operands,
-        meta,
-        "layer_norm",
-        pattern_hint="layer_norm",
-    )
+    from xdsl.dialects.arith import AddfOp, ConstantOp, MulfOp, SubfOp
+    from xdsl.dialects.builtin import FloatAttr
+    from xdsl.dialects.math import RsqrtOp
+
+    x = operands[0]
+    in_shape = _shape_of(x)
+    if in_shape is None or any(d < 0 for d in in_shape):
+        return _opaque_decomp("aten_native_layer_norm", operands, meta, "layer_norm", pattern_hint="layer_norm")
+    elem = _t_elem(x)
+    norm_shape = _fx_arg(meta, 1, None)
+    k = len(norm_shape) if norm_shape is not None else 1
+    eps = _fx_arg(meta, 4, 1e-5)
+    rank = len(in_shape)
+    dims = list(range(rank - k, rank))
+    keep = list(in_shape)
+    for d in dims:
+        keep[d] = 1
+    rt = TensorType(elem, in_shape)
+    id_map = _broadcast_map(in_shape, in_shape)
+    keep_map = _broadcast_map(keep, in_shape)
+    count = 1
+    for d in dims:
+        count *= in_shape[d]
+
+    ops: list[Operation] = []
+
+    def reduce_mean(src):
+        o, s, rsh = _reduce(src, in_shape, dims, 0.0, AddfOp, elem)
+        ops.extend(o)
+        sp = _splat_scalar(float(count), TensorType(elem, rsh))
+        if sp is None:
+            return None
+        ops.extend(sp[0])
+        dv = _elementwise([s, sp[1]], TensorType(elem, rsh), _bin_build(DivfOp))
+        if dv is None:
+            return None
+        ops.extend(dv[0])
+        return _keepdim_reshape(ops, dv[1], rsh, keep, elem)
+
+    from xdsl.dialects.arith import DivfOp
+
+    mean = reduce_mean(x)
+    if mean is None:
+        return _opaque_decomp("aten_native_layer_norm", operands, meta, "layer_norm", pattern_hint="layer_norm")
+    cen = _elementwise([x, mean], rt, _bin_build(SubfOp), input_maps=[id_map, keep_map])
+    ops += cen[0]
+    sq = _elementwise([cen[1], cen[1]], rt, _bin_build(MulfOp))
+    ops += sq[0]
+    var = reduce_mean(sq[1])
+    if var is None:
+        return _opaque_decomp("aten_native_layer_norm", operands, meta, "layer_norm", pattern_hint="layer_norm")
+
+    def add_eps_rsqrt(v):
+        c = ConstantOp(FloatAttr(float(eps), elem), elem)
+        ce = SplatOp_like(c, keep, elem, ops)
+        ve = _elementwise([v, ce], TensorType(elem, keep), _bin_build(AddfOp))
+        ops.extend(ve[0])
+        rs = _elementwise([ve[1]], TensorType(elem, keep), _un_build(RsqrtOp))
+        ops.extend(rs[0])
+        return rs[1]
+
+    rstd = add_eps_rsqrt(var)
+    normed = _elementwise([cen[1], rstd], rt, _bin_build(MulfOp), input_maps=[id_map, keep_map])
+    ops += normed[0]
+    res = normed[1]
+
+    # optional affine: out = normed * weight + bias (weight/bias broadcast over norm dims)
+    if len(operands) >= 2 and isinstance(operands[1].type, TensorType):
+        w = operands[1]
+        wmap = _broadcast_map(_shape_of(w) or [], in_shape)
+        if wmap is not None:
+            sc = _elementwise([res, w], rt, _bin_build(MulfOp), input_maps=[id_map, wmap])
+            if sc is not None:
+                ops += sc[0]
+                res = sc[1]
+    if len(operands) >= 3 and isinstance(operands[2].type, TensorType):
+        b = operands[2]
+        bmap = _broadcast_map(_shape_of(b) or [], in_shape)
+        if bmap is not None:
+            sh = _elementwise([res, b], rt, _bin_build(AddfOp), input_maps=[id_map, bmap])
+            if sh is not None:
+                ops += sh[0]
+                res = sh[1]
+
+    rid = _next_region_id("layer_norm")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("layer_norm")
+    return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="layer_norm")
+
+
+def SplatOp_like(const_op, shape, elem, ops):
+    """Splat a freshly-built scalar ConstantOp to a tensor of ``shape``; appends ops."""
+    from xdsl.dialects.tensor import SplatOp
+
+    ops.append(const_op)
+    sp = SplatOp(const_op.result, [], TensorType(elem, shape))
+    ops.append(sp)
+    return sp.results[0]
 
 
 def _reduce(input_ssa, in_shape, dims, identity, combine_cls, elem):
