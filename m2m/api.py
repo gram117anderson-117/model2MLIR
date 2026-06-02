@@ -130,6 +130,17 @@ def convert(
         exported_program=exported_program,
         use_torch_mlir=(backend != "fx_importer"),
     )
+    # Stamp the representation level so downstream/merlin knows which contract it received
+    # (default portable standard form vs the opt-in structured high-level form).
+    if result.module is not None:
+        try:
+            from xdsl.dialects.builtin import StringAttr
+
+            if "m2m.level" not in result.module.attributes:
+                result.module.attributes["m2m.level"] = StringAttr("linalg-on-tensors")
+        except Exception:  # noqa: BLE001
+            pass
+
     # Record the quantization scheme on the module so the (fp8/int8) quantization
     # is captured in the IR even when fp8 element types render as f32 (xDSL has no
     # builtin Float8). Downstream targets read m2m.quantization to recover the scheme.

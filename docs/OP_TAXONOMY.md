@@ -5,6 +5,39 @@ match* small and stable, even as we add support for hundreds of `aten` ops acros
 models. We do **not** want "one bespoke pattern per aten op." We want a small, fixed,
 matchable vocabulary, with new ops slotting into it rather than inventing new shapes.
 
+## The IR contract (two levels)
+
+`convert(..., level=...)` emits one of two forms:
+
+- **`linalg-on-tensors` (default, portable):** only standard dialects — `builtin, func,
+  arith, math, linalg, tensor, scf, cf` — PLUS `quant_ext.{quantize,dequantize}` as the one
+  principled exception (it carries the quantization contract, which has no standard-dialect
+  equivalent in xDSL 0.65). The opaque escape hatch is a typed `func.call @aten_*` (never
+  silent-wrong). This artifact parses in real MLIR toolchains.
+- **`high-level` (opt-in, xDSL/merlin-only):** adds named ops for fundamentally-distinct
+  operations (`linalg_ext.{softmax,layer_norm,rms_norm,rope,swiglu,gelu,silu}`,
+  `tensor_ext.{concat,pack,unpack}`) so a pass matches one op, not a generic body. The
+  deterministic `m2m.transforms.expand_to_linalg(module)` pass lowers it to the default form.
+  Always expand before exporting to a non-xDSL toolchain (these dialects are unregistered there).
+
+**Stable attribute schema** (all `m2m.`-prefixed, discardable — standard tooling ignores them;
+stamped centrally in `import_fx._forward_fx_meta` + the `module.walk()` backfill):
+
+| Attribute | Scope | Meaning |
+|---|---|---|
+| `m2m.family` | op | coarse family (closed vocab `CANONICAL_FAMILIES`, ~19) |
+| `m2m.op` | op | fine op-kind (open set) |
+| `m2m.region_id` | op | transform-unit grouping |
+| `m2m.provenance.aten` | op | source aten op (e.g. `aten.native_layer_norm.default`) |
+| `m2m.provenance.orig_dtype` | op | pre-coercion torch dtype (e.g. `float8_e4m3fn` before fp8→f32) |
+| `m2m.level` | module | `"linalg-on-tensors"` \| `"high-level"` |
+| `m2m.quantization` / `m2m.quantization_mixed` | module | scheme / per-module map |
+
+**Contract caveat (verified, load-bearing):** xDSL's custom-assembly printer drops discardable
+attrs on *named* ops (`linalg.transpose`, `linalg_ext.*`) in TEXT, though they exist on the
+in-memory IR. So **named ops are matched by op-type; only `linalg.generic` is matched by
+`m2m.*` attrs.** `coverage._NAMED_FAMILY` is the supported text-matching path.
+
 ## The problem
 
 xDSL (0.65) ships **no named elementwise linalg ops** (`linalg.add`, `linalg.mul`,

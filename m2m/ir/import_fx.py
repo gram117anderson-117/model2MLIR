@@ -192,6 +192,17 @@ def _forward_fx_meta(
             op.attributes["m2m.transpose_absorbed"] = StringAttr("true")
         if fx_meta.get("_compgen_fuse_dequant") and "m2m.fuse_dequant" not in op.attributes:
             op.attributes["m2m.fuse_dequant"] = StringAttr("true")
+        # provenance: trace each op back to its PyTorch origin (the source aten op) and the
+        # original torch dtype before any coercion (e.g. fp8 -> f32). Lets downstream/merlin
+        # recover "what this represents in PyTorch" and the true low-precision dtype.
+        aten = fx_meta.get("_aten_target")
+        if aten and "m2m.provenance.aten" not in op.attributes:
+            op.attributes["m2m.provenance.aten"] = StringAttr(str(aten))
+        if "m2m.provenance.orig_dtype" not in op.attributes:
+            val = fx_meta.get("val")
+            dt = getattr(val[0] if isinstance(val, (tuple, list)) and val else val, "dtype", None)
+            if dt is not None:
+                op.attributes["m2m.provenance.orig_dtype"] = StringAttr(str(dt).replace("torch.", ""))
 
 
 def _torch_dtype_to_xdsl(dtype: torch.dtype) -> Attribute:
@@ -491,6 +502,7 @@ class FXImporter:
                 # quant_max, etc.) that don't show up as SSA operands.
                 meta["_fx_args"] = tuple(node.args)
                 meta["_fx_kwargs"] = dict(node.kwargs)
+                meta["_aten_target"] = target_str  # provenance: source aten op
                 try:
                     result = decomp_fn(operands, meta, node.name)
                 except (IndexError, KeyError, TypeError) as decomp_err:
