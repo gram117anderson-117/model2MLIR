@@ -1487,17 +1487,80 @@ def decompose_convolution(operands, meta, node_name):
     )
 
 
+def decompose_select_int(operands, meta, node_name):
+    """aten.select.int(input, dim, index) -> rank-reducing tensor.extract_slice (family slice)."""
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("aten_select", operands[:1], meta, "layout", pattern_hint="select")
+    src = operands[0]
+    in_shape = list(src.type.get_shape())
+    if any(d < 0 for d in in_shape):
+        return _opaque_decomp("aten_select", operands[:1], meta, "layout", pattern_hint="select")
+    rank = len(in_shape)
+    dim = int(_fx_arg(meta, 1, 0) or 0) % rank
+    index = int(_fx_arg(meta, 2, 0) or 0)
+    if index < 0:
+        index += in_shape[dim]
+    offsets = [0] * rank
+    offsets[dim] = max(0, min(index, in_shape[dim] - 1))
+    sizes = list(in_shape)
+    sizes[dim] = 1
+    from xdsl.dialects.tensor import ExtractSliceOp
+
+    op = ExtractSliceOp.from_static_parameters(src, offsets, sizes, [1] * rank, reduce_rank=True)
+    rid = _next_region_id("select")
+    _attach_region_id(op, rid)
+    op.attributes["m2m.family"] = StringAttr("slice")
+    return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="select")
+
+
 def decompose_embedding(operands, meta, node_name):
-    """aten.embedding.default(weight, indices, ...) -> gather-style op (MVP: opaque)."""
-    # weight + indices are the first two operands; scalar-flag kwargs beyond that.
-    tensor_operands = operands[:2] if len(operands) >= 2 else operands
-    return _opaque_decomp(
-        "aten_embedding",
-        tensor_operands,
-        meta,
-        "embedding",
-        pattern_hint="embedding_lookup",
+    """aten.embedding(weight[V,D], indices[*I]) -> gather out[*I,D]=weight[indices] via
+    linalg.generic + tensor.extract (family gather)."""
+    if len(operands) < 2 or not isinstance(operands[0].type, TensorType) or not isinstance(operands[1].type, TensorType):
+        return _opaque_decomp("aten_embedding", operands[:2], meta, "embedding", pattern_hint="embedding_lookup")
+    weight, indices = operands[0], operands[1]
+    welem = weight.type.element_type
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    idx_shape = _shape_of(indices)
+    if idx_shape is None or any(d < 0 for d in out_shape) or any(d < 0 for d in idx_shape) or len(out_shape) != len(idx_shape) + 1:
+        return _opaque_decomp("aten_embedding", operands[:2], meta, "embedding", pattern_hint="embedding_lookup")
+
+    from xdsl.dialects.arith import IndexCastOp
+    from xdsl.dialects.builtin import AffineMapAttr, IndexType
+    from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import EmptyOp, ExtractOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    rank = len(out_shape)
+    out_t = TensorType(welem, out_shape)
+    empty = EmptyOp([], out_t)
+    # indices map: (i0..i_{k-1}, d) -> (i0..i_{k-1})   (drop the trailing D dim)
+    idx_map = AffineMap(rank, 0, tuple(AffineExpr.dimension(i) for i in range(rank - 1)))
+    out_map = AffineMap.identity(rank)
+    idx_elem = indices.type.element_type
+    blk = Block(arg_types=[idx_elem, welem])
+    ic = IndexCastOp(blk.args[0], IndexType())
+    didx = IndexOp(rank - 1)
+    ext = ExtractOp(weight, [ic.results[0], didx.results[0]], welem)
+    blk.add_op(ic)
+    blk.add_op(didx)
+    blk.add_op(ext)
+    blk.add_op(YieldOp(ext.results[0]))
+    gen = GenericOp(
+        inputs=[indices],
+        outputs=[empty.results[0]],
+        body=Region(blk),
+        indexing_maps=[AffineMapAttr(idx_map), AffineMapAttr(out_map)],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * rank,
+        result_types=[out_t],
     )
+    rid = _next_region_id("gather")
+    for op in (empty, gen):
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("gather")
+    return DecompResult(ops=[empty, gen], result=gen.results[0], region_ids=[rid], pattern_hint="embedding")
 
 
 def _sigmoid_build(args, out_elem):
@@ -2875,6 +2938,7 @@ DECOMPOSITION_TABLE.update(
         "aten._unsafe_view.default": decompose_view,
         "aten.sum.dim_IntList": decompose_sum_dim,
         "aten.reciprocal.default": decompose_reciprocal,
+        "aten.select.int": decompose_select_int,
         "aten.min.other": _make_minmax("MinimumfOp", "minimum"),
         "aten.max.other": _make_minmax("MaximumfOp", "maximum"),
     }
