@@ -138,6 +138,19 @@ _NAMED_MATCHABLE = re.compile(
     r"tensor\.insert_slice|tensor\.collapse_shape|tensor\.expand_shape|scf\.for)\b")
 
 
+def region_summary(mlir_text: str) -> dict[str, int]:
+    """Report ``{family: number_of_distinct_regions}`` -- the count of transform-units (ops
+    sharing an ``m2m.region_id``) per coarse family. This is what a rewrite pass actually
+    iterates over: a whole transformer collapses to a few dozen regions across ~a dozen
+    families, not thousands of unique ops. The headline number for 'are we proliferating?'."""
+    seen: dict[str, set] = {}
+    for m in re.finditer(r'm2m\.region_id = "([^"]+)"[^\n]*?m2m\.family = "([^"]+)"', mlir_text):
+        seen.setdefault(m.group(2), set()).add(m.group(1))
+    for m in re.finditer(r'm2m\.family = "([^"]+)"[^\n]*?m2m\.region_id = "([^"]+)"', mlir_text):
+        seen.setdefault(m.group(1), set()).add(m.group(2))
+    return {fam: len(ids) for fam, ids in sorted(seen.items(), key=lambda kv: -len(kv[1]))}
+
+
 def untagged_compute_ops(mlir_text: str) -> int:
     """Count ``linalg.generic`` ops carrying NO ``m2m.family`` tag. Should be 0 -- a generic
     is the only op that's *not* self-describing (everything is a linalg.generic), so it MUST
@@ -273,6 +286,7 @@ __all__ = [
     "golden_lowering",
     "op_vocabulary",
     "opaque_report",
+    "region_summary",
     "untagged_compute_ops",
     "validate_op",
 ]
