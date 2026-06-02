@@ -76,13 +76,27 @@ def _ensure_venv(model: str, cfg: dict, *, build: bool) -> Path:
     return py
 
 
+def _quant_for(cfg: dict, fmt: str):
+    """QuantizationConfig for a format. A model may override the default scheme via
+    capture.toml ``[quant.<fmt>]`` (scheme + optional per_module map) -- e.g. BitVLA, whose
+    BitNet layers can't be torchao-quantized, quantizes only its lm_head."""
+    from m2m.capture.torchao_pipeline import QuantizationConfig
+
+    override = (cfg.get("quant") or {}).get(fmt)
+    if override:
+        return QuantizationConfig(scheme=override.get("scheme", "none"),
+                                  per_module=override.get("per_module") or None)
+    scheme = SCHEME[fmt]
+    return QuantizationConfig(scheme=scheme) if scheme else None
+
+
 def _inner_capture(model: str, formats: list[str], level: str) -> None:
     """Runs INSIDE the model's venv: capture each format, write .mlir, emit a JSON summary."""
     import m2m
-    from m2m.capture.torchao_pipeline import QuantizationConfig
     from m2m.coverage import family_histogram, opaque_report
 
     model_dir = WORKLOADS / model
+    cfg = _load_toml(model_dir)
     sys.path.insert(0, str(model_dir))
     from loader import get_model_and_inputs  # type: ignore
 
@@ -90,8 +104,7 @@ def _inner_capture(model: str, formats: list[str], level: str) -> None:
     suffix = {"fp32": "", "int8": "_int8", "fp8": "_fp8"}
     results = {}
     for fmt in formats:
-        scheme = SCHEME[fmt]
-        q = QuantizationConfig(scheme=scheme) if scheme else None
+        q = _quant_for(cfg, fmt)
         r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=q, level=level)
         path = model_dir / f"{model}{suffix[fmt]}.mlir"
         path.write_text(r.mlir_text)

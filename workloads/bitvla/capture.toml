@@ -4,3 +4,12 @@ deps = ["torch==2.8.0", "torchvision==0.23.0", "numpy", "timm", "accelerate"]
 upstream = "/scratch/agustin/projects/BitVLA"
 [env]
 BITVLA_LLM_LAYERS = "2"
+
+# BitNet (W1.58) layers can't be torchao-quantized (abs().mean() unsupported); quantize only
+# the plain lm_head Linear, leaving BitLinear's in-graph ternary quant intact.
+[quant.int8]
+scheme = "none"
+per_module = { lm_head = "int8_weight_only" }
+[quant.fp8]
+scheme = "none"
+per_module = { lm_head = "float8_weight_only_e4m3" }

@@ -28,6 +28,11 @@ import types
 import torch
 from torch import nn
 
+# Make the upstream repo importable without requiring an editable install of gr00t.
+_GROOT_REPO = "/scratch/agustin/projects/Isaac-GR00T"
+if _GROOT_REPO not in sys.path:
+    sys.path.insert(0, _GROOT_REPO)
+
 # ``gr00t.model.__init__`` eagerly imports the full training/inference pipeline
 # (dataset factory -> pandas, HF backbone setup, etc.), none of which is needed
 # to instantiate the action-head DiT and all of which drags in heavy/optional
