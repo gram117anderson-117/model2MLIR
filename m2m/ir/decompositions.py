@@ -167,13 +167,29 @@ def _emit_reshape(source: SSAValue, out_shape: list[int], elem: Any):
     return ops, cur
 
 
-def _elementwise(inputs: list[SSAValue], result_type: TensorType, scalar_build):
-    """Emit a ``linalg.generic`` elementwise op (identity maps, all-parallel).
+def _broadcast_map(operand_shape, result_shape):
+    """Affine map projecting the iteration space (result dims) onto an operand's dims.
 
-    ``inputs`` must all have ``result_type``'s shape (splat scalars first).
-    ``scalar_build(args, out_elem) -> (ops, yield_ssa)`` builds the scalar body from the
-    per-element block args. Returns ``(ops, result_ssa)`` or ``None`` on dynamic shape.
-    """
+    Handles exact match (identity) and rank-difference broadcasting (a lower-rank operand
+    broadcasts over the leading dims, its dims aligned to the trailing result dims -- e.g.
+    bias [N] over [M, N]). Returns None for unsupported broadcasts (size-1 within matching
+    rank), so the caller falls back to opaque."""
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    r, s = len(result_shape), len(operand_shape)
+    if list(operand_shape) == list(result_shape):
+        return AffineMap.identity(r)
+    if s <= r and list(operand_shape) == list(result_shape)[r - s :]:
+        return AffineMap(r, 0, tuple(AffineExpr.dimension(r - s + i) for i in range(s)))
+    return None
+
+
+def _elementwise(inputs: list[SSAValue], result_type: TensorType, scalar_build, input_maps=None):
+    """Emit a ``linalg.generic`` elementwise op (all-parallel).
+
+    ``input_maps`` (one AffineMap per input) enables broadcasting; defaults to identity
+    maps (inputs must then match ``result_type``'s shape). ``scalar_build(args, out_elem)
+    -> (ops, yield_ssa)`` builds the scalar body. Returns ``(ops, result_ssa)`` or None."""
     shape = result_type.get_shape()
     if any(d < 0 for d in shape):
         return None
@@ -195,12 +211,14 @@ def _elementwise(inputs: list[SSAValue], result_type: TensorType, scalar_build):
         block.add_op(op)
     block.add_op(YieldOp(yield_ssa))
 
-    idmap = AffineMapAttr(AffineMap.identity(rank))
+    if input_maps is None:
+        input_maps = [AffineMap.identity(rank)] * len(inputs)
+    indexing_maps = [AffineMapAttr(m) for m in input_maps] + [AffineMapAttr(AffineMap.identity(rank))]
     generic = GenericOp(
         inputs=list(inputs),
         outputs=[empty.results[0]],
         body=Region(block),
-        indexing_maps=[idmap] * (len(inputs) + 1),
+        indexing_maps=indexing_maps,
         iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * rank,
         result_types=[result_type],
     )
@@ -407,12 +425,14 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
     else:
         return None
 
-    # We only emit identity-map elementwise when both operands already match the
-    # result shape; broadcasting (e.g. [M,N] + [N]) needs non-identity maps -> opaque.
-    if _shape_of(lhs) != out_shape or _shape_of(rhs) != out_shape:
+    # Broadcasting via affine maps (e.g. bias [N] over [M, N]); unsupported broadcasts
+    # (size-1 within matching rank) return None -> opaque fallback.
+    ml = _broadcast_map(_shape_of(lhs) or [], out_shape)
+    mr = _broadcast_map(_shape_of(rhs) or [], out_shape)
+    if ml is None or mr is None:
         return None
 
-    em = _elementwise([lhs, rhs], result_type, scalar_build)
+    em = _elementwise([lhs, rhs], result_type, scalar_build, input_maps=[ml, mr])
     if em is None:
         return None
     ops, res = em
