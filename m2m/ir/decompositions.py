@@ -638,27 +638,30 @@ def decompose_permute(
     meta: dict[str, Any],
     node_name: str,
 ) -> DecompResult:
-    """Decompose aten.permute.default(input, dims) for the common 2D transpose case."""
-
+    """aten.permute.default(input, dims) -> linalg.transpose for ANY rank."""
     operand_type = operands[0].type
     val: Any = meta["val"]
     result_shape = _static_shape(val.shape)
-    if not isinstance(operand_type, TensorType):
-        dims = None
-    else:
-        input_shape = list(operand_type.get_shape())
-        dims = (1, 0) if len(input_shape) == 2 and input_shape == list(reversed(result_shape)) else None
-
-    if dims != (1, 0):
-        from xdsl.dialects.func import CallOp
-
-        result_type = TensorType(Float32Type(), _static_shape(val.shape))
+    meta_elem = _element_type_from_meta(meta)
+    dims = _fx_arg(meta, 1, None)
+    if (
+        isinstance(operand_type, TensorType)
+        and operand_type.element_type == meta_elem
+        and dims is not None
+        and all(d >= 0 for d in result_shape)
+    ):
+        elem = operand_type.element_type
+        result_type = TensorType(elem, result_shape)
+        empty = _make_empty(result_type)
+        perm = DenseArrayBase.from_list(i64, [int(d) for d in dims])
+        transpose = TransposeOp(
+            input=operands[0], init=empty.results[0], permutation=perm, result=result_type
+        )
         rid = _next_region_id("permute")
-        call = CallOp("aten_permute", [operands[0]], [result_type])
-        _attach_region_id(call, rid)
-        return DecompResult(ops=[call], result=call.res[0], region_ids=[rid])
+        _attach_region_id(transpose, rid)
+        return DecompResult(ops=[empty, transpose], result=transpose.results[0], region_ids=[rid], pattern_hint="permute")
 
-    return decompose_transpose(operands, meta, node_name)
+    return _opaque_decomp("aten_permute", operands[:1], meta, "layout", pattern_hint="permute")
 
 
 def decompose_addmm(
@@ -1149,28 +1152,20 @@ def decompose_split_with_sizes(operands, meta, node_name):
 
 
 def decompose_clone(operands, meta, node_name):
-    """aten.clone.default(input) -> identity (metadata-only MVP)."""
-    return _opaque_decomp(
-        "aten_clone",
-        operands[:1],
-        meta,
-        "identity",
-        pattern_hint="clone",
-    )
+    """aten.clone.default(input) -> identity: forward the operand SSA (no op emitted)."""
+    if operands:
+        return DecompResult(ops=[], result=operands[0], pattern_hint="clone")
+    return _opaque_decomp("aten_clone", operands[:1], meta, "identity", pattern_hint="clone")
 
 
 # --- layout / reshape / contiguous (production-readiness fill-ins) -----------
 
 
 def decompose_contiguous(operands, meta, node_name):
-    """aten.contiguous.default(input) -> layout no-op; same shape same dtype."""
-    return _opaque_decomp(
-        "aten_contiguous",
-        operands[:1],
-        meta,
-        "layout",
-        pattern_hint="contiguous",
-    )
+    """aten.contiguous.default(input) -> identity: forward the operand SSA (no op)."""
+    if operands:
+        return DecompResult(ops=[], result=operands[0], pattern_hint="contiguous")
+    return _opaque_decomp("aten_contiguous", operands[:1], meta, "layout", pattern_hint="contiguous")
 
 
 def decompose_transpose_int(operands, meta, node_name):
