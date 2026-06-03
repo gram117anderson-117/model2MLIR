@@ -126,8 +126,9 @@ def convert(
             # inline them). Cascades to resolve their downstream ops.
             if exported_program is not None:
                 try:
-                    while inline_set_grad_hops(exported_program.graph_module):
-                        pass
+                    for _ in range(8):  # bounded fixpoint (nested HOPs); guards against spin
+                        if not inline_set_grad_hops(exported_program.graph_module):
+                            break
                 except Exception:  # noqa: BLE001 - non-fatal; importer handles residual
                     pass
         except Exception:  # noqa: BLE001 - bridge will re-export as a fallback

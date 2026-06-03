@@ -85,7 +85,10 @@ def inline_set_grad_hops(gm) -> bool:
     g = gm.graph
     changed = False
     for node in list(g.nodes):
-        if node.op != "call_function" or "wrap_with_" not in str(node.target):
+        # Only the set_grad (torch.no_grad) HOP -- it's cleanly multi-output (getitem) and
+        # inlines without exposing nested HOPs. Autocast HOPs are left intact (inlining them
+        # interacts badly with nesting); they stay as a small opaque residual.
+        if node.op != "call_function" or "wrap_with_set_grad_enabled" not in str(node.target):
             continue
         # the submodule is whichever arg is a get_attr to a GraphModule; subgraph inputs are
         # the node args that follow it (the flags precede it).
@@ -94,6 +97,15 @@ def inline_set_grad_hops(gm) -> bool:
                         and hasattr(getattr(gm, a.target, None), "graph")), None)
         if sub_idx is None:
             continue
+        # Decide erasability BEFORE touching the graph (never leave orphaned duplicates):
+        # either every consumer is an int getitem (multi-output), or there's a single direct
+        # consumer (single-output). Anything else -> skip this HOP (stays opaque, no spin).
+        users = list(node.users)
+        getitems = [u for u in users if u.op == "call_function" and u.target is operator.getitem
+                    and isinstance(u.args[1], int)]
+        direct = [u for u in users if u not in getitems]
+        if direct and (len(users) != 1):
+            continue  # mixed / multiple direct users: unsafe to fully erase
         sub = getattr(gm, node.args[sub_idx].target)
         operands = list(node.args[sub_idx + 1:])
         placeholders = [n for n in sub.graph.nodes if n.op == "placeholder"]
@@ -108,16 +120,15 @@ def inline_set_grad_hops(gm) -> bool:
                     outputs = [env.get(o, o) for o in (outs if isinstance(outs, (tuple, list)) else [outs])]
                     continue
                 env[sn] = g.node_copy(sn, lambda n: env[n])
-        if outputs is None:
+        if not outputs or (getitems and any(u.args[1] >= len(outputs) for u in getitems)):
             continue
-        for user in list(node.users):
-            if user.op == "call_function" and user.target is operator.getitem:
-                idx = user.args[1]
-                if isinstance(idx, int) and 0 <= idx < len(outputs):
-                    user.replace_all_uses_with(outputs[idx])
-                    g.erase_node(user)
-        if not node.users:
-            g.erase_node(node)
+        if direct:                       # single-output HOP used directly
+            node.replace_all_uses_with(outputs[0])
+        else:
+            for u in getitems:
+                u.replace_all_uses_with(outputs[u.args[1]])
+                g.erase_node(u)
+        g.erase_node(node)
         changed = True
     if changed:
         g.eliminate_dead_code()
