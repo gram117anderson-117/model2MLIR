@@ -84,7 +84,12 @@ CASES = [
     ("mean_absmean", lambda a: a.abs().mean(), X),        # BitNet W1.58 absmean
     ("sdpa_4d", lambda q, k, v: torch.nn.functional.scaled_dot_product_attention(q, k, v),
      (torch.randn(1, 4, 16, 8), torch.randn(1, 4, 16, 8), torch.randn(1, 4, 16, 8))),
+    ("sdpa_mask", lambda q, k, v, m: torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=m),
+     (torch.randn(1, 4, 8, 16), torch.randn(1, 4, 12, 16), torch.randn(1, 4, 12, 16), torch.randn(1, 1, 8, 12))),
     ("chunk", lambda a: a.chunk(3, -1)[1], (torch.randn(1, 1, 12),)),
+    ("unbind", lambda a: torch.unbind(a, 2)[1], (torch.randn(1, 4, 3, 8),)),
+    ("repeat_interleave", lambda a: a.repeat_interleave(2, dim=1), (torch.randn(1, 4, 8),)),
+    ("matmul_3d_2d", lambda a, b: a @ b, (torch.randn(1, 30, 32), torch.randn(32, 64))),
 ]
 
 # Data-dependent ops: output has a dynamic (?) dim, so shape can't match eager exactly --

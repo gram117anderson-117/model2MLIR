@@ -5,13 +5,24 @@ One command captures any model to MLIR in every datatype/quant format:
 ```bash
 python workloads/capture.py <model>                 # fp32 + int8 + fp8
 python workloads/capture.py <model> --formats fp32  # just one
-python workloads/capture.py <model> --level high-level
+python workloads/capture.py <model> --level high-level   # structured (linalg_ext.*) form
+python workloads/capture.py <model> --sections      # also emit per-source-module .mlir
 python workloads/capture.py --all                   # every model
 python workloads/capture.py --list                  # what's available
 ```
 
-Output: `workloads/<model>/<model>.mlir` (fp32), `_int8.mlir`, `_fp8.mlir` — each asserted
-to lower to **0 opaque ops**. `.mlir` files are gitignored (build artifacts).
+Output per model/format:
+- `workloads/<model>/<model>{,_int8,_fp8}.mlir` — the graph, each asserted to **0 opaque ops**.
+- `workloads/<model>/<model>{,_int8,_fp8}.safetensors` (+ `.manifest.json`) — the real
+  weights/buffers, keyed by name; the `.mlir` carries `m2m.weights_file`. Graph stays small;
+  data is fully recoverable. (See `m2m.transforms.externalize`.)
+- with `--sections`: `workloads/<model>/sections/<model>{...}.<section>.mlir` — one `func.func`
+  per top-level source module (VLM / action expert / ...), with cross-section I/O, so each
+  section can compile/run at its own cadence. (See `m2m.transforms.split_by_section`.)
+
+`convert()` options: `level` (linalg-on-tensors | high-level), `quantization`, `preserve_qdq`,
+`fully_standard` (pure core MLIR, no `*_ext`), `weights_path` (externalize to safetensors).
+`.mlir`/`.safetensors` are gitignored (build artifacts).
 
 ## What a model directory contains
 
