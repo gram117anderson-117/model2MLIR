@@ -114,10 +114,24 @@ def _inner_capture(model: str, formats: list[str], level: str) -> None:
             path = model_dir / f"{model}{suffix[fmt]}.mlir"
             path.write_text(r.mlir_text)
             opaque = opaque_report(r.mlir_text)
+            n_sections = 0
+            if os.environ.get("M2M_EMIT_SECTIONS") and r.module is not None:
+                try:
+                    from m2m.api import module_to_text
+                    from m2m.transforms import split_by_section
+                    secdir = model_dir / "sections"
+                    secdir.mkdir(exist_ok=True)
+                    secs = split_by_section(r.module)
+                    for sname, smod in secs.items():
+                        (secdir / f"{model}{suffix[fmt]}.{sname}.mlir").write_text(module_to_text(smod))
+                    n_sections = len(secs)
+                except Exception:  # noqa: BLE001
+                    pass
             results[fmt] = {
                 "ok": r.ok, "opaque": sum(opaque.values()), "opaque_detail": opaque,
                 "linalg": r.mlir_text.count("linalg."),
                 "families": len(family_histogram(r.mlir_text)),
+                "sections": n_sections,
                 "path": str(path), "bytes": len(r.mlir_text),
             }
         except Exception as exc:  # noqa: BLE001 - one format failing must not sink the others
@@ -154,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--all", action="store_true", help="capture every model with a loader.py")
     ap.add_argument("--list", action="store_true", help="list available models")
     ap.add_argument("--no-venv", action="store_true", help="don't build missing venvs (fail instead)")
+    ap.add_argument("--sections", action="store_true", help="also emit per-source-module section .mlir files")
     ap.add_argument("--_inner", dest="inner", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
@@ -169,6 +184,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.inner:  # in-venv worker
         _inner_capture(args.model, formats, args.level)
         return 0
+
+    if args.sections:
+        os.environ["M2M_EMIT_SECTIONS"] = "1"  # propagated to the in-venv worker
 
     models = _all_models() if args.all else ([args.model] if args.model else [])
     if not models:

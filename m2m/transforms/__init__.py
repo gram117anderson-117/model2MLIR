@@ -11,6 +11,7 @@ from xdsl.dialects.builtin import ModuleOp, StringAttr
 from m2m.transforms.expand_ext import EXPANDERS, expand_to_linalg
 from m2m.transforms.expand_quant import expand_quant_to_standard
 from m2m.transforms.fuse_qdq import fuse_qdq
+from m2m.transforms.sections import split_by_section
 
 
 def to_standard(module: ModuleOp) -> ModuleOp:
@@ -27,4 +28,5 @@ def to_standard(module: ModuleOp) -> ModuleOp:
     return module
 
 
-__all__ = ["EXPANDERS", "expand_quant_to_standard", "expand_to_linalg", "fuse_qdq", "to_standard"]
+__all__ = ["EXPANDERS", "expand_quant_to_standard", "expand_to_linalg", "fuse_qdq",
+           "split_by_section", "to_standard"]

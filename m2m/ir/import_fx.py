@@ -212,6 +212,16 @@ def _forward_fx_meta(
             dt = getattr(val[0] if isinstance(val, (tuple, list)) and val else val, "dtype", None)
             if dt is not None:
                 op.attributes["m2m.provenance.orig_dtype"] = StringAttr(str(dt).replace("torch.", ""))
+        # module provenance: the top-level source nn.Module (VLM / action expert / vision /
+        # ...) this op came from -- the basis for per-section partitioning and per-frequency
+        # scheduling. Derived from the FX nn_module_stack (first non-empty path component).
+        if "m2m.module" not in op.attributes:
+            stack = fx_meta.get("nn_module_stack")
+            if isinstance(stack, dict) and stack:
+                paths = [v[0] for v in stack.values() if isinstance(v, (tuple, list)) and v]
+                nonempty = [p for p in paths if p]
+                if nonempty:
+                    op.attributes["m2m.module"] = StringAttr(str(nonempty[0]).split(".")[0])
 
 
 def _torch_dtype_to_xdsl(dtype: torch.dtype) -> Attribute:

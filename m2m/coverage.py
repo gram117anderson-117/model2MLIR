@@ -138,6 +138,13 @@ _NAMED_MATCHABLE = re.compile(
     r"tensor\.insert_slice|tensor\.collapse_shape|tensor\.expand_shape|scf\.for)\b")
 
 
+def module_sections(mlir_text: str) -> dict[str, int]:
+    """Report ``{source_module: op_count}`` from the ``m2m.module`` provenance tags -- the
+    VLA sections (VLM / action expert / vision / ...) and their sizes. The basis for
+    per-section partitioning + per-frequency scheduling."""
+    return dict(Counter(re.findall(r'm2m\.module = "([^"]+)"', mlir_text)))
+
+
 def region_summary(mlir_text: str) -> dict[str, int]:
     """Report ``{family: number_of_distinct_regions}`` -- the count of transform-units (ops
     sharing an ``m2m.region_id``) per coarse family. This is what a rewrite pass actually
