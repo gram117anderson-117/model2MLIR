@@ -69,87 +69,93 @@ def _chunk(input, chunks, dim=0):
 
 
 def inline_set_grad_hops(gm) -> bool:
-    """Inline ``wrap_with_*`` higher-order ops (torch.no_grad / torch.autocast regions) into
-    the parent FX graph.
+    """Flatten ALL ``wrap_with_*`` higher-order ops (torch.no_grad / torch.autocast regions,
+    arbitrarily nested) by recursively rebuilding the FX graph.
 
-    A ``torch.no_grad()`` / ``torch.autocast()`` region is exported (on torch 2.7.x) as a HOP
-    wrapping a sub-GraphModule -- e.g. ``wrap_with_set_grad_enabled(enabled, submod, *ops)`` or
-    ``wrap_with_autocast(device, dtype, enabled, cache, submod, *ops)`` -- with
-    ``getitem(hop, i)`` extracting its outputs. The FXImporter doesn't recurse into the
-    subgraph, so its outputs aren't mapped and downstream ops lose their operand. Inlining the
-    subgraph's nodes into the parent removes the HOP. Returns True if anything changed (caller
-    re-runs to a fixpoint for nested HOPs). Idempotent.
+    These HOPs wrap a sub-GraphModule -- ``wrap_with_set_grad_enabled(enabled, submod, *ops)``
+    / ``wrap_with_autocast(device, dtype, enabled, cache, submod, *ops)`` -- with
+    ``getitem(hop, i)`` extracting outputs. The FXImporter can't recurse into them, so their
+    bodies (e.g. RoPE precompute) never lower. Rather than fragile in-place surgery (which
+    can't converge on nested HOPs), we copy the whole graph into a fresh one, splicing each
+    HOP's subgraph inline (recursively) with its placeholders bound to the HOP's operands.
+    get_attr'd attributes (tensor constants + nested submodules) are transferred to ``gm``.
+    Returns True if any HOP was flattened. One call fully flattens (recursion handles nesting).
     """
     import operator
 
-    g = gm.graph
-    changed = False
-    for node in list(g.nodes):
-        # Inline the set_grad (torch.no_grad) HOP. Autocast HOPs are gated off: pi0.5 nests
-        # autocast-in-autocast around its RoPE precompute, and inlining the outer exposes 36
-        # unsqueeze whose nested-fixpoint resolution doesn't converge cleanly (-> 41 vs the
-        # clean 4 as an opaque boundary). Attribute transfer + get_attr materialization make
-        # the machinery correct; flip to "wrap_with_" once nested-autocast convergence is solid.
-        if node.op != "call_function" or "wrap_with_set_grad_enabled" not in str(node.target):
-            continue
-        # the submodule is whichever arg is a get_attr to a GraphModule; subgraph inputs are
-        # the node args that follow it (the flags precede it).
-        sub_idx = next((i for i, a in enumerate(node.args)
-                        if getattr(a, "op", None) == "get_attr"
-                        and hasattr(getattr(gm, a.target, None), "graph")), None)
-        if sub_idx is None:
-            continue
-        # Decide erasability BEFORE touching the graph (never leave orphaned duplicates):
-        # either every consumer is an int getitem (multi-output), or there's a single direct
-        # consumer (single-output). Anything else -> skip this HOP (stays opaque, no spin).
-        users = list(node.users)
-        getitems = [u for u in users if u.op == "call_function" and u.target is operator.getitem
-                    and isinstance(u.args[1], int)]
-        direct = [u for u in users if u not in getitems]
-        if direct and (len(users) != 1):
-            continue  # mixed / multiple direct users: unsafe to fully erase
-        sub = getattr(gm, node.args[sub_idx].target)
-        operands = list(node.args[sub_idx + 1:])
-        placeholders = [n for n in sub.graph.nodes if n.op == "placeholder"]
-        env = {ph: val for ph, val in zip(placeholders, operands)}
-        # Transfer the subgraph's get_attr'd attributes (tensor constants AND nested HOP
-        # submodules) onto the parent module, so copied get_attr nodes resolve -- without
-        # this a nested HOP's submodule (submod_N) is unreachable and can't be inlined.
-        for sn in sub.graph.nodes:
-            if sn.op == "get_attr" and not hasattr(gm, sn.target):
-                try:
-                    obj = getattr(sub, sn.target)
-                    if isinstance(obj, torch.nn.Module):
-                        gm.add_module(sn.target, obj)
-                    else:
-                        setattr(gm, sn.target, obj)
-                except Exception:  # noqa: BLE001
-                    pass
+    import torch.fx as fx
+
+    if not any(n.op == "call_function" and "wrap_with_" in str(n.target) for n in gm.graph.nodes):
+        return False
+
+    new_g = fx.Graph()
+
+    def _submod_idx(owner, n):
+        return next((k for k, a in enumerate(n.args)
+                     if isinstance(a, fx.Node) and a.op == "get_attr"
+                     and hasattr(getattr(owner, a.target, None), "graph")), None)
+
+    def emit(owner, node_list, local_env):
+        """Copy a (sub)graph's nodes into new_g using local_env (sub node -> new value).
+        A HOP node maps to a LIST of its output values; getitem on it indexes that list;
+        a direct single-output use is unwrapped in _remap. Returns the output value list."""
+        def _remap(a):
+            v = local_env[a]
+            return v[0] if isinstance(v, list) and len(v) == 1 else v
+
         outputs = None
-        with g.inserting_before(node):
-            for sn in sub.graph.nodes:
-                if sn.op == "placeholder":
+        for sn in node_list:
+            if sn.op == "placeholder":
+                continue  # bound by caller in local_env
+            if sn.op == "output":
+                o = sn.args[0]
+                outputs = [_remap(x) if isinstance(x, fx.Node) else x
+                           for x in (o if isinstance(o, (tuple, list)) else [o])]
+                continue
+            if sn.op == "get_attr":
+                if not hasattr(gm, sn.target):
+                    try:
+                        obj = getattr(owner, sn.target)
+                        gm.add_module(sn.target, obj) if isinstance(obj, torch.nn.Module) \
+                            else setattr(gm, sn.target, obj)
+                    except Exception:  # noqa: BLE001
+                        pass
+                ga = new_g.get_attr(sn.target)
+                ga.meta = dict(sn.meta)
+                local_env[sn] = ga
+                continue
+            if sn.op == "call_function":
+                # getitem on a HOP's output list
+                if (sn.target is operator.getitem and isinstance(sn.args[0], fx.Node)
+                        and isinstance(local_env.get(sn.args[0]), list)):
+                    local_env[sn] = local_env[sn.args[0]][sn.args[1]]
                     continue
-                if sn.op == "output":
-                    outs = sn.args[0]
-                    outputs = [env.get(o, o) for o in (outs if isinstance(outs, (tuple, list)) else [outs])]
-                    continue
-                env[sn] = g.node_copy(sn, lambda n: env[n])
-        if not outputs or (getitems and any(u.args[1] >= len(outputs) for u in getitems)):
-            continue
-        if direct:                       # single-output HOP used directly
-            node.replace_all_uses_with(outputs[0])
-        else:
-            for u in getitems:
-                u.replace_all_uses_with(outputs[u.args[1]])
-                g.erase_node(u)
-        g.erase_node(node)
-        changed = True
-    if changed:
-        g.eliminate_dead_code()
-        g.lint()
-        gm.recompile()
-    return changed
+                if "wrap_with_" in str(sn.target):
+                    si = _submod_idx(owner, sn)
+                    if si is not None:
+                        sub = getattr(owner, sn.args[si].target)
+                        operands = [_remap(a) for a in sn.args[si + 1:] if isinstance(a, fx.Node)]
+                        phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
+                        child = dict(zip(phs, operands))
+                        local_env[sn] = emit(sub, list(sub.graph.nodes), child) or []
+                        continue
+            # ordinary node (or unhandled HOP): copy with remapped args
+            new_node = new_g.node_copy(sn, _remap)
+            local_env[sn] = new_node
+        return outputs
+
+    top_env = {}
+    for n in gm.graph.nodes:
+        if n.op == "placeholder":
+            p = new_g.placeholder(n.name)
+            p.meta = dict(n.meta)
+            top_env[n] = p
+    outs = emit(gm, [n for n in gm.graph.nodes if n.op != "placeholder"], top_env)
+    new_g.output(tuple(outs) if outs else ())
+    new_g.lint()
+    gm.graph = new_g
+    gm.recompile()
+    return True
 
 
 # op-overload -> decomposition function. Extend as new torch-mlir gap ops surface.
