@@ -85,12 +85,11 @@ def inline_set_grad_hops(gm) -> bool:
     g = gm.graph
     changed = False
     for node in list(g.nodes):
-        # Inline the set_grad (torch.no_grad) HOP. Autocast-HOP inlining is gated off: for
-        # pi0.5 its subgraph has an operand-remapping edge case (a sliced tensor is mismapped),
-        # which regresses to a corrupt 41 vs. the clean 4 when left as an opaque boundary. The
-        # attribute-transfer + get_attr materialization below make the *machinery* correct
-        # (nested submodules reachable, constants materialized); flip this to "wrap_with_" once
-        # the operand-remap edge case is handled.
+        # Inline the set_grad (torch.no_grad) HOP. Autocast HOPs are gated off: pi0.5 nests
+        # autocast-in-autocast around its RoPE precompute, and inlining the outer exposes 36
+        # unsqueeze whose nested-fixpoint resolution doesn't converge cleanly (-> 41 vs the
+        # clean 4 as an opaque boundary). Attribute transfer + get_attr materialization make
+        # the machinery correct; flip to "wrap_with_" once nested-autocast convergence is solid.
         if node.op != "call_function" or "wrap_with_set_grad_enabled" not in str(node.target):
             continue
         # the submodule is whichever arg is a get_attr to a GraphModule; subgraph inputs are
