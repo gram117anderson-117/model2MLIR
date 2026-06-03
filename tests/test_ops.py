@@ -82,6 +82,9 @@ CASES = [
     ("repeat_prepend", lambda a: a.repeat(2, 1, 1), (torch.randn(3, 8),)),
     ("mean_full", lambda a: a.mean(), X),                 # mean.default -> scalar
     ("mean_absmean", lambda a: a.abs().mean(), X),        # BitNet W1.58 absmean
+    ("sdpa_4d", lambda q, k, v: torch.nn.functional.scaled_dot_product_attention(q, k, v),
+     (torch.randn(1, 4, 16, 8), torch.randn(1, 4, 16, 8), torch.randn(1, 4, 16, 8))),
+    ("chunk", lambda a: a.chunk(3, -1)[1], (torch.randn(1, 1, 12),)),
 ]
 
 # Data-dependent ops: output has a dynamic (?) dim, so shape can't match eager exactly --

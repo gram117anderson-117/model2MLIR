@@ -885,6 +885,95 @@ def _opaque_decomp(
     )
 
 
+def _batched_matmul(a, b, *, batch_rank, transpose_b, out_shape, elem):
+    """N-D batched matmul as a single linalg.generic contraction (family matmul).
+
+    a: [*batch, M, K]; b: [*batch, K, N] (or [*batch, N, K] if transpose_b).
+    out: [*batch, M, N]. Returns (ops, result_ssa)."""
+    from xdsl.dialects.arith import AddfOp, ConstantOp, MulfOp
+    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import SplatOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    D = AffineExpr.dimension
+    nb = batch_rank
+    m, n, k = nb, nb + 1, nb + 2
+    ndim = nb + 3
+    batch = [D(i) for i in range(nb)]
+    a_map = AffineMap(ndim, 0, (*batch, D(m), D(k)))
+    b_map = AffineMap(ndim, 0, (*batch, D(n), D(k))) if transpose_b \
+        else AffineMap(ndim, 0, (*batch, D(k), D(n)))
+    o_map = AffineMap(ndim, 0, (*batch, D(m), D(n)))
+    rt = TensorType(elem, out_shape)
+    zero = ConstantOp(FloatAttr(0.0, elem), elem)
+    init = SplatOp(zero.result, [], rt)
+    blk = Block(arg_types=[elem, elem, elem])
+    prod = MulfOp(blk.args[0], blk.args[1])
+    acc = AddfOp(blk.args[2], prod.results[0])
+    blk.add_op(prod); blk.add_op(acc); blk.add_op(YieldOp(acc.results[0]))
+    par, red = IteratorType.PARALLEL, IteratorType.REDUCTION
+    gen = GenericOp(
+        inputs=[a, b], outputs=[init.results[0]], body=Region(blk),
+        indexing_maps=[AffineMapAttr(a_map), AffineMapAttr(b_map), AffineMapAttr(o_map)],
+        iterator_types=[IteratorTypeAttr(par)] * (ndim - 1) + [IteratorTypeAttr(red)],
+        result_types=[rt],
+    )
+    return [zero, init, gen], gen.results[0]
+
+
+def decompose_scaled_dot_product_attention(operands, meta, node_name):
+    """aten.scaled_dot_product_attention(Q, K, V) -> softmax(Q Kᵀ / √E) V (family attention).
+
+    Handles the no-mask, non-causal case (the captured pi0.5 attention): Q/K/V are
+    [*batch, L, E]. Built from batched matmul + scale + softmax + batched matmul, all
+    standard dialects -- torch-version-independent (doesn't rely on export decomposition)."""
+    import math
+
+    from xdsl.dialects.arith import ConstantOp, MulfOp
+    from xdsl.dialects.builtin import FloatAttr
+
+    if len(operands) < 3:
+        return _opaque_decomp("aten_sdpa", operands[:3], meta, "attention", pattern_hint="sdpa")
+    q, k, v = operands[0], operands[1], operands[2]
+    sq, sk, sv = _shape_of(q), _shape_of(k), _shape_of(v)
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    elem = _t_elem(q)
+    # only the plain (no attn_mask / not causal) case; >2 SSA tensor operands => a mask is
+    # present -> bail to opaque (rare; keeps this correct rather than silently wrong).
+    if (sq is None or sk is None or sv is None or len(sq) < 2 or len(operands) > 3
+            or any(d < 0 for d in (*sq, *sk, *sv, *out_shape))):
+        return _opaque_decomp("aten_sdpa", operands[:3], meta, "attention", pattern_hint="sdpa")
+    batch_rank = len(sq) - 2
+    L, E, S = sq[-2], sq[-1], sk[-2]
+    scores_shape = [*sq[:-1], S]                       # [*batch, L, S]
+    ops, scores = _batched_matmul(q, k, batch_rank=batch_rank, transpose_b=True,
+                                  out_shape=scores_shape, elem=elem)
+    # scale by 1/sqrt(E)
+    scale = 1.0 / math.sqrt(E)
+    sc = _pointwise([scores], {"val": type("V", (), {"shape": scores_shape, "dtype": None})()},
+                    lambda args, oe: ([c := ConstantOp(FloatAttr(scale, oe), oe),
+                                       m := MulfOp(args[0], c.results[0])], m.results[0]),
+                    family="matmul")
+    if sc is None:
+        return _opaque_decomp("aten_sdpa", operands[:3], meta, "attention", pattern_hint="sdpa")
+    ops += sc.ops
+    sm = build_softmax_body(sc.result, dim=len(scores_shape) - 1)
+    if sm is None:
+        return _opaque_decomp("aten_sdpa", operands[:3], meta, "attention", pattern_hint="sdpa")
+    ops += sm[0]
+    o2, out = _batched_matmul(sm[1], v, batch_rank=batch_rank, transpose_b=False,
+                              out_shape=out_shape, elem=elem)
+    ops += o2
+    rid = _next_region_id("attention")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("attention")
+    return DecompResult(ops=ops, result=out, region_ids=[rid], pattern_hint="sdpa")
+
+
 def decompose_bmm(operands, meta, node_name):
     """aten.bmm.default(a[B,M,K], b[B,K,N]) -> batch matmul via linalg.generic (contraction)."""
     if len(operands) < 2:
@@ -2071,6 +2160,81 @@ def decompose_split_with_sizes(operands, meta, node_name):
     return DecompResult(ops=ops, result=results[0], results=results, region_ids=[rid], pattern_hint="split")
 
 
+def decompose_chunk(operands, meta, node_name):
+    """aten.chunk.default(input, chunks, dim) -> multi-output extract_slices. The exact
+    per-chunk sizes are read from meta['val'] (the captured output tensors)."""
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("aten_chunk", operands[:1], meta, "layout", pattern_hint="split")
+    src = operands[0]
+    in_shape = list(src.type.get_shape())
+    val: Any = meta["val"]
+    pieces = val if isinstance(val, (tuple, list)) else [val]
+    if any(d < 0 for d in in_shape) or not pieces:
+        return _opaque_decomp("aten_chunk", operands[:1], meta, "layout", pattern_hint="split")
+    rank = len(in_shape)
+    dim = int(_fx_arg(meta, 2, 0) or 0) % rank
+    sizes = [int(p.shape[dim]) for p in pieces]
+
+    from xdsl.dialects.tensor import ExtractSliceOp
+
+    ops: list[Operation] = []
+    results: list[SSAValue] = []
+    rid = _next_region_id("split")
+    off = 0
+    for sz in sizes:
+        offsets = [0] * rank
+        offsets[dim] = off
+        szs = list(in_shape)
+        szs[dim] = sz
+        op = ExtractSliceOp.from_static_parameters(src, offsets, szs, [1] * rank)
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("slice")
+        ops.append(op)
+        results.append(op.results[0])
+        off += sz
+    return DecompResult(ops=ops, result=results[0], results=results, region_ids=[rid], pattern_hint="chunk")
+
+
+def decompose_dequantize_affine(operands, meta, node_name):
+    """torchao.dequantize_affine(input, scale[, ...]) -> quant_ext.dequantize_per_channel.
+
+    The torchao fp8/int affine dequant (per-channel scale, symmetric -> zp=0). Emitted as a
+    first-class quant_ext op (family quantize) so the quantization stays matchable."""
+    from xdsl.dialects.arith import ConstantOp
+    from xdsl.dialects.builtin import IntegerAttr, IntegerType
+    from xdsl.dialects.tensor import SplatOp
+
+    from m2m.ir.quant.ops import DequantizePerChannelOp
+
+    if len(operands) < 2 or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("torchao_dequantize_affine", operands[:1], meta, "quantize",
+                              pattern_hint="dequantize")
+    inp, scale = operands[0], operands[1]
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    elem = _element_type_from_meta(meta)
+    if any(d < 0 for d in out_shape) or not isinstance(scale.type, TensorType):
+        return _opaque_decomp("torchao_dequantize_affine", operands[:1], meta, "quantize",
+                              pattern_hint="dequantize")
+    scale_shape = list(scale.type.get_shape())
+    zp_elem = IntegerType(32)
+    zero = ConstantOp(IntegerAttr(0, zp_elem), zp_elem)
+    zp = SplatOp(zero.result, [], TensorType(zp_elem, scale_shape))
+    # axis = first dim whose extent matches the scale vector (per-channel)
+    axis = next((i for i, d in enumerate(out_shape) if scale_shape and d == scale_shape[0]), 0)
+    deq = DequantizePerChannelOp(
+        operands=[inp, scale, zp.results[0]], result_types=[TensorType(elem, out_shape)],
+        properties={"axis": IntegerAttr(axis, IntegerType(64))},
+    )
+    deq.attributes["m2m.op"] = StringAttr("dequantize")
+    deq.attributes["m2m.family"] = StringAttr("quantize")
+    rid = _next_region_id("quantize")
+    for op in (zero, zp, deq):
+        _attach_region_id(op, rid)
+    return DecompResult(ops=[zero, zp, deq], result=deq.results[0], region_ids=[rid],
+                        pattern_hint="dequantize")
+
+
 def decompose_clone(operands, meta, node_name):
     """aten.clone.default(input) -> identity: forward the operand SSA (no op emitted)."""
     if operands:
@@ -2151,6 +2315,21 @@ def decompose_matmul(operands, meta, node_name):
                 region_ids=[rid],
                 pattern_hint="matmul",
             )
+
+    # N-D batched matmul: a[*batch, M, K] @ b[*batch, K, N] -> [*batch, M, N]
+    if out_rank > 2 and len(operands) == 2:
+        a, b = operands[0], operands[1]
+        sa, sb = _shape_of(a), _shape_of(b)
+        out_shape = _static_shape(shape)
+        if (sa is not None and sb is not None and len(sa) == out_rank and len(sb) == out_rank
+                and not any(d < 0 for d in (*sa, *sb, *out_shape))):
+            ops, res = _batched_matmul(a, b, batch_rank=out_rank - 2, transpose_b=False,
+                                       out_shape=out_shape, elem=_t_elem(a))
+            rid = _next_region_id("matmul")
+            for op in ops:
+                _attach_region_id(op, rid)
+                op.attributes["m2m.family"] = StringAttr("contraction")
+            return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="matmul")
 
     hint = "batch_matmul" if out_rank > 2 else "matmul"
     return _opaque_decomp(
@@ -3906,6 +4085,15 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.mul_.Tensor": decompose_mul_tensor,
     "aten.sub_.Tensor": decompose_sub_tensor,
     "aten.square.default": decompose_square,
+    "aten.scaled_dot_product_attention.default": decompose_scaled_dot_product_attention,
+    "aten._scaled_dot_product_attention_math.default": decompose_scaled_dot_product_attention,
+    "aten.chunk.default": decompose_chunk,
+    "torchao.dequantize_affine.default": decompose_dequantize_affine,
+    "torchao.dequantize_affine_float8.default": decompose_dequantize_affine,
+    "aten.dropout.default": _identity_decomp,        # eval dropout = identity
+    "aten.detach_.default": _identity_decomp,         # in-place detach = identity
+    "aten.flatten.using_ints": decompose_view,        # flatten = reshape (shape from meta)
+    "aten.__and__.Tensor": decompose_bitwise_and,
     "aten.where.self": decompose_where_self,
     "aten.scalar_tensor.default": decompose_scalar_tensor,
     "aten.full_like.default": decompose_full_like,
