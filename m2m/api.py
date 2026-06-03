@@ -58,6 +58,7 @@ def convert(
     level: str = "linalg-on-tensors",
     preserve_qdq: bool = True,
     fully_standard: bool = False,
+    weights_path: str | None = None,
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -146,6 +147,7 @@ def convert(
         exported_program=exported_program,
         use_torch_mlir=(backend != "fx_importer" and not emit_named),
         emit_named_ops=emit_named,
+        weights_path=weights_path,
     )
     # Stamp the representation level so downstream/merlin knows which contract it received
     # (default portable standard form vs the opt-in structured high-level form).

@@ -108,7 +108,9 @@ def _inner_capture(model: str, formats: list[str], level: str) -> None:
             # one instance across formats would double-quantize.
             mdl, inputs = get_model_and_inputs()
             q = _quant_for(cfg, fmt)
-            r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=q, level=level)
+            weights_path = str(model_dir / f"{model}{suffix[fmt]}.safetensors")
+            r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=q, level=level,
+                            weights_path=weights_path)
             path = model_dir / f"{model}{suffix[fmt]}.mlir"
             path.write_text(r.mlir_text)
             opaque = opaque_report(r.mlir_text)

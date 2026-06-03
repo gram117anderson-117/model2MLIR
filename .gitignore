@@ -30,3 +30,7 @@ tmp/
 
 # generated MLIR captures
 workloads/**/*.mlir
+
+# externalized weight artifacts (build outputs)
+workloads/**/*.safetensors
+workloads/**/*.manifest.json

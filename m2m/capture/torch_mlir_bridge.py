@@ -144,6 +144,7 @@ def bridge_fx_graph(
     exported_program: Any | None = None,
     use_torch_mlir: bool = True,
     emit_named_ops: bool = False,
+    weights_path: str | None = None,
 ) -> BridgeResult:
     """Convert ``model`` + ``example_inputs`` into an xDSL ModuleOp.
 
@@ -254,6 +255,15 @@ def bridge_fx_graph(
             return result
         result.module = module
         result.path_taken = "fx_importer"
+        # Externalize weights/buffers to safetensors (graph stays inspectable, data recoverable).
+        if weights_path:
+            try:
+                from m2m.transforms.externalize import externalize_weights
+
+                summary = externalize_weights(exported, module, weights_path)
+                result.diagnostics.append(f"externalized {summary['weights']} weights -> {weights_path}")
+            except Exception as exc:  # noqa: BLE001 - non-fatal
+                result.diagnostics.append(f"weight externalization failed: {exc}")
         result.diagnostics.append(
             f"FXImporter fallback succeeded with "
             f"{importer.decomposed_count} decomposed ops, "
