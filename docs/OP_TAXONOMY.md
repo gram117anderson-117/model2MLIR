@@ -20,23 +20,23 @@ matchable vocabulary, with new ops slotting into it rather than inventing new sh
   deterministic `m2m.transforms.expand_to_linalg(module)` pass lowers it to the default form.
   Always expand before exporting to a non-xDSL toolchain (these dialects are unregistered there).
 
-**Stable attribute schema** (all `m2m.`-prefixed, discardable — standard tooling ignores them;
+**Stable attribute schema** (all `prov.`-prefixed, discardable — standard tooling ignores them;
 stamped centrally in `import_fx._forward_fx_meta` + the `module.walk()` backfill):
 
 | Attribute | Scope | Meaning |
 |---|---|---|
-| `m2m.family` | op | coarse family (closed vocab `CANONICAL_FAMILIES`, ~19) |
-| `m2m.op` | op | fine op-kind (open set) |
-| `m2m.region_id` | op | transform-unit grouping |
-| `m2m.provenance.aten` | op | source aten op (e.g. `aten.native_layer_norm.default`) |
-| `m2m.provenance.orig_dtype` | op | pre-coercion torch dtype (e.g. `float8_e4m3fn` before fp8→f32) |
-| `m2m.level` | module | `"linalg-on-tensors"` \| `"high-level"` |
-| `m2m.quantization` / `m2m.quantization_mixed` | module | scheme / per-module map |
+| `prov.family` | op | coarse family (closed vocab `CANONICAL_FAMILIES`, ~19) |
+| `prov.op` | op | fine op-kind (open set) |
+| `prov.region_id` | op | transform-unit grouping |
+| `prov.aten` | op | source aten op (e.g. `aten.native_layer_norm.default`) |
+| `prov.orig_dtype` | op | pre-coercion torch dtype (e.g. `float8_e4m3fn` before fp8→f32) |
+| `prov.level` | module | `"linalg-on-tensors"` \| `"high-level"` |
+| `prov.quantization` / `prov.quantization_mixed` | module | scheme / per-module map |
 
 **Contract caveat (verified, load-bearing):** xDSL's custom-assembly printer drops discardable
 attrs on *named* ops (`linalg.transpose`, `linalg_ext.*`) in TEXT, though they exist on the
 in-memory IR. So **named ops are matched by op-type; only `linalg.generic` is matched by
-`m2m.*` attrs.** `coverage._NAMED_FAMILY` is the supported text-matching path.
+`prov.*` attrs.** `coverage._NAMED_FAMILY` is the supported text-matching path.
 
 ## The problem
 
@@ -53,11 +53,11 @@ Lower to canonical standard dialects (`linalg`, `tensor`, `arith`, `math`, `scf`
 **every** emitted op, centrally and automatically (in `import_fx._forward_fx_meta`), with a
 two-level tag:
 
-- `m2m.op`     — the fine canonical op-kind: `add`, `mul`, `matmul`, `softmax`, `cumsum`, …
-- `m2m.family` — the coarse family (a small fixed set, see below), **authoritative** from
+- `prov.op`     — the fine canonical op-kind: `add`, `mul`, `matmul`, `softmax`, `cumsum`, …
+- `prov.family` — the coarse family (a small fixed set, see below), **authoritative** from
   the central `_FAMILY_OF` map so the whole module uses ONE vocabulary.
 
-A pass matches on `op.attributes["m2m.family"]` (broad sweeps) or `["m2m.op"]` (specific
+A pass matches on `op.attributes["prov.family"]` (broad sweeps) or `["prov.op"]` (specific
 rewrites) — never by walking a `linalg.generic` body. Because the tagging lives at the
 single per-op chokepoint, coverage is 100% and *cannot* be forgotten when a new
 decomposition is added.
@@ -83,8 +83,8 @@ extension dialect over a bespoke generic. These already exist:
 Naming convention: extension dialects use **bare, standard-adjacent** names (`linalg_ext`
 reads as "an extension of linalg", portable / close to upstream MLIR) — *not* a vendor
 prefix. `quant_ext` is named to avoid colliding with MLIR's real `quant` dialect. Only the
-**discardable annotation attributes** keep a namespace prefix (`m2m.op`, `m2m.family`,
-`m2m.region_id`, …) — MLIR requires one, and standard tooling simply ignores them, so the
+**discardable annotation attributes** keep a namespace prefix (`prov.op`, `prov.family`,
+`prov.region_id`, …) — MLIR requires one, and standard tooling simply ignores them, so the
 *ops* stay standard MLIR.
 
 ## Quantization representation
@@ -102,8 +102,8 @@ prefix. `quant_ext` is named to avoid colliding with MLIR's real `quant` dialect
   (`f8E4M3FN`/`f8E5M2`), so any f8 storage in the artifact parses in a standard toolchain. But
   **end-to-end f8 storage is currently blocked**: the weight transpose (`aten.t`) lowers to
   `linalg.transpose`, whose body-builder asserts `AnyFloat | IntegerType`, which the shim f8
-  type isn't. So fp8 compute flows as f32 today (scheme recoverable via `m2m.quantization` +
-  `m2m.provenance.orig_dtype`). Full native-f8 needs xDSL native f8 (so linalg accepts it) or
+  type isn't. So fp8 compute flows as f32 today (scheme recoverable via `prov.quantization` +
+  `prov.orig_dtype`). Full native-f8 needs xDSL native f8 (so linalg accepts it) or
   a torch-mlir round-trip (torch-mlir has f8 and handles f8 transpose) — tracked follow-up.
 
 A named op is matched by **op type** (the strongest possible match) and carries its
@@ -130,4 +130,4 @@ portable.
 - **Scalability** is enforced by this taxonomy: the matchable vocabulary is bounded
   (~19 families) and fixed; adding ops grows the `aten → family` map, not the pass surface.
 - Measure anytime with `m2m.coverage.dialect_op_histogram(text)` and by grepping
-  `m2m.family = "…"` / `m2m.op = "…"` across the emitted `.mlir`.
+  `prov.family = "…"` / `prov.op = "…"` across the emitted `.mlir`.

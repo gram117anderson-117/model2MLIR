@@ -43,7 +43,7 @@ def _capture():
 
 
 def test_no_untagged_generics():
-    """Every linalg.generic carries an m2m.family tag (named ops are matchable by type)."""
+    """Every linalg.generic carries an prov.family tag (named ops are matchable by type)."""
     r = _capture()
     assert r.ok
     assert untagged_compute_ops(r.mlir_text) == 0

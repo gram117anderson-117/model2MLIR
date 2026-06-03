@@ -115,13 +115,13 @@ CANONICAL_FAMILIES = frozenset({
 
 def op_vocabulary(mlir_text: str) -> dict[str, dict[str, int]]:
     """Return the matchable op surface as ``{family: {op_kind: count}}`` from the
-    ``m2m.family`` / ``m2m.op`` attribute tags. This is what a pass writer sees: how few,
+    ``prov.family`` / ``prov.op`` attribute tags. This is what a pass writer sees: how few,
     stable buckets the whole network collapses into (the scalability goal)."""
     out: dict[str, dict[str, int]] = {}
-    for fam, op in re.findall(r'm2m\.family = "([^"]+)"[^\n]*?m2m\.op = "([^"]+)"', mlir_text):
+    for fam, op in re.findall(r'prov\.family = "([^"]+)"[^\n]*?prov\.op = "([^"]+)"', mlir_text):
         out.setdefault(fam, Counter())[op] += 1
     # also catch ops where the attrs print in the other order
-    for op, fam in re.findall(r'm2m\.op = "([^"]+)"[^\n]*?m2m\.family = "([^"]+)"', mlir_text):
+    for op, fam in re.findall(r'prov\.op = "([^"]+)"[^\n]*?prov\.family = "([^"]+)"', mlir_text):
         d = out.setdefault(fam, Counter())
         # avoid double counting lines already matched above is hard via regex; this is a
         # best-effort report, not an exact count -- use it to see the *shape*, not totals.
@@ -130,7 +130,7 @@ def op_vocabulary(mlir_text: str) -> dict[str, dict[str, int]]:
 
 
 # Named ops are matchable by their op-type alone (no attr needed); only the catch-all
-# linalg.generic must carry m2m.family/m2m.op to be matchable. (xDSL's custom assembly for
+# linalg.generic must carry prov.family/prov.op to be matchable. (xDSL's custom assembly for
 # named linalg ops doesn't even print discardable attrs, though they exist on the IR.)
 _NAMED_MATCHABLE = re.compile(
     r"\b(linalg\.matmul|linalg\.batch_matmul|linalg\.transpose|linalg\.reduce|linalg\.fill|"
@@ -139,33 +139,33 @@ _NAMED_MATCHABLE = re.compile(
 
 
 def module_sections(mlir_text: str) -> dict[str, int]:
-    """Report ``{source_module: op_count}`` from the ``m2m.module`` provenance tags -- the
+    """Report ``{source_module: op_count}`` from the ``prov.module`` provenance tags -- the
     VLA sections (VLM / action expert / vision / ...) and their sizes. The basis for
     per-section partitioning + per-frequency scheduling."""
-    return dict(Counter(re.findall(r'm2m\.module = "([^"]+)"', mlir_text)))
+    return dict(Counter(re.findall(r'prov\.module = "([^"]+)"', mlir_text)))
 
 
 def region_summary(mlir_text: str) -> dict[str, int]:
     """Report ``{family: number_of_distinct_regions}`` -- the count of transform-units (ops
-    sharing an ``m2m.region_id``) per coarse family. This is what a rewrite pass actually
+    sharing an ``prov.region_id``) per coarse family. This is what a rewrite pass actually
     iterates over: a whole transformer collapses to a few dozen regions across ~a dozen
     families, not thousands of unique ops. The headline number for 'are we proliferating?'."""
     seen: dict[str, set] = {}
-    for m in re.finditer(r'm2m\.region_id = "([^"]+)"[^\n]*?m2m\.family = "([^"]+)"', mlir_text):
+    for m in re.finditer(r'prov\.region_id = "([^"]+)"[^\n]*?prov\.family = "([^"]+)"', mlir_text):
         seen.setdefault(m.group(2), set()).add(m.group(1))
-    for m in re.finditer(r'm2m\.family = "([^"]+)"[^\n]*?m2m\.region_id = "([^"]+)"', mlir_text):
+    for m in re.finditer(r'prov\.family = "([^"]+)"[^\n]*?prov\.region_id = "([^"]+)"', mlir_text):
         seen.setdefault(m.group(1), set()).add(m.group(2))
     return {fam: len(ids) for fam, ids in sorted(seen.items(), key=lambda kv: -len(kv[1]))}
 
 
 def untagged_compute_ops(mlir_text: str) -> int:
-    """Count ``linalg.generic`` ops carrying NO ``m2m.family`` tag. Should be 0 -- a generic
+    """Count ``linalg.generic`` ops carrying NO ``prov.family`` tag. Should be 0 -- a generic
     is the only op that's *not* self-describing (everything is a linalg.generic), so it MUST
     be tagged to be matchable. Named ops (matmul/transpose/reduce/...) are matchable by their
     op-type and are excluded. A non-zero value means a generic escaped the taxonomy."""
     untagged = 0
     for line in mlir_text.splitlines():
-        if "linalg.generic" in line and "m2m.family" not in line:
+        if "linalg.generic" in line and "prov.family" not in line:
             untagged += 1
     return untagged
 
@@ -182,9 +182,9 @@ _NAMED_FAMILY = {  # named op (matchable by type) -> coarse family
 
 def family_histogram(mlir_text: str) -> dict[str, int]:
     """Multiset of coarse families over the FULL matchable surface: generics by their
-    ``m2m.family`` attr, plus named ops folded in by op-type (since named ops are matchable
+    ``prov.family`` attr, plus named ops folded in by op-type (since named ops are matchable
     by type and xDSL doesn't print their discardable attrs)."""
-    h = Counter(re.findall(r'm2m\.family = "([^"]+)"', mlir_text))
+    h = Counter(re.findall(r'prov\.family = "([^"]+)"', mlir_text))
     for line in mlir_text.splitlines():
         if "linalg.generic" in line:
             continue

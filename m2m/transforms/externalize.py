@@ -2,7 +2,7 @@
 
 Keep the ``.mlir`` small and inspectable while preserving the actual parameter/buffer data:
 write them to a widely-supported ``safetensors`` file keyed by their state-dict names, tag the
-module with ``m2m.weights_file``, and emit a JSON manifest mapping each func argument
+module with ``prov.weights_file``, and emit a JSON manifest mapping each func argument
 (placeholder) to its weight key + dtype + shape. A consumer loads the safetensors and binds
 each tensor to the corresponding function argument.
 """
@@ -18,7 +18,7 @@ from xdsl.dialects.builtin import ModuleOp, StringAttr
 def externalize_weights(exported: Any, module: ModuleOp, path: str) -> dict:
     """Write the exported program's parameters/buffers to ``path`` (safetensors) and a
     ``path + '.manifest.json'`` mapping func-arg index -> {weight, kind, dtype, shape}.
-    Tags ``module`` with ``m2m.weights_file``. Returns a summary dict. Best-effort: tensors
+    Tags ``module`` with ``prov.weights_file``. Returns a summary dict. Best-effort: tensors
     that can't be serialized (e.g. exotic quant subclasses) are recorded in the manifest
     with an ``error`` and skipped, never aborting capture."""
     import torch
@@ -57,7 +57,7 @@ def externalize_weights(exported: Any, module: ModuleOp, path: str) -> dict:
     with open(path + ".manifest.json", "w") as fh:
         json.dump(manifest, fh, indent=2)
     try:
-        module.attributes["m2m.weights_file"] = StringAttr(path)
+        module.attributes["prov.weights_file"] = StringAttr(path)
     except Exception:  # noqa: BLE001
         pass
     return {"weights": len(tensors), "args": len(placeholders), "path": path}

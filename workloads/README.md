@@ -14,7 +14,7 @@ python workloads/capture.py --list                  # what's available
 Output per model/format:
 - `workloads/<model>/<model>{,_int8,_fp8}.mlir` — the graph, each asserted to **0 opaque ops**.
 - `workloads/<model>/<model>{,_int8,_fp8}.safetensors` (+ `.manifest.json`) — the real
-  weights/buffers, keyed by name; the `.mlir` carries `m2m.weights_file`. Graph stays small;
+  weights/buffers, keyed by name; the `.mlir` carries `prov.weights_file`. Graph stays small;
   data is fully recoverable. (See `m2m.transforms.externalize`.)
 - with `--sections`: `workloads/<model>/sections/<model>{...}.<section>.mlir` — one `func.func`
   per top-level source module (VLM / action expert / ...), with cross-section I/O, so each

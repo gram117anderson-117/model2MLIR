@@ -22,7 +22,7 @@ def to_standard(module: ModuleOp) -> ModuleOp:
     expand_to_linalg(module)
     expand_quant_to_standard(module)
     try:
-        module.attributes["m2m.level"] = StringAttr("standard")
+        module.attributes["prov.level"] = StringAttr("standard")
     except Exception:  # noqa: BLE001
         pass
     return module

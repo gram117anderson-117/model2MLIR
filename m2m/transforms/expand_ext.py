@@ -48,8 +48,8 @@ def expand_to_linalg(module: ModuleOp) -> ModuleOp:
     """Lower every ``*_ext`` named op in ``module`` to standard dialects, in place.
 
     Each named op is replaced by its standard body (built via the shared ``build_*_body``
-    emitters), the body ops are tagged with the same taxonomy (``m2m.op`` / ``m2m.family``
-    / ``m2m.region_id``) as the importer would produce, and the module's ``m2m.level`` is
+    emitters), the body ops are tagged with the same taxonomy (``prov.op`` / ``prov.family``
+    / ``prov.region_id``) as the importer would produce, and the module's ``prov.level`` is
     set to ``linalg-on-tensors``. Returns the same module for chaining."""
     for op in list(module.walk()):
         handler = EXPANDERS.get(type(op))
@@ -62,11 +62,11 @@ def expand_to_linalg(module: ModuleOp) -> ModuleOp:
         rid = _next_region_id(op_kind)
         for o in ops:
             _attach_region_id(o, rid)
-            o.attributes["m2m.op"] = StringAttr(op_kind)
-            o.attributes["m2m.family"] = StringAttr(family)
+            o.attributes["prov.op"] = StringAttr(op_kind)
+            o.attributes["prov.family"] = StringAttr(family)
         Rewriter.insert_op(ops, InsertPoint.before(op))
         op.results[0].replace_all_uses_with(result)
         Rewriter.erase_op(op)
 
-    module.attributes["m2m.level"] = StringAttr("linalg-on-tensors")
+    module.attributes["prov.level"] = StringAttr("linalg-on-tensors")
     return module

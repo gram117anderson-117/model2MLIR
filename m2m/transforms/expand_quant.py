@@ -44,8 +44,8 @@ def expand_quant_to_standard(module: ModuleOp) -> ModuleOp:
         rid = _next_region_id("dequantize")
         for o in ops:
             _attach_region_id(o, rid)
-            o.attributes["m2m.op"] = StringAttr("dequantize")
-            o.attributes["m2m.family"] = StringAttr("quantize")
+            o.attributes["prov.op"] = StringAttr("dequantize")
+            o.attributes["prov.family"] = StringAttr("quantize")
         Rewriter.insert_op(ops, InsertPoint.before(op))
         op.results[0].replace_all_uses_with(result)
         Rewriter.erase_op(op)

@@ -83,8 +83,8 @@ _FX_META_FORWARD_KEYS = (
 # Canonical op taxonomy (the matchable vocabulary for downstream passes).
 #
 # Every emitted op is stamped with TWO attributes, centrally and automatically:
-#   m2m.op     -- the fine canonical op-kind  (e.g. "add", "matmul", "softmax")
-#   m2m.family -- the coarse family it belongs to (a small, fixed set below)
+#   prov.op     -- the fine canonical op-kind  (e.g. "add", "matmul", "softmax")
+#   prov.family -- the coarse family it belongs to (a small, fixed set below)
 # so a pass matches on an attribute, never by inspecting linalg.generic bodies.
 # Adding a new aten op means slotting its hint into one of these families --
 # NOT inventing a new pattern. Keep this vocabulary small; only add a family
@@ -141,7 +141,7 @@ def high_level_named_ops() -> set:
 
 # Fallback when a decomposition emitted a named op but set no pattern_hint: infer the
 # (op-kind, family) straight from the MLIR op name, so tagging is 100% regardless of
-# whether each decomposition remembered a hint. Maps op.name -> (m2m.op, m2m.family).
+# whether each decomposition remembered a hint. Maps op.name -> (prov.op, prov.family).
 _OP_TYPE_TAXONOMY: dict[str, tuple[str, str]] = {
     "linalg.matmul": ("matmul", "contraction"),
     "linalg.batch_matmul": ("batch_matmul", "contraction"),
@@ -166,11 +166,11 @@ def _forward_fx_meta(
     decomp_hint: str | None = None,
 ) -> None:
     """Copy FX node meta + DecompResult.pattern_hint onto ``op.attributes`` and stamp the
-    canonical taxonomy (``m2m.op`` fine kind + ``m2m.family`` coarse family) on EVERY op.
+    canonical taxonomy (``prov.op`` fine kind + ``prov.family`` coarse family) on EVERY op.
 
-    - ``_compgen_pattern`` (FX-level tag) -> ``m2m._pattern_hint``
+    - ``_compgen_pattern`` (FX-level tag) -> ``prov._pattern_hint``
     - ``decomp_hint`` (decomp-side explicit tag) wins when FX didn't set one.
-    - ``m2m.op`` <- effective hint; ``m2m.family`` <- family_of(hint), backfilled only
+    - ``prov.op`` <- effective hint; ``prov.family`` <- family_of(hint), backfilled only
       when a decomposition didn't already set an (authoritative) family. This makes
       family tagging 100% consistent regardless of whether each decomposition remembered.
 
@@ -178,11 +178,11 @@ def _forward_fx_meta(
     """
     fx_hint = fx_meta.get("_compgen_pattern") if isinstance(fx_meta, dict) else None
     effective_hint = fx_hint or decomp_hint
-    if effective_hint and "m2m._pattern_hint" not in op.attributes:
-        op.attributes["m2m._pattern_hint"] = StringAttr(str(effective_hint))
+    if effective_hint and "prov._pattern_hint" not in op.attributes:
+        op.attributes["prov._pattern_hint"] = StringAttr(str(effective_hint))
     # canonical two-level taxonomy (matchable by downstream passes):
-    #   m2m.op     = fine op-kind (the hint)            -- preserved as-is
-    #   m2m.family = coarse family from the fixed map   -- AUTHORITATIVE: overwrite any
+    #   prov.op     = fine op-kind (the hint)            -- preserved as-is
+    #   prov.family = coarse family from the fixed map   -- AUTHORITATIVE: overwrite any
     #     ad-hoc family a decomposition set, so the whole module uses ONE vocabulary.
     fam = family_of(effective_hint)
     op_kind = str(effective_hint) if effective_hint else None
@@ -191,37 +191,37 @@ def _forward_fx_meta(
         type_tax = _OP_TYPE_TAXONOMY.get(getattr(op, "name", ""))
         if type_tax is not None:
             op_kind, fam = type_tax
-    if op_kind and "m2m.op" not in op.attributes:
-        op.attributes["m2m.op"] = StringAttr(op_kind)
+    if op_kind and "prov.op" not in op.attributes:
+        op.attributes["prov.op"] = StringAttr(op_kind)
     if fam is not None:
-        op.attributes["m2m.family"] = StringAttr(fam)  # authoritative coarse family
+        op.attributes["prov.family"] = StringAttr(fam)  # authoritative coarse family
 
     if isinstance(fx_meta, dict):
-        if fx_meta.get("_compgen_transpose_absorbed") and "m2m.transpose_absorbed" not in op.attributes:
-            op.attributes["m2m.transpose_absorbed"] = StringAttr("true")
-        if fx_meta.get("_compgen_fuse_dequant") and "m2m.fuse_dequant" not in op.attributes:
-            op.attributes["m2m.fuse_dequant"] = StringAttr("true")
+        if fx_meta.get("_compgen_transpose_absorbed") and "prov.transpose_absorbed" not in op.attributes:
+            op.attributes["prov.transpose_absorbed"] = StringAttr("true")
+        if fx_meta.get("_compgen_fuse_dequant") and "prov.fuse_dequant" not in op.attributes:
+            op.attributes["prov.fuse_dequant"] = StringAttr("true")
         # provenance: trace each op back to its PyTorch origin (the source aten op) and the
         # original torch dtype before any coercion (e.g. fp8 -> f32). Lets downstream/merlin
         # recover "what this represents in PyTorch" and the true low-precision dtype.
         aten = fx_meta.get("_aten_target")
-        if aten and "m2m.provenance.aten" not in op.attributes:
-            op.attributes["m2m.provenance.aten"] = StringAttr(str(aten))
-        if "m2m.provenance.orig_dtype" not in op.attributes:
+        if aten and "prov.aten" not in op.attributes:
+            op.attributes["prov.aten"] = StringAttr(str(aten))
+        if "prov.orig_dtype" not in op.attributes:
             val = fx_meta.get("val")
             dt = getattr(val[0] if isinstance(val, (tuple, list)) and val else val, "dtype", None)
             if dt is not None:
-                op.attributes["m2m.provenance.orig_dtype"] = StringAttr(str(dt).replace("torch.", ""))
+                op.attributes["prov.orig_dtype"] = StringAttr(str(dt).replace("torch.", ""))
         # module provenance: the top-level source nn.Module (VLM / action expert / vision /
         # ...) this op came from -- the basis for per-section partitioning and per-frequency
         # scheduling. Derived from the FX nn_module_stack (first non-empty path component).
-        if "m2m.module" not in op.attributes:
+        if "prov.module" not in op.attributes:
             stack = fx_meta.get("nn_module_stack")
             if isinstance(stack, dict) and stack:
                 paths = [v[0] for v in stack.values() if isinstance(v, (tuple, list)) and v]
                 nonempty = [p for p in paths if p]
                 if nonempty:
-                    op.attributes["m2m.module"] = StringAttr(str(nonempty[0]).split(".")[0])
+                    op.attributes["prov.module"] = StringAttr(str(nonempty[0]).split(".")[0])
 
 
 def _torch_dtype_to_xdsl(dtype: torch.dtype) -> Attribute:
@@ -238,7 +238,7 @@ def _torch_dtype_to_xdsl(dtype: torch.dtype) -> Attribute:
     # reject our custom Float8 type with an AnyFloat assertion. Since we can't
     # patch xDSL (and fp8 here is for representation, not execution), fp8 tensors
     # flow through the compute path as f32; the exact torchAO fp8 scheme is recorded
-    # as the module attribute `m2m.quantization` so the quantization is still captured.
+    # as the module attribute `prov.quantization` so the quantization is still captured.
     # `Float8E4M3FNType`/`Float8E5M2Type` remain available for a future xDSL that
     # supports f8 natively (or a torch-mlir round-trip).
     _f8 = {getattr(torch, n, None) for n in ("float8_e4m3fn", "float8_e5m2",
@@ -401,9 +401,9 @@ class FXImporter:
             if tt is None:
                 continue
             op = _EmptyOp([], tt)
-            op.attributes["m2m.op"] = StringAttr("const")
-            op.attributes["m2m.family"] = StringAttr("fill")
-            op.attributes["m2m.get_attr"] = StringAttr(str(node.target))
+            op.attributes["prov.op"] = StringAttr("const")
+            op.attributes["prov.family"] = StringAttr("fill")
+            op.attributes["prov.get_attr"] = StringAttr(str(node.target))
             block.add_op(op)
             value_map[node.name] = op.results[0]
 
@@ -687,19 +687,19 @@ class FXImporter:
         # circuit by emitting a B^T kernel.
         _annotate_transposes_and_matmuls(module)
 
-        # Taxonomy backfill: a final sweep that stamps m2m.op / m2m.family on every named
+        # Taxonomy backfill: a final sweep that stamps prov.op / prov.family on every named
         # compute op still missing them (ops emitted by helpers outside any DecompResult --
         # e.g. transpose/reduce built inside matmul/layer-norm helpers -- never pass through
         # _forward_fx_meta). Guarantees the matchable vocabulary covers 100% of named ops.
         for op in module.walk():
-            if "m2m.family" in op.attributes:
+            if "prov.family" in op.attributes:
                 continue
             tax = _OP_TYPE_TAXONOMY.get(getattr(op, "name", ""))
             if tax is not None:
                 kind, fam = tax
-                if "m2m.op" not in op.attributes:
-                    op.attributes["m2m.op"] = StringAttr(kind)
-                op.attributes["m2m.family"] = StringAttr(fam)
+                if "prov.op" not in op.attributes:
+                    op.attributes["prov.op"] = StringAttr(kind)
+                op.attributes["prov.family"] = StringAttr(fam)
 
         try:
             module.verify()
@@ -746,15 +746,15 @@ def _annotate_transposes_and_matmuls(module: ModuleOp) -> None:
     transpose_counter = 0
     for op in module.walk():
         if isinstance(op, TransposeOp):
-            existing_rid = op.attributes.get("m2m.region_id")
+            existing_rid = op.attributes.get("prov.region_id")
             if existing_rid is None:
                 rid = f"transpose_{transpose_counter}"
                 transpose_counter += 1
-                op.attributes["m2m.region_id"] = StringAttr(rid)
+                op.attributes["prov.region_id"] = StringAttr(rid)
             else:
                 rid = existing_rid.data if isinstance(existing_rid, StringAttr) else None
-            if rid and "m2m.dispatch_id" not in op.attributes:
-                op.attributes["m2m.dispatch_id"] = StringAttr(rid)
+            if rid and "prov.dispatch_id" not in op.attributes:
+                op.attributes["prov.dispatch_id"] = StringAttr(rid)
 
     # Opaque func.call annotation (REQ-026). Per-callee counters so
     # ids stay readable: ``aten_relu_default_0``, ``aten_add_1``, etc.
@@ -768,23 +768,23 @@ def _annotate_transposes_and_matmuls(module: ModuleOp) -> None:
         # but those have no `results`; skip them defensively.
         if not op.results:
             continue
-        existing_rid = op.attributes.get("m2m.region_id")
+        existing_rid = op.attributes.get("prov.region_id")
         if existing_rid is None:
             callee = op.callee.string_value()
             stem = callee.lstrip("@") if callee else "call"
             count = callee_counters.get(stem, 0)
             callee_counters[stem] = count + 1
             rid = f"{stem}_{count}"
-            op.attributes["m2m.region_id"] = StringAttr(rid)
+            op.attributes["prov.region_id"] = StringAttr(rid)
         else:
             rid = existing_rid.data if isinstance(existing_rid, StringAttr) else None
-        if rid and "m2m.dispatch_id" not in op.attributes:
-            op.attributes["m2m.dispatch_id"] = StringAttr(rid)
+        if rid and "prov.dispatch_id" not in op.attributes:
+            op.attributes["prov.dispatch_id"] = StringAttr(rid)
 
     for op in module.walk():
         if not isinstance(op, MatmulOp):
             continue
-        if "m2m.transposed_b" in op.attributes:
+        if "prov.transposed_b" in op.attributes:
             continue  # already tagged by a decomposition
         if len(op.operands) < 2:
             continue
@@ -800,7 +800,7 @@ def _annotate_transposes_and_matmuls(module: ModuleOp) -> None:
         except Exception:
             perm = None
         if perm == [1, 0]:
-            op.attributes["m2m.transposed_b"] = StringAttr("true")
+            op.attributes["prov.transposed_b"] = StringAttr("true")
 
 
 def fx_to_xdsl(

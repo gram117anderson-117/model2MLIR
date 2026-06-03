@@ -55,7 +55,7 @@ def _make_external_call_translation(target: str) -> SynthesizedPayloadTranslatio
     ) -> DecompResult:
         result_type = _result_type_from_meta(meta)
         call = CallOp(sanitized, operands, [result_type])
-        call.attributes["m2m.region_id"] = StringAttr(f"{region_prefix}_{node_name}")
+        call.attributes["prov.region_id"] = StringAttr(f"{region_prefix}_{node_name}")
         return DecompResult(ops=[call], result=call.res[0], region_ids=[f"{region_prefix}_{node_name}"])
 
     return SynthesizedPayloadTranslation(

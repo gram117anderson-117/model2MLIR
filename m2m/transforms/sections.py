@@ -2,7 +2,7 @@
 
 VLAs are composed of sections (VLM backbone, action expert / DiT, vision encoder, ...) that
 may run at different frequencies. The importer flattens the whole forward, but tags every op
-with ``m2m.module`` (its source nn.Module). This pass splits the flat function into one
+with ``prov.module`` (its source nn.Module). This pass splits the flat function into one
 ``func.func`` per top-level section -- each taking the cross-section values it consumes and
 returning the values other sections consume -- so each section can be compiled/scheduled/run
 at its own cadence (and emitted to its own ``.mlir`` file).
@@ -16,14 +16,14 @@ from xdsl.ir import Block, Region
 
 
 def _section_of(op) -> str | None:
-    a = op.attributes.get("m2m.module")
+    a = op.attributes.get("prov.module")
     return a.data if isinstance(a, StringAttr) else None
 
 
 def split_by_section(module: ModuleOp) -> dict[str, ModuleOp]:
     """Return ``{section_name: ModuleOp}`` -- one module per top-level source section, each a
     ``func.func @section_<name>`` with the section's ops and proper cross-section I/O. Ops
-    without an ``m2m.module`` tag inherit their operands' section (else 'shared')."""
+    without an ``prov.module`` tag inherit their operands' section (else 'shared')."""
     func = next((o for o in module.body.block.ops if isinstance(o, FuncOp)), None)
     if func is None or not func.body.blocks:
         return {}
@@ -80,6 +80,6 @@ def split_by_section(module: ModuleOp) -> dict[str, ModuleOp]:
         ft = FunctionType.from_lists([v.type for v in inputs], [o.type for o in outputs])
         nf = FuncOp(f"section_{S}", ft, region=Region(nblk))
         m = ModuleOp([nf])
-        m.attributes["m2m.section"] = StringAttr(S)
+        m.attributes["prov.section"] = StringAttr(S)
         out[S] = m
     return out

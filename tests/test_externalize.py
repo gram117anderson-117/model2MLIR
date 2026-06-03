@@ -28,7 +28,7 @@ def test_weights_externalized_and_recoverable(tmp_path):
     wp = str(tmp_path / "mlp.safetensors")
     r = m2m.convert(m, (torch.randn(2, 8),), backend="fx_importer", weights_path=wp)
     assert r.ok
-    assert "m2m.weights_file" in r.mlir_text          # graph references the data file
+    assert "prov.weights_file" in r.mlir_text          # graph references the data file
 
     st = load_file(wp)                                 # real data is recoverable
     assert set(st.keys()) == {"a.weight", "a.bias", "b.weight", "b.bias"}

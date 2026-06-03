@@ -115,7 +115,7 @@ def _make_empty(result_type: TensorType) -> EmptyOp:
 
 def _attach_region_id(op: Operation, region_id: str) -> None:
     """Attach a compgen.region_id attribute to an operation."""
-    op.attributes["m2m.region_id"] = StringAttr(region_id)
+    op.attributes["prov.region_id"] = StringAttr(region_id)
 
 
 def _reassoc(rank: int):
@@ -379,7 +379,7 @@ def decompose_linear(
     # ``compgen.transposed_b`` flag instead.
     transpose_rid = _next_region_id("transpose")
     _attach_region_id(transpose, transpose_rid)
-    transpose.attributes["m2m.dispatch_id"] = StringAttr(transpose_rid)
+    transpose.attributes["prov.dispatch_id"] = StringAttr(transpose_rid)
     region_ids.append(transpose_rid)
     ops.append(transpose)
 
@@ -394,13 +394,13 @@ def decompose_linear(
     )
     rid = _next_region_id("matmul")
     _attach_region_id(matmul, rid)
-    matmul.attributes["m2m.dispatch_id"] = StringAttr(rid)
+    matmul.attributes["prov.dispatch_id"] = StringAttr(rid)
     # REQ-023: declare that this matmul's B operand is logically a
     # transposed weight. Providers that prefer to short-circuit the
     # transpose op (e.g. emit a B^T kernel kernel directly against
     # the original weight) can read this flag and skip the
     # transpose region.
-    matmul.attributes["m2m.transposed_b"] = StringAttr("true")
+    matmul.attributes["prov.transposed_b"] = StringAttr("true")
     region_ids.append(rid)
     ops.append(matmul)
 
@@ -624,7 +624,7 @@ def _scalar_to_tensor(scalar: Any, like_type: TensorType) -> tuple[list[Operatio
     f32_attr = DenseIntOrFPElementsAttr.from_list(f32_like, [float(scalar)])
     f32_const = ConstantOp(f32_attr, f32_like)
     cast = CallOp("_compgen_cast_scalar", [f32_const.result], [like_type])
-    cast.attributes["m2m.cast_to"] = StringAttr(str(elem))
+    cast.attributes["prov.cast_to"] = StringAttr(str(elem))
     return [f32_const, cast], cast.res[0]
 
 
@@ -994,7 +994,7 @@ def decompose_scaled_dot_product_attention(operands, meta, node_name):
     rid = _next_region_id("attention")
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("attention")
+        op.attributes["prov.family"] = StringAttr("attention")
     return DecompResult(ops=ops, result=out, region_ids=[rid], pattern_hint="sdpa")
 
 
@@ -1043,7 +1043,7 @@ def decompose_bmm(operands, meta, node_name):
     rid = _next_region_id("matmul")
     for op in (zero, init, gen):
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("matmul")
+        op.attributes["prov.family"] = StringAttr("matmul")
     return DecompResult(ops=[zero, init, gen], result=gen.results[0], region_ids=[rid], pattern_hint="batch_matmul")
 
 
@@ -1104,7 +1104,7 @@ def decompose_int_mm(operands, meta, node_name):
     rid = _next_region_id("matmul")
     for op in (zero, init, gen):
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("matmul")
+        op.attributes["prov.family"] = StringAttr("matmul")
     return DecompResult(ops=[zero, init, gen], result=gen.results[0], region_ids=[rid], pattern_hint="int_matmul")
 
 
@@ -1149,7 +1149,7 @@ def _make_amin_amax(is_min):
         rid = _next_region_id("reduce")
         for op in ops:
             _attach_region_id(op, rid)
-            op.attributes["m2m.family"] = StringAttr("reduce")
+            op.attributes["prov.family"] = StringAttr("reduce")
         return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="reduce")
 
     return decompose
@@ -1277,7 +1277,7 @@ def decompose_native_layer_norm(operands, meta, node_name):
     rid = _next_region_id("layer_norm")
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("layer_norm")
+        op.attributes["prov.family"] = StringAttr("layer_norm")
     return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="layer_norm")
 
 
@@ -1422,7 +1422,7 @@ def decompose_softmax(operands, meta, node_name):
     rid = _next_region_id("softmax")
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("softmax")
+        op.attributes["prov.family"] = StringAttr("softmax")
     return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="softmax")
 
 
@@ -1518,7 +1518,7 @@ def decompose_slice_scatter(operands, meta, node_name):
     op = InsertSliceOp.from_static_parameters(src, inp, offsets, ss, strides)
     rid = _next_region_id("slice_scatter")
     _attach_region_id(op, rid)
-    op.attributes["m2m.family"] = StringAttr("slice")
+    op.attributes["prov.family"] = StringAttr("slice")
     return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="slice_scatter")
 
 
@@ -1562,7 +1562,7 @@ def decompose_any_real(operands, meta, node_name):
     rid = _next_region_id("reduce")
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("reduce")
+        op.attributes["prov.family"] = StringAttr("reduce")
     return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="any")
 
 
@@ -1591,7 +1591,7 @@ def decompose_empty(operands, meta, node_name):
         return _opaque_decomp("aten_empty", [], meta, "empty", pattern_hint="empty")
     e = _make_empty(TensorType(elem, out_shape))
     rid = _next_region_id("empty")
-    e.attributes["m2m.family"] = StringAttr("empty")
+    e.attributes["prov.family"] = StringAttr("empty")
     _attach_region_id(e, rid)
     return DecompResult(ops=[e], result=e.results[0], region_ids=[rid], pattern_hint="empty")
 
@@ -1614,7 +1614,7 @@ def _make_fill(value_idx: int):
         rid = _next_region_id("fill")
         for op in ops:
             _attach_region_id(op, rid)
-            op.attributes["m2m.family"] = StringAttr("fill")
+            op.attributes["prov.family"] = StringAttr("fill")
         return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="fill")
 
     return f
@@ -1661,7 +1661,7 @@ def decompose_mean_dim(operands, meta, node_name):
     rid = _next_region_id("reduce")
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("reduce")
+        op.attributes["prov.family"] = StringAttr("reduce")
     return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="reduce_mean")
 
 
@@ -1740,7 +1740,7 @@ def _try_direct_conv2d(operands, meta, in_shape, w_shape):
             res = em[1]
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("conv")
+        op.attributes["prov.family"] = StringAttr("conv")
     return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="conv2d")
 
 
@@ -1896,7 +1896,7 @@ def decompose_convolution(operands, meta, node_name):
     im2col_call = CallOp("aten_im2col", [in_v], [im2col_type])
     im2col_rid = _next_region_id("im2col")
     _attach_region_id(im2col_call, im2col_rid)
-    im2col_call.attributes["m2m.dispatch_id"] = StringAttr(im2col_rid)
+    im2col_call.attributes["prov.dispatch_id"] = StringAttr(im2col_rid)
     region_ids.append(im2col_rid)
     ops.append(im2col_call)
 
@@ -1905,7 +1905,7 @@ def decompose_convolution(operands, meta, node_name):
     w_flat_call = CallOp("aten_flatten_weight", [w_v], [w_flat_type])
     w_flat_rid = _next_region_id("flatten")
     _attach_region_id(w_flat_call, w_flat_rid)
-    w_flat_call.attributes["m2m.dispatch_id"] = StringAttr(w_flat_rid)
+    w_flat_call.attributes["prov.dispatch_id"] = StringAttr(w_flat_rid)
     region_ids.append(w_flat_rid)
     ops.append(w_flat_call)
 
@@ -1920,7 +1920,7 @@ def decompose_convolution(operands, meta, node_name):
     )
     mm_rid = _next_region_id("matmul")
     _attach_region_id(matmul, mm_rid)
-    matmul.attributes["m2m.dispatch_id"] = StringAttr(mm_rid)
+    matmul.attributes["prov.dispatch_id"] = StringAttr(mm_rid)
     region_ids.append(mm_rid)
     ops.append(matmul)
 
@@ -1929,7 +1929,7 @@ def decompose_convolution(operands, meta, node_name):
     reshape_call = CallOp("aten_reshape", [matmul.res[0]], [out_type])
     reshape_rid = _next_region_id("reshape")
     _attach_region_id(reshape_call, reshape_rid)
-    reshape_call.attributes["m2m.dispatch_id"] = StringAttr(reshape_rid)
+    reshape_call.attributes["prov.dispatch_id"] = StringAttr(reshape_rid)
     region_ids.append(reshape_rid)
     ops.append(reshape_call)
 
@@ -1963,7 +1963,7 @@ def decompose_select_int(operands, meta, node_name):
     op = ExtractSliceOp.from_static_parameters(src, offsets, sizes, [1] * rank, reduce_rank=True)
     rid = _next_region_id("select")
     _attach_region_id(op, rid)
-    op.attributes["m2m.family"] = StringAttr("slice")
+    op.attributes["prov.family"] = StringAttr("slice")
     return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="select")
 
 
@@ -2013,7 +2013,7 @@ def decompose_embedding(operands, meta, node_name):
     rid = _next_region_id("gather")
     for op in (empty, gen):
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("gather")
+        op.attributes["prov.family"] = StringAttr("gather")
     return DecompResult(ops=[empty, gen], result=gen.results[0], region_ids=[rid], pattern_hint="embedding")
 
 
@@ -2199,7 +2199,7 @@ def decompose_cat(operands, meta, node_name):
         rid = _next_region_id("cat")
         for o in ops:
             _attach_region_id(o, rid)
-            o.attributes["m2m.family"] = StringAttr("concat")
+            o.attributes["prov.family"] = StringAttr("concat")
         return DecompResult(ops=ops, result=op.results[0], region_ids=[rid], pattern_hint="cat")
     return _opaque_decomp("aten_cat", operands, meta, "layout", pattern_hint="cat")
 
@@ -2236,7 +2236,7 @@ def decompose_split_with_sizes(operands, meta, node_name):
         sizes[dim] = sz
         op = ExtractSliceOp.from_static_parameters(src, offsets, sizes, [1] * rank)
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("slice")
+        op.attributes["prov.family"] = StringAttr("slice")
         ops.append(op)
         results.append(op.results[0])
         off += sz
@@ -2277,7 +2277,7 @@ def decompose_unbind(operands, meta, node_name):
         results.append(re[1])
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("layout")
+        op.attributes["prov.family"] = StringAttr("layout")
     return DecompResult(ops=ops, result=results[0], results=results, region_ids=[rid], pattern_hint="unbind")
 
 
@@ -2332,7 +2332,7 @@ def decompose_repeat_interleave(operands, meta, node_name):
     rid = _next_region_id("tile")
     for op in (empty, gen):
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("gather_scatter")
+        op.attributes["prov.family"] = StringAttr("gather_scatter")
     return DecompResult(ops=[empty, gen], result=gen.results[0], region_ids=[rid], pattern_hint="repeat")
 
 
@@ -2364,7 +2364,7 @@ def decompose_chunk(operands, meta, node_name):
         szs[dim] = sz
         op = ExtractSliceOp.from_static_parameters(src, offsets, szs, [1] * rank)
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("slice")
+        op.attributes["prov.family"] = StringAttr("slice")
         ops.append(op)
         results.append(op.results[0])
         off += sz
@@ -2402,8 +2402,8 @@ def decompose_dequantize_affine(operands, meta, node_name):
         operands=[inp, scale, zp.results[0]], result_types=[TensorType(elem, out_shape)],
         properties={"axis": IntegerAttr(axis, IntegerType(64))},
     )
-    deq.attributes["m2m.op"] = StringAttr("dequantize")
-    deq.attributes["m2m.family"] = StringAttr("quantize")
+    deq.attributes["prov.op"] = StringAttr("dequantize")
+    deq.attributes["prov.family"] = StringAttr("quantize")
     rid = _next_region_id("quantize")
     for op in (zero, zp, deq):
         _attach_region_id(op, rid)
@@ -2540,7 +2540,7 @@ def decompose_matmul(operands, meta, node_name):
                 rid = _next_region_id("matmul")
                 for op in ops:
                     _attach_region_id(op, rid)
-                    op.attributes["m2m.family"] = StringAttr("contraction")
+                    op.attributes["prov.family"] = StringAttr("contraction")
                 return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="matmul")
 
     hint = "batch_matmul" if out_rank > 2 else "matmul"
@@ -2590,7 +2590,7 @@ def decompose_access_subclass_inner_tensor(operands, meta, node_name):
     op = _make_empty(TensorType(elem, out_shape))
     rid = _next_region_id("quant_param")
     _attach_region_id(op, rid)
-    op.attributes["m2m.family"] = StringAttr("quantize")
+    op.attributes["prov.family"] = StringAttr("quantize")
     return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="quant_param")
 
 
@@ -2685,7 +2685,7 @@ def decompose_arange(operands, meta, node_name):
     rid = _next_region_id("iota")
     for op in (empty, gen):
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("iota")
+        op.attributes["prov.family"] = StringAttr("iota")
     return DecompResult(ops=[empty, gen], result=gen.results[0], region_ids=[rid], pattern_hint="arange")
 
 
@@ -2731,7 +2731,7 @@ def decompose_sum_dim(operands, meta, node_name):
     rid = _next_region_id("reduce")
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("reduce")
+        op.attributes["prov.family"] = StringAttr("reduce")
     return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="reduce_sum")
 
 
@@ -2843,7 +2843,7 @@ def decompose_bucketize(operands, meta, node_name):
     rid = _next_region_id("search")
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("search")
+        op.attributes["prov.family"] = StringAttr("search")
     return DecompResult(ops=ops, result=gen.results[0], region_ids=[rid], pattern_hint="bucketize")
 
 
@@ -2923,7 +2923,7 @@ def _bool_mask_gather(source, mask, shape, elem):
     rid = _next_region_id("mask_gather")
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("mask_gather")
+        op.attributes["prov.family"] = StringAttr("mask_gather")
     return DecompResult(ops=ops, result=floop.results[0], region_ids=[rid], pattern_hint="mask_gather")
 
 
@@ -3034,7 +3034,7 @@ def decompose_index_tensor(operands, meta, node_name):
     rid = _next_region_id("gather")
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("gather")
+        op.attributes["prov.family"] = StringAttr("gather")
     return DecompResult(ops=ops, result=gen.results[0], region_ids=[rid], pattern_hint="index_gather")
 
 
@@ -3106,7 +3106,7 @@ def decompose_index_put(operands, meta, node_name):
     rid = _next_region_id("mask_scatter")
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("mask_scatter")
+        op.attributes["prov.family"] = StringAttr("mask_scatter")
     return DecompResult(ops=ops, result=result, region_ids=[rid], pattern_hint="index_put")
 
 
@@ -3221,7 +3221,7 @@ def decompose_cumsum(operands, meta, node_name):
     rid = _next_region_id("scan")
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("scan")
+        op.attributes["prov.family"] = StringAttr("scan")
     return DecompResult(ops=ops, result=gen.results[0], region_ids=[rid], pattern_hint="cumsum")
 
 
@@ -3312,7 +3312,7 @@ def _arg_reduce(x, dim, keepdim, val_elem, *, is_min):
     rid = _next_region_id("arg_reduce")
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("arg_reduce")
+        op.attributes["prov.family"] = StringAttr("arg_reduce")
     return ops, values, indices
 
 
@@ -3379,7 +3379,7 @@ def decompose_slice_tensor(operands, meta, node_name):
                 rid = _next_region_id("slice")
                 for op in ops:
                     _attach_region_id(op, rid)
-                    op.attributes["m2m.family"] = StringAttr("slice")
+                    op.attributes["prov.family"] = StringAttr("slice")
                 return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="slice")
         return _opaque_decomp("aten_slice", operands[:1], meta, "layout", pattern_hint="slice")
 
@@ -3404,7 +3404,7 @@ def decompose_slice_tensor(operands, meta, node_name):
     op = ExtractSliceOp.from_static_parameters(src, offsets, out_shape, strides)
     rid = _next_region_id("slice")
     _attach_region_id(op, rid)
-    op.attributes["m2m.family"] = StringAttr("slice")
+    op.attributes["prov.family"] = StringAttr("slice")
     return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="slice")
 
 
@@ -3939,7 +3939,7 @@ def decompose_choose_qparams_per_channel(operands, meta, node_name):
 
 def _pointwise(operands, meta, scalar_build, *, family: str, out_elem=None, promote=False):
     """Scalable pointwise core: build a broadcast-aware linalg.generic for ANY pointwise
-    op, tagged with an ``m2m.family`` cluster attribute so transforms can match families
+    op, tagged with an ``prov.family`` cluster attribute so transforms can match families
     rather than unique ops. ``out_elem`` defaults to the meta result dtype.
 
     Returns a DecompResult, or None (caller -> opaque) on dynamic shapes / unsupported
@@ -3969,7 +3969,7 @@ def _pointwise(operands, meta, scalar_build, *, family: str, out_elem=None, prom
     rid = _next_region_id(family)
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr(family)
+        op.attributes["prov.family"] = StringAttr(family)
     return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint=family)
 
 
@@ -4028,7 +4028,7 @@ def decompose_ones(operands, meta, node_name):
     rid = _next_region_id("fill")
     for op in sp[0]:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("fill")
+        op.attributes["prov.family"] = StringAttr("fill")
     return DecompResult(ops=sp[0], result=sp[1], region_ids=[rid], pattern_hint="fill")
 
 
@@ -4074,7 +4074,7 @@ def decompose_linspace(operands, meta, node_name):
     rid = _next_region_id("iota")
     for op in (empty, gen):
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("iota")
+        op.attributes["prov.family"] = StringAttr("iota")
     return DecompResult(ops=[empty, gen], result=gen.results[0], region_ids=[rid], pattern_hint="iota")
 
 
@@ -4275,7 +4275,7 @@ def decompose_repeat(operands, meta, node_name):
     rid = _next_region_id("tile")
     for op in ops:
         _attach_region_id(op, rid)
-        op.attributes["m2m.family"] = StringAttr("tile")
+        op.attributes["prov.family"] = StringAttr("tile")
     return DecompResult(ops=ops, result=gen.results[0], region_ids=[rid], pattern_hint="repeat")
 
 

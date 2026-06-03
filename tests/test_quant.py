@@ -41,7 +41,7 @@ def test_quant_scheme_lowers(scheme):
     assert r.ok, f"{scheme} did not produce a valid module"
     opaque = opaque_report(r.mlir_text)
     assert sum(opaque.values()) == 0, f"{scheme} left opaque: {opaque}"
-    assert "m2m.quantization" in r.mlir_text
+    assert "prov.quantization" in r.mlir_text
 
 
 def test_int8_weight_only_preserves_qdq():
@@ -113,4 +113,4 @@ def test_mixed_precision_lowers():
     r = m2m.convert(Net().eval(), X, backend="fx_importer", quantization=cfg)
     assert r.ok
     assert sum(opaque_report(r.mlir_text).values()) == 0
-    assert "m2m.quantization_mixed" in r.mlir_text
+    assert "prov.quantization_mixed" in r.mlir_text

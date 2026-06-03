@@ -2,7 +2,7 @@
 
 torchao weight-only int8/fp8 lowers its dequant to a `dtype_cast` (int->float) generic feeding
 a `mul` (x scale) generic -- the quantization semantics are *implicit* in two generics. This
-pass recognizes that pair via the taxonomy tags (`m2m.op == "dtype_cast"` then `"mul"`) and
+pass recognizes that pair via the taxonomy tags (`prov.op == "dtype_cast"` then `"mul"`) and
 rewrites it to an explicit ``quant_ext.dequantize_per_{tensor,channel}`` op, so the
 quantization is first-class and matchable (a target-aware fuse can then map it to a native
 quantized matmul). Symmetric weight-only -> zero_point = 0.
@@ -23,7 +23,7 @@ from m2m.ir.quant.ops import DequantizePerChannelOp, DequantizePerTensorOp
 
 
 def _tag(op) -> str | None:
-    a = op.attributes.get("m2m.op")
+    a = op.attributes.get("prov.op")
     return a.data if isinstance(a, StringAttr) else None
 
 
@@ -87,8 +87,8 @@ def _fuse(module: ModuleOp) -> None:
             properties={"axis": IntegerAttr(w_rank - 1, IntegerType(64)),
                         "input_dtype": StringAttr(str(w_i8.type.element_type))},
         )
-        deq.attributes["m2m.op"] = StringAttr("dequantize")
-        deq.attributes["m2m.family"] = StringAttr("quantize")
+        deq.attributes["prov.op"] = StringAttr("dequantize")
+        deq.attributes["prov.family"] = StringAttr("quantize")
         Rewriter.insert_op([zero, zp, deq], InsertPoint.before(cast))
         cast.results[0].replace_all_uses_with(deq.results[0])   # matmul now reads the dequant
         mul.results[0].replace_all_uses_with(mm.results[0])     # drop the post-matmul scale
