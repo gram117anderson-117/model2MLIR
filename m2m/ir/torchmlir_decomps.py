@@ -85,10 +85,12 @@ def inline_set_grad_hops(gm) -> bool:
     g = gm.graph
     changed = False
     for node in list(g.nodes):
-        # Only the set_grad (torch.no_grad) HOP. Autocast HOPs wrap a nested constant-
-        # precompute subgraph whose operand remapping during inlining is fragile (it
-        # mismaps a sliced tensor), so we leave autocast as a clean opaque boundary -- the
-        # correct floor (4 opaque on pi05) vs. a corrupt 41 if inlined.
+        # Inline the set_grad (torch.no_grad) HOP. Autocast-HOP inlining is gated off: for
+        # pi0.5 its subgraph has an operand-remapping edge case (a sliced tensor is mismapped),
+        # which regresses to a corrupt 41 vs. the clean 4 when left as an opaque boundary. The
+        # attribute-transfer + get_attr materialization below make the *machinery* correct
+        # (nested submodules reachable, constants materialized); flip this to "wrap_with_" once
+        # the operand-remap edge case is handled.
         if node.op != "call_function" or "wrap_with_set_grad_enabled" not in str(node.target):
             continue
         # the submodule is whichever arg is a get_attr to a GraphModule; subgraph inputs are
@@ -111,6 +113,19 @@ def inline_set_grad_hops(gm) -> bool:
         operands = list(node.args[sub_idx + 1:])
         placeholders = [n for n in sub.graph.nodes if n.op == "placeholder"]
         env = {ph: val for ph, val in zip(placeholders, operands)}
+        # Transfer the subgraph's get_attr'd attributes (tensor constants AND nested HOP
+        # submodules) onto the parent module, so copied get_attr nodes resolve -- without
+        # this a nested HOP's submodule (submod_N) is unreachable and can't be inlined.
+        for sn in sub.graph.nodes:
+            if sn.op == "get_attr" and not hasattr(gm, sn.target):
+                try:
+                    obj = getattr(sub, sn.target)
+                    if isinstance(obj, torch.nn.Module):
+                        gm.add_module(sn.target, obj)
+                    else:
+                        setattr(gm, sn.target, obj)
+                except Exception:  # noqa: BLE001
+                    pass
         outputs = None
         with g.inserting_before(node):
             for sn in sub.graph.nodes:
