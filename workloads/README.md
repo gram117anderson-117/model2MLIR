@@ -90,6 +90,6 @@ python workloads/capture.py --all     # capture/refresh all 10 in fp32+int8+fp8
 | xr0 | 0 | 0 | 0 | |
 | bitvla | 0 | 0 | 0 | int8/fp8 quantize lm_head only (BitNet W1.58 stays) |
 | groot_n1d7 | 0 | 0 | 0 | |
-| pi05 | 0 | 48* | 48* | *fp32 is 0 opaque. int8/fp8 leave a 48-op residual: a torch-2.7.1-quantized constant-precompute subgraph (zero-operand `unsqueeze` on folded constants + `ones`/`linspace`/`arange.start`/`conv2d_padding`) that a modern torch stack constant-folds away. Down from 5193 via general SDPA/N-D-matmul/dequant decompositions. Fix: capture on newer torch/torchao. |
+| pi05 | 0 | 4* | 4* | *fp32 is 0 opaque. int8/fp8 leave 4 ops: 2 `wrap_with_autocast` HOPs + 2 `to_dtype`, where the autocast wraps a `get_attr`-constant precompute subgraph. Down from **5193** (99.92%) via general SDPA / N-D-matmul / dequant decompositions + `torch.no_grad` HOP inlining. Closing the last 4 needs importer `get_attr` lifted-constant materialization (a modern torch stack folds the autocast/constant subgraph away). |
 
 "0" = 0 opaque ops. Re-run `capture.py <model>` to regenerate after converter changes.
