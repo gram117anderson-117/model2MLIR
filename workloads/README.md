@@ -101,6 +101,9 @@ python workloads/capture.py --all     # capture/refresh all 10 in fp32+int8+fp8
 | xr0 | 0 | 0 | 0 | |
 | bitvla | 0 | 0 | 0 | int8/fp8 quantize lm_head only (BitNet W1.58 stays) |
 | groot_n1d7 | 0 | 0 | 0 | |
-| pi05 | 0 | 4* | 4* | *fp32 is 0 opaque. int8/fp8 leave 4 ops: 2 `wrap_with_autocast` HOPs + 2 `to_dtype`, where the autocast wraps a `get_attr`-constant precompute subgraph. Down from **5193** (99.92%) via general SDPA / N-D-matmul / dequant decompositions + `torch.no_grad` HOP inlining. Closing the last 4 needs importer `get_attr` lifted-constant materialization (a modern torch stack folds the autocast/constant subgraph away). |
+| pi05 | 0 | 0 | 0 | 3.6B; recursive HOP flattener + SDPA/N-D-matmul/dequant decompositions (was 5193) |
 
-"0" = 0 opaque ops. Re-run `capture.py <model>` to regenerate after converter changes.
+**All 10 models lower to 0 opaque ops in fp32, int8, and fp8 (30/30 artifacts).** Each capture
+also emits `<model>{,_int8,_fp8}.safetensors` (+ manifest) with the real weights, and (with
+`--sections`) per-source-module `.mlir` files. "0" = 0 opaque ops. Re-run `capture.py <model>`
+to regenerate after converter changes.
