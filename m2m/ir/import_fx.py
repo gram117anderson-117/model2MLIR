@@ -378,6 +378,25 @@ class FXImporter:
         for i, p in enumerate(placeholders):
             value_map[p.name] = block.args[i]
 
+        # Materialize get_attr lifted tensor constants as typed values so ops that consume
+        # them resolve. We materialize by TYPE from meta (data elided, like weights) -- this
+        # also handles get_attr nodes lifted in from inlined no_grad/autocast subgraphs, whose
+        # backing attribute lives on a child module (we never read it, only its meta type).
+        from xdsl.dialects.tensor import EmptyOp as _EmptyOp
+
+        for node in nodes:
+            if node.op != "get_attr":
+                continue
+            tt = node_types.get(node.name)
+            if tt is None:
+                continue
+            op = _EmptyOp([], tt)
+            op.attributes["m2m.op"] = StringAttr("const")
+            op.attributes["m2m.family"] = StringAttr("fill")
+            op.attributes["m2m.get_attr"] = StringAttr(str(node.target))
+            block.add_op(op)
+            value_map[node.name] = op.results[0]
+
         # Track external function declarations for opaque fallback
         extern_funcs: list[FuncOp] = []
         declared_sigs: dict[str, str] = {}

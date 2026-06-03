@@ -85,10 +85,10 @@ def inline_set_grad_hops(gm) -> bool:
     g = gm.graph
     changed = False
     for node in list(g.nodes):
-        # Only the set_grad (torch.no_grad) HOP. Inlining autocast HOPs re-exposes a nested
-        # constant-precompute subgraph (36 unsqueeze on lifted get_attr constants the importer
-        # can't materialize) -- strictly worse -- so the autocast HOP stays a clean opaque
-        # boundary. Closing it needs get_attr lifted-constant materialization in the importer.
+        # Only the set_grad (torch.no_grad) HOP. Autocast HOPs wrap a nested constant-
+        # precompute subgraph whose operand remapping during inlining is fragile (it
+        # mismaps a sliced tensor), so we leave autocast as a clean opaque boundary -- the
+        # correct floor (4 opaque on pi05) vs. a corrupt 41 if inlined.
         if node.op != "call_function" or "wrap_with_set_grad_enabled" not in str(node.target):
             continue
         # the submodule is whichever arg is a get_attr to a GraphModule; subgraph inputs are
