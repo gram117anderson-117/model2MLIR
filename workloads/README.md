@@ -90,6 +90,6 @@ python workloads/capture.py --all     # capture/refresh all 10 in fp32+int8+fp8
 | xr0 | 0 | 0 | 0 | |
 | bitvla | 0 | 0 | 0 | int8/fp8 quantize lm_head only (BitNet W1.58 stays) |
 | groot_n1d7 | 0 | 0 | 0 | |
-| pi05 | 0 | 357* | 357* | *torchao-0.11 (openpi's torch-2.7.1 pin) retains SDPA + a few ops on the **quantized** export, which doesn't route through the gap-decomp table. fp32 is 0 opaque. Fix: newer torch/torchao in the openpi venv, or wire the gap decomps into the quant export path. |
+| pi05 | 0 | 48* | 48* | *fp32 is 0 opaque. int8/fp8 leave a 48-op residual: a torch-2.7.1-quantized constant-precompute subgraph (zero-operand `unsqueeze` on folded constants + `ones`/`linspace`/`arange.start`/`conv2d_padding`) that a modern torch stack constant-folds away. Down from 5193 via general SDPA/N-D-matmul/dequant decompositions. Fix: capture on newer torch/torchao. |
 
 "0" = 0 opaque ops. Re-run `capture.py <model>` to regenerate after converter changes.
