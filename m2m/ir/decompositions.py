@@ -1304,6 +1304,40 @@ def _keepdim_reshape(ops, ssa, reduced_shape, keep_shape, elem):
     return re[1]
 
 
+def build_dequantize_body(inp, scales, zps, *, axis, out_shape, out_elem):
+    """Standard-dialect dequantize: out = (cast(input) - cast(zp)) * scale, with the
+    per-channel scale/zp broadcast along ``axis``. A single linalg.generic + arith (no
+    quant dialect). The single source of truth for lowering quant_ext.dequantize to pure
+    MLIR. Returns ``(ops, result_ssa)`` or None."""
+    from xdsl.dialects.arith import MulfOp, SIToFPOp, SubfOp
+    from xdsl.dialects.builtin import AnyFloat, IntegerType
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    if any(d < 0 for d in out_shape):
+        return None
+    rank = len(out_shape)
+    id_map = AffineMap.identity(rank)
+    chan_map = AffineMap(rank, 0, (AffineExpr.dimension(axis % rank),))  # broadcast [C] along axis
+
+    def build(args, oe):
+        in_v, scale_v, zp_v = args
+        ops = []
+        if isinstance(in_v.type, IntegerType):
+            c = SIToFPOp(in_v, oe); ops.append(c); in_f = c.results[0]
+        else:
+            in_f = in_v
+        if isinstance(zp_v.type, IntegerType):
+            z = SIToFPOp(zp_v, oe); ops.append(z); zp_f = z.results[0]
+        else:
+            zp_f = zp_v
+        sub = SubfOp(in_f, zp_f); mul = MulfOp(sub.results[0], scale_v)
+        ops += [sub, mul]
+        return ops, mul.results[0]
+
+    return _elementwise([inp, scales, zps], TensorType(out_elem, out_shape), build,
+                        input_maps=[id_map, chan_map, chan_map])
+
+
 def build_softmax_body(x, *, dim):
     """Pure softmax lowering (max/sub/exp/sum/div over ``dim``) on an SSA tensor.
 
@@ -1684,6 +1718,31 @@ def _try_direct_conv2d(operands, meta, in_shape, w_shape):
         _attach_region_id(op, rid)
         op.attributes["m2m.family"] = StringAttr("conv")
     return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="conv2d")
+
+
+def decompose_conv2d_padding(operands, meta, node_name):
+    """aten.conv2d.padding(input, weight, bias, stride, padding, dilation, groups).
+
+    For ``valid``/zero padding (e.g. a ViT patch-embed: stride=kernel, no pad) this is the
+    direct conv; remap args to the convolution.default layout and reuse _try_direct_conv2d."""
+    if len(operands) < 2:
+        return _opaque_decomp("aten_conv2d", operands[:1], meta, "conv", pattern_hint="conv2d")
+    in_shape = _shape_of(operands[0])
+    w_shape = _shape_of(operands[1])
+    pad = _fx_arg(meta, 4, 0)
+    is_zero = (pad in (0, "valid", None)) or (isinstance(pad, (list, tuple)) and all(int(p) == 0 for p in pad))
+    if in_shape is not None and w_shape is not None and is_zero:
+        stride = _fx_arg(meta, 3, [1, 1])
+        dilation = _fx_arg(meta, 5, [1, 1])
+        groups = _fx_arg(meta, 6, 1)
+        m = dict(meta)
+        # convolution.default layout: (in, w, bias, stride, padding, dilation, transposed,
+        # output_padding, groups) -- the indices _try_direct_conv2d reads.
+        m["_fx_args"] = (operands[0], operands[1], None, stride, [0, 0], dilation, False, [0, 0], groups)
+        r = _try_direct_conv2d(operands, m, in_shape, w_shape)
+        if r is not None:
+            return r
+    return _opaque_decomp("aten_conv2d", operands[:1], meta, "conv", pattern_hint="conv2d")
 
 
 def decompose_convolution(operands, meta, node_name):
@@ -3780,6 +3839,92 @@ def decompose_where_self(operands, meta, node_name):
     return _opaque_decomp("aten_where", operands[:3], meta, "select", pattern_hint="where")
 
 
+def decompose_where_scalar(operands, meta, node_name):
+    """aten.where.Scalar(cond, a, b) with scalar branches -> select(cond, a, b) (family select)."""
+    from xdsl.dialects.arith import ConstantOp, SelectOp
+    from xdsl.dialects.builtin import FloatAttr, IntegerAttr, IntegerType
+
+    if not operands:
+        return _opaque_decomp("aten_where", operands[:1], meta, "select", pattern_hint="where")
+    a, b = _fx_arg(meta, 1, 0), _fx_arg(meta, 2, 0)
+
+    def build(args, oe):
+        def const(x):
+            attr = IntegerAttr(int(x), oe) if isinstance(oe, IntegerType) else FloatAttr(float(x), oe)
+            return ConstantOp(attr, oe)
+        ca, cb = const(a), const(b)
+        s = SelectOp(args[0], ca.results[0], cb.results[0])
+        return [ca, cb, s], s.results[0]
+
+    real = _pointwise([operands[0]], meta, build, family="select")
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_where", operands[:1], meta, "select", pattern_hint="where")
+
+
+def decompose_ones(operands, meta, node_name):
+    """aten.ones[.default](size, ...) -> splat of 1 (family fill)."""
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    elem = _element_type_from_meta(meta)
+    if any(d < 0 for d in out_shape):
+        return _opaque_decomp("aten_ones", [], meta, "fill", pattern_hint="fill")
+    sp = _splat_scalar(1, TensorType(elem, out_shape))
+    if sp is None:
+        return _opaque_decomp("aten_ones", [], meta, "fill", pattern_hint="fill")
+    rid = _next_region_id("fill")
+    for op in sp[0]:
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("fill")
+    return DecompResult(ops=sp[0], result=sp[1], region_ids=[rid], pattern_hint="fill")
+
+
+def decompose_linspace(operands, meta, node_name):
+    """aten.linspace.default(start, end, steps) -> evenly-spaced 1-D iota (family iota):
+    out[i] = start + i*(end-start)/(steps-1)."""
+    from xdsl.dialects.arith import AddfOp, ConstantOp, IndexCastOp, MulfOp, SIToFPOp
+    from xdsl.dialects.builtin import AffineMapAttr, AnyFloat, FloatAttr, IntegerType
+    from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import EmptyOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineMap
+
+    val: Any = meta["val"]
+    out_shape = _static_shape(getattr(val, "shape", []))
+    elem = _element_type_from_meta(meta)
+    if len(out_shape) != 1 or out_shape[0] < 0 or not isinstance(elem, AnyFloat):
+        return _opaque_decomp("aten_linspace", [], meta, "iota", pattern_hint="iota")
+    start = float(_fx_arg(meta, 0, 0.0))
+    end = float(_fx_arg(meta, 1, 1.0))
+    steps = out_shape[0]
+    delta = (end - start) / (steps - 1) if steps > 1 else 0.0
+
+    out_t = TensorType(elem, out_shape)
+    empty = EmptyOp([], out_t)
+    blk = Block(arg_types=[elem])
+    idx = IndexOp(0)
+    # i (index) -> f: index_cast to i64 then sitofp
+    ic = IndexCastOp(idx.results[0], IntegerType(64))
+    f = SIToFPOp(ic.results[0], elem)
+    dc = ConstantOp(FloatAttr(delta, elem), elem)
+    sc = ConstantOp(FloatAttr(start, elem), elem)
+    mul = MulfOp(f.results[0], dc.results[0])
+    add = AddfOp(sc.results[0], mul.results[0])
+    for op in (idx, ic, f, dc, sc, mul, add):
+        blk.add_op(op)
+    blk.add_op(YieldOp(add.results[0]))
+    gen = GenericOp(
+        inputs=[], outputs=[empty.results[0]], body=Region(blk),
+        indexing_maps=[AffineMapAttr(AffineMap.identity(1))],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)], result_types=[out_t],
+    )
+    rid = _next_region_id("iota")
+    for op in (empty, gen):
+        _attach_region_id(op, rid)
+        op.attributes["m2m.family"] = StringAttr("iota")
+    return DecompResult(ops=[empty, gen], result=gen.results[0], region_ids=[rid], pattern_hint="iota")
+
+
 def _make_compare(kind: str):
     """aten.{eq,ne,lt,le,gt,ge}.{Tensor,Scalar} -> arith.cmpf (family: compare, i1 out)."""
     from xdsl.dialects.builtin import IntegerType
@@ -4094,6 +4239,11 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.detach_.default": _identity_decomp,         # in-place detach = identity
     "aten.flatten.using_ints": decompose_view,        # flatten = reshape (shape from meta)
     "aten.__and__.Tensor": decompose_bitwise_and,
+    "aten.arange.start": decompose_arange,            # arange(start, end)
+    "aten.ones.default": decompose_ones,
+    "aten.linspace.default": decompose_linspace,
+    "aten.where.Scalar": decompose_where_scalar,
+    "aten.conv2d.padding": decompose_conv2d_padding,
     "aten.where.self": decompose_where_self,
     "aten.scalar_tensor.default": decompose_scalar_tensor,
     "aten.full_like.default": decompose_full_like,

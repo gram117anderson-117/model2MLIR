@@ -57,6 +57,7 @@ def convert(
     backend: str = "auto",
     level: str = "linalg-on-tensors",
     preserve_qdq: bool = True,
+    fully_standard: bool = False,
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -112,7 +113,7 @@ def convert(
     if decompose:
         try:
             from m2m.capture.torch_export import capture_frontend_artifact
-            from m2m.ir.torchmlir_decomps import torch_mlir_gap_decompositions
+            from m2m.ir.torchmlir_decomps import inline_set_grad_hops, torch_mlir_gap_decompositions
 
             artifact = capture_frontend_artifact(
                 model,
@@ -120,6 +121,15 @@ def convert(
                 export_decomposition_table=torch_mlir_gap_decompositions(),
             )
             exported_program = artifact.exported_program or artifact.original_exported_program
+            # Inline torch.no_grad() HOPs (wrap_with_set_grad_enabled) so the FXImporter
+            # sees a flat graph (torch 2.7.x quantized exports keep these; modern stacks
+            # inline them). Cascades to resolve their downstream ops.
+            if exported_program is not None:
+                try:
+                    while inline_set_grad_hops(exported_program.graph_module):
+                        pass
+                except Exception:  # noqa: BLE001 - non-fatal; importer handles residual
+                    pass
         except Exception:  # noqa: BLE001 - bridge will re-export as a fallback
             exported_program = None
 
@@ -172,6 +182,17 @@ def convert(
             from m2m.transforms import fuse_qdq
 
             result.module = fuse_qdq(result.module)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Fully-standard mode: lower ALL extension ops (linalg_ext + quant_ext) to pure upstream
+    # MLIR core dialects (linalg/scf/tensor/arith/math). The artifact then uses no custom
+    # dialect at all -- a "purely MLIR supported" version.
+    if fully_standard and result.module is not None:
+        try:
+            from m2m.transforms import to_standard
+
+            result.module = to_standard(result.module)
         except Exception:  # noqa: BLE001
             pass
 

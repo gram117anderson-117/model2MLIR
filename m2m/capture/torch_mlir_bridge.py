@@ -232,6 +232,17 @@ def bridge_fx_graph(
         from m2m.ir.import_fx import FXImporter
 
         exported = exported_program if exported_program is not None else capture_model(model, example_inputs)
+        # Inline torch.no_grad() HOPs on whatever graph we're about to import (covers the
+        # case where api.convert's pre-inlined exported_program was None and we re-exported).
+        try:
+            from m2m.ir.torchmlir_decomps import inline_set_grad_hops
+
+            gm = getattr(exported, "graph_module", None)
+            if gm is not None:
+                while inline_set_grad_hops(gm):
+                    pass
+        except Exception:  # noqa: BLE001 - non-fatal
+            pass
         importer = FXImporter(emit_named_ops=emit_named_ops)
         module = importer.import_graph(exported)
         errors = [d for d in importer.diagnostics if d.level == "error"]

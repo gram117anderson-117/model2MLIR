@@ -57,6 +57,19 @@ def test_int8_weight_only_preserves_qdq():
     assert "quant_ext.dequantize" not in r2.mlir_text
 
 
+def test_fully_standard_has_no_ext_dialects():
+    """fully_standard=True lowers QDQ (and any *_ext op) to pure upstream MLIR -- no custom
+    dialect remains; quant_ext.dequantize becomes linalg.generic + arith."""
+    import re
+    r = m2m.convert(MLP().eval(), X, backend="fx_importer", fully_standard=True,
+                    quantization=QuantizationConfig(scheme="int8_weight_only"))
+    assert "_ext." not in r.mlir_text                       # no quant_ext / linalg_ext / tensor_ext
+    assert sum(opaque_report(r.mlir_text).values()) == 0    # still 0 opaque
+    # only core dialects in the op stream
+    op_dialects = {d.split(".")[0] for d in re.findall(r"%\w+ = (\w+)\.", r.mlir_text)}
+    assert op_dialects <= {"arith", "linalg", "tensor", "scf", "math", "builtin", "func", "cf"}, op_dialects
+
+
 def test_true_int_matmul_present():
     """Dynamic-activation int8 lowers to a real i8->i32 integer matmul (no dequant roundtrip)."""
     r = m2m.convert(MLP().eval(), X, backend="fx_importer",

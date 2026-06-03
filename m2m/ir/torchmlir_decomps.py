@@ -68,6 +68,64 @@ def _chunk(input, chunks, dim=0):
     return torch.tensor_split(input, chunks, dim=dim)
 
 
+def inline_set_grad_hops(gm) -> bool:
+    """Inline ``wrap_with_*`` higher-order ops (torch.no_grad / torch.autocast regions) into
+    the parent FX graph.
+
+    A ``torch.no_grad()`` / ``torch.autocast()`` region is exported (on torch 2.7.x) as a HOP
+    wrapping a sub-GraphModule -- e.g. ``wrap_with_set_grad_enabled(enabled, submod, *ops)`` or
+    ``wrap_with_autocast(device, dtype, enabled, cache, submod, *ops)`` -- with
+    ``getitem(hop, i)`` extracting its outputs. The FXImporter doesn't recurse into the
+    subgraph, so its outputs aren't mapped and downstream ops lose their operand. Inlining the
+    subgraph's nodes into the parent removes the HOP. Returns True if anything changed (caller
+    re-runs to a fixpoint for nested HOPs). Idempotent.
+    """
+    import operator
+
+    g = gm.graph
+    changed = False
+    for node in list(g.nodes):
+        if node.op != "call_function" or "wrap_with_" not in str(node.target):
+            continue
+        # the submodule is whichever arg is a get_attr to a GraphModule; subgraph inputs are
+        # the node args that follow it (the flags precede it).
+        sub_idx = next((i for i, a in enumerate(node.args)
+                        if getattr(a, "op", None) == "get_attr"
+                        and hasattr(getattr(gm, a.target, None), "graph")), None)
+        if sub_idx is None:
+            continue
+        sub = getattr(gm, node.args[sub_idx].target)
+        operands = list(node.args[sub_idx + 1:])
+        placeholders = [n for n in sub.graph.nodes if n.op == "placeholder"]
+        env = {ph: val for ph, val in zip(placeholders, operands)}
+        outputs = None
+        with g.inserting_before(node):
+            for sn in sub.graph.nodes:
+                if sn.op == "placeholder":
+                    continue
+                if sn.op == "output":
+                    outs = sn.args[0]
+                    outputs = [env.get(o, o) for o in (outs if isinstance(outs, (tuple, list)) else [outs])]
+                    continue
+                env[sn] = g.node_copy(sn, lambda n: env[n])
+        if outputs is None:
+            continue
+        for user in list(node.users):
+            if user.op == "call_function" and user.target is operator.getitem:
+                idx = user.args[1]
+                if isinstance(idx, int) and 0 <= idx < len(outputs):
+                    user.replace_all_uses_with(outputs[idx])
+                    g.erase_node(user)
+        if not node.users:
+            g.erase_node(node)
+        changed = True
+    if changed:
+        g.eliminate_dead_code()
+        g.lint()
+        gm.recompile()
+    return changed
+
+
 # op-overload -> decomposition function. Extend as new torch-mlir gap ops surface.
 _GAP_DECOMPS: dict[Any, Any] = {
     _aten.empty_permuted.default: _empty_permuted,
