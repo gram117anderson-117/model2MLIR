@@ -406,9 +406,37 @@ def decompose_linear(
 
     result = matmul.results[0]
 
-    # Step 3: Bias addition deferred — requires broadcast lowering
-    # (bias is [N] but result is [M, N], needs linalg.generic with
-    # indexing_maps for proper broadcast semantics)
+    # Step 3: Bias addition. linear(x, w, b) = matmul + b, with b ([N]) broadcast over the
+    # leading dims of the result ([..., N]). Emit a linalg.generic add whose bias input uses a
+    # right-aligned broadcast map (the same [N]-over-[M,N] map the addmm/binary-add path uses).
+    # Without this the bias is silently dropped for the over-rank (>=3-D activation) linear that
+    # this decomposition handles -- the 2-D case goes through torch-mlir's native addmm and kept
+    # the bias, so the drop only bit reshaped 3-D linears (e.g. an attention qkv_proj feeding a
+    # head split), shifting every downstream value by the bias (~%-level error, amplified by a
+    # following softmax). See oscar-merlin task #60.
+    # (Mirrors decompose_addmm's bias-add exactly so it sections/lowers identically.)
+    # decompose_linear is the sole handler for aten.linear.default (torch emits the 2-D
+    # activation case as aten.addmm, handled separately), so adding the bias here can't double
+    # it. In practice this fires for over-rank (>=3-D) linears.
+    bias = operands[2] if len(operands) > 2 else None
+    out_shape = result_type.get_shape()
+    elem = result_type.element_type
+    if bias is not None and isinstance(bias.type, TensorType):
+        from xdsl.dialects.arith import AddfOp
+
+        mb = _broadcast_map(_shape_of(bias) or [], out_shape)
+        if mb is not None and _t_elem(bias) == elem and not any(d < 0 for d in out_shape):
+            em = _elementwise(
+                [result, bias], result_type, _bin_build(AddfOp),
+                input_maps=[_broadcast_map(out_shape, out_shape), mb],
+            )
+            if em is not None:
+                add_ops, result = em
+                add_rid = _next_region_id("add")
+                for op in add_ops:
+                    _attach_region_id(op, add_rid)
+                region_ids.append(add_rid)
+                ops.extend(add_ops)
 
     return DecompResult(ops=ops, result=result, region_ids=region_ids)
 
