@@ -20,6 +20,24 @@ def _section_of(op) -> str | None:
     return a.data if isinstance(a, StringAttr) else None
 
 
+def _free_values(op):
+    """All SSA values ``op`` consumes, including captures inside nested regions
+    (e.g. a weight referenced by a ``tensor.extract`` in a ``linalg.generic`` body),
+    minus values defined inside the op itself."""
+    defined = set(op.results)
+    for region in op.regions:
+        for block in region.blocks:
+            defined.update(block.args)
+            for child in block.walk():
+                defined.update(child.results)
+    free = []
+    for child in op.walk():
+        for v in child.operands:
+            if v not in defined:
+                free.append(v)
+    return free
+
+
 def split_by_section(module: ModuleOp) -> dict[str, ModuleOp]:
     """Return ``{section_name: ModuleOp}`` -- one module per top-level source section, each a
     ``func.func @section_<name>`` with the section's ops and proper cross-section I/O. Ops
@@ -57,7 +75,7 @@ def split_by_section(module: ModuleOp) -> dict[str, ModuleOp]:
         inputs: list = []
         iseen: set = set()
         for op in sops:
-            for v in op.operands:
+            for v in _free_values(op):
                 if v not in defined and v not in iseen:
                     inputs.append(v)
                     iseen.add(v)

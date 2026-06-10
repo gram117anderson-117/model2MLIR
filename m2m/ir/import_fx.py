@@ -344,6 +344,51 @@ class FXImporter:
         call_nodes = [n for n in nodes if n.op == "call_function"]
         output_nodes = [n for n in nodes if n.op == "output"]
 
+        # Resolve torchao subclass-inner-tensor access chains to a full attribute path.
+        # torch>=2.8 + torchao leave weight-only quant unfolded as
+        #   w_placeholder -> access("tensor_impl") -> access("int_data"/"scale")
+        # whose inner tensors are never externalized; decompose_access_subclass_inner_tensor
+        # would emit an uninitialized tensor.empty for them (silent garbage). Tag each access
+        # node with the model attribute path of the value it reads (e.g.
+        # "model...qkv_proj.weight.tensor_impl.int_data") so a consumer can bind the real data.
+        sig = getattr(exported_program, "graph_signature", None)
+        _in2param = dict(getattr(sig, "inputs_to_parameters", {})) if sig else {}
+        _in2buf = dict(getattr(sig, "inputs_to_buffers", {})) if sig else {}
+        _ACCESS = "access_subclass_inner_tensor"
+
+        def _resolve_subclass_path(node):
+            args = getattr(node, "args", ())
+            if len(args) < 2 or not isinstance(args[1], str):
+                return None
+            base, inner = args[0], args[1]
+            bop = getattr(base, "op", None)
+            if bop == "placeholder":
+                root = _in2param.get(base.name) or _in2buf.get(base.name) or base.name
+                return f"{root}.{inner}"
+            if bop == "get_attr":
+                return f"{base.target}.{inner}"           # constant/lifted weight FQN
+            if bop == "call_function" and _ACCESS in str(base.target):
+                parent = _resolve_subclass_path(base)
+                return f"{parent}.{inner}" if parent else None
+            return None
+
+        _quant_inner_key: dict[str, str] = {}
+        for n in nodes:
+            if n.op == "call_function" and _ACCESS in str(n.target):
+                k = _resolve_subclass_path(n)
+                if k:
+                    _quant_inner_key[n.name] = k
+        import os as _os
+        if _os.environ.get("M2M_DEBUG_QINNER"):
+            _acc = [n for n in nodes if n.op == "call_function" and _ACCESS in str(n.target)]
+            print(f"[qinner] access nodes={len(_acc)} resolved={len(_quant_inner_key)} "
+                  f"in2param={len(_in2param)}", flush=True)
+            for n in _acc[:4]:
+                b = n.args[0] if n.args else None
+                print(f"[qinner]   {n.name} base.op={getattr(b,'op',None)} "
+                      f"base.name={getattr(b,'name',None)} inner={n.args[1] if len(n.args)>1 else None} "
+                      f"-> {_quant_inner_key.get(n.name)}", flush=True)
+
         # Build xDSL types for each node from meta
         node_types: dict[str, TensorType] = {}
         for node in nodes:
@@ -543,6 +588,7 @@ class FXImporter:
                 meta["_fx_kwargs"] = dict(node.kwargs)
                 meta["_aten_target"] = target_str  # provenance: source aten op
                 meta["_emit_named_ops"] = self.emit_named_ops  # high-level form toggle
+                meta["_quant_inner"] = _quant_inner_key.get(node.name)  # subclass attr path
                 try:
                     result = decomp_fn(operands, meta, node.name)
                 except (IndexError, KeyError, TypeError) as decomp_err:
@@ -687,6 +733,13 @@ class FXImporter:
         # circuit by emitting a B^T kernel.
         _annotate_transposes_and_matmuls(module)
 
+        # linalg.matmul/quantized_matmul accumulate into their `outs` operand
+        # (out += A·B), so the accumulator MUST be zero-initialized. The decompose
+        # helpers feed a bare tensor.empty (undefined) as outs -- correct only when
+        # the backend happens to give zeroed memory. Insert an explicit
+        # `linalg.fill 0` so the contraction is always correct.
+        _zero_fill_contraction_accumulators(module)
+
         # Taxonomy backfill: a final sweep that stamps prov.op / prov.family on every named
         # compute op still missing them (ops emitted by helpers outside any DecompResult --
         # e.g. transpose/reduce built inside matmul/layer-norm helpers -- never pass through
@@ -719,6 +772,45 @@ class FXImporter:
         stream = io.StringIO()
         Printer(stream=stream).print(module)
         return stream.getvalue()
+
+
+def _zero_fill_contraction_accumulators(module: ModuleOp) -> None:
+    """Ensure every matmul-family op's `outs` accumulator is zero-initialized.
+
+    linalg contraction ops compute ``out += A·B``; an unfilled tensor.empty as outs
+    reads undefined memory. For each MatmulOp/QuantizedMatmulOp whose outs is a bare
+    tensor.empty, insert ``%c0 = arith.constant 0 ; %f = linalg.fill ins(%c0) outs(empty)``
+    and rewrite the contraction to accumulate into %f.
+    """
+    from xdsl.dialects import arith
+    from xdsl.dialects.builtin import FloatAttr, IntegerAttr, IntegerType
+    from xdsl.dialects.linalg.ops import FillOp, MatmulOp, QuantizedMatmulOp
+    from xdsl.dialects.tensor import EmptyOp
+
+    for op in list(module.walk()):
+        if not isinstance(op, (MatmulOp, QuantizedMatmulOp)):
+            continue
+        outs = op.outputs[0]
+        empty = outs.owner
+        if not isinstance(empty, EmptyOp):
+            continue
+        res_t = outs.type
+        elem = res_t.element_type
+        zero = (arith.ConstantOp(FloatAttr(0.0, elem)) if not isinstance(elem, IntegerType)
+                else arith.ConstantOp(IntegerAttr(0, elem)))
+        fill = FillOp(inputs=[zero.result], outputs=[empty.results[0]], res=[res_t])
+        fill.attributes["prov.op"] = StringAttr("fill")
+        fill.attributes["prov.family"] = StringAttr("fill")
+        # Inherit the contraction's source-module tag so the inserted init ops section with
+        # their matmul (split_by_section buckets prov.module-less, operand-less ops as 'shared').
+        mod = op.attributes.get("prov.module")
+        if mod is not None:
+            zero.attributes["prov.module"] = mod
+            fill.attributes["prov.module"] = mod
+        block = op.parent_block()
+        block.insert_op_before(zero, op)
+        block.insert_op_before(fill, op)
+        op.operands[len(op.inputs)] = fill.results[0]
 
 
 def _annotate_transposes_and_matmuls(module: ModuleOp) -> None:

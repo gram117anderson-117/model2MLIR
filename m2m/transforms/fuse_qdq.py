@@ -89,6 +89,26 @@ def _fuse(module: ModuleOp) -> None:
         )
         deq.attributes["prov.op"] = StringAttr("dequantize")
         deq.attributes["prov.family"] = StringAttr("quantize")
+        # Propagate the int_data/scale model attribute paths (set by the access-subclass
+        # decomposition) onto the dequant. xDSL's printer drops attributes on tensor.empty,
+        # so the tags can't ride on the elided inner-tensor empties through the text handoff;
+        # the dequant serializes its attrs, so a consumer recovers the binding from them.
+        def _src_quant_inner(val):
+            op = getattr(val, "owner", None)
+            for _ in range(8):
+                if not hasattr(op, "attributes"):
+                    return None
+                qi = op.attributes.get("prov.quant_inner")
+                if qi is not None:
+                    return qi
+                ins = getattr(op, "operands", ())
+                op = getattr(ins[0], "owner", None) if ins else None
+            return None
+        _wk, _sk = _src_quant_inner(w_i8), _src_quant_inner(scale)
+        if _wk is not None:
+            deq.attributes["prov.quant_inner_w"] = _wk
+        if _sk is not None:
+            deq.attributes["prov.quant_inner_s"] = _sk
         Rewriter.insert_op([zero, zp, deq], InsertPoint.before(cast))
         cast.results[0].replace_all_uses_with(deq.results[0])   # matmul now reads the dequant
         mul.results[0].replace_all_uses_with(mm.results[0])     # drop the post-matmul scale

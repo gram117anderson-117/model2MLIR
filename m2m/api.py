@@ -180,6 +180,48 @@ def convert(
     # explicit quant_ext.dequantize op so the quantization is first-class/matchable. Only
     # meaningful for the FXImporter path (we have a module) and when quantizing. Verify-
     # guarded inside fuse_qdq -> never regresses the portable output.
+    import os as _os
+    def _qcount(tag):
+        if _os.environ.get("M2M_DEBUG_QINNER") and result.module is not None:
+            from m2m.capture.torch_mlir_bridge import module_to_text as _mt
+            try:
+                n = _mt(result.module).count("prov.quant_inner")
+            except Exception:  # noqa: BLE001
+                n = -1
+            print(f"[qinner-api] {tag}: prov.quant_inner={n}", flush=True)
+    # Propagate quant-inner tags from the (elided, uninitialized) torchao subclass
+    # inner-tensor empties onto their CONSUMER ops. xDSL's printer drops attributes on
+    # tensor.empty, so the binding key can't survive the text handoff on the empty itself;
+    # a consuming linalg.generic (the dtype_cast / mul / dequant) does serialize its attrs.
+    # Covers BOTH int8 (dequant) and fp8 (mul x scale) weight-only patterns.
+    if quantization is not None and result.module is not None:
+        try:
+            from collections import deque
+
+            # xDSL's printer drops attributes on tensor.empty AND on layout ops like
+            # linalg.transpose / tensor.*_shape, so the binding key must land on the first
+            # downstream op that DOES serialize its attrs (a linalg.generic / quant op).
+            # BFS forward from each elided inner-tensor empty through the attr-dropping
+            # pass-throughs and tag that carrier with prov.quant_inner_<operand-index>.
+            _CARRIERS = ("linalg.generic", "builtin.unregistered")
+            for _op in list(result.module.walk()):
+                if _op.name != "tensor.empty" or "prov.quant_inner" not in _op.attributes:
+                    continue
+                _tag = _op.attributes["prov.quant_inner"]
+                _q, _seen = deque([_op.results[0]]), set()
+                while _q:
+                    _val = _q.popleft()
+                    for _use in list(_val.uses):
+                        _c = _use.operation
+                        if _c.name in _CARRIERS:
+                            _c.attributes[f"prov.quant_inner_{_use.index}"] = _tag
+                        elif id(_c) not in _seen:
+                            _seen.add(id(_c))
+                            for _r in _c.results:
+                                _q.append(_r)
+        except Exception:  # noqa: BLE001 - best-effort; runtime falls back to empty
+            pass
+    _qcount("after_bridge")
     if preserve_qdq and quantization is not None and result.module is not None:
         try:
             from m2m.transforms import fuse_qdq
@@ -187,6 +229,7 @@ def convert(
             result.module = fuse_qdq(result.module)
         except Exception:  # noqa: BLE001
             pass
+    _qcount("after_fuse_qdq")
 
     # Fully-standard mode: lower ALL extension ops (linalg_ext + quant_ext) to pure upstream
     # MLIR core dialects (linalg/scf/tensor/arith/math). The artifact then uses no custom

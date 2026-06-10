@@ -1534,7 +1534,9 @@ def decompose_slice_scatter(operands, meta, node_name):
     start = 0 if start is None else int(start)
     if start < 0:
         start += si[dim]
-    step = _fx_arg(meta, 4, 1)
+    # aten.slice_scatter(input, src, dim, start, end, step): step is arg 5, not 4
+    # (arg 4 is `end`, which is implied by the src extent and so unused here).
+    step = _fx_arg(meta, 5, 1)
     step = 1 if step is None else max(1, int(step))
     offsets = [0] * rank
     offsets[dim] = max(0, min(start, si[dim]))
@@ -2619,6 +2621,14 @@ def decompose_access_subclass_inner_tensor(operands, meta, node_name):
     rid = _next_region_id("quant_param")
     _attach_region_id(op, rid)
     op.attributes["prov.family"] = StringAttr("quantize")
+    # The inner tensor (int_data / scale) is elided here -- record the model attribute path
+    # so a consumer can bind the real quantized data instead of this uninitialized empty.
+    key = meta.get("_quant_inner")
+    import os as _os
+    if _os.environ.get("M2M_DEBUG_QINNER"):
+        print(f"[qinner-decomp] node={node_name} key={key!r} meta_keys={[k for k in meta if k.startswith('_')]}", flush=True)
+    if key:
+        op.attributes["prov.quant_inner"] = StringAttr(str(key))
     return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="quant_param")
 
 

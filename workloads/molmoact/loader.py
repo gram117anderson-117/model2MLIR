@@ -50,8 +50,55 @@ class _LogitsOnly(nn.Module):
         self.lm = lm
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        out = self.lm(input_ids=input_ids, use_cache=False)
+        import os
+        tap = os.environ.get("M2M_MOLMOACT_TAP")
+        if tap == "mask":                          # capture just the native causal mask
+            mm = self.lm.model
+            h = mm.wte(input_ids)
+            seq = input_ids.shape[1]
+            cache_position = torch.arange(seq, device=input_ids.device)
+            m = mm._update_causal_mask(None, h, cache_position, None, False)
+            return m.to(torch.float32)
+        if tap in ("norm0", "attn0", "block0"):   # bisection inside decoder layer 0 (pre-norm)
+            # Access via the canonical module paths (NOT aliases) so the rotary buffer's
+            # exported attr path matches model.named_buffers() / extra.npz; direct nested
+            # attribute access traces cleanly (only a getattr/hasattr loop breaks dynamo).
+            mm = self.lm.model
+            block0 = mm.blocks[0]
+            h = mm.wte(input_ids)                          # [1, S, H]
+            hn = block0.attn_norm(h)                       # pre-attention RMSNorm
+            if tap == "norm0":
+                return hn
+            seq = input_ids.shape[1]
+            pos = torch.arange(seq, device=input_ids.device).unsqueeze(0)
+            cos, sin = mm.rotary_emb(h, pos)               # RoPE tables for this length
+            mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)
+            mask = mask.view(1, 1, seq, seq)
+            if tap == "block0":                            # full decoder layer 0, clean mask
+                out = block0(h, attention_mask=mask, position_ids=pos,
+                             position_embeddings=(cos, sin))
+                return out[0]
+            attn_out, _ = block0.self_attn(
+                hidden_states=hn, position_embeddings=(cos, sin),
+                attention_mask=mask, position_ids=pos)
+            return attn_out                                # self-attention block output
+        out = self.lm(input_ids=input_ids, use_cache=False,
+                      output_hidden_states=bool(tap))
+        if tap == "hidden":            # bisection: transformer output, pre-lm_head
+            return out.hidden_states[-1]
+        if tap == "embed":             # bisection: token embeddings, pre-layer-0
+            return out.hidden_states[0]
+        if tap == "layer1":            # bisection: after the first decoder layer
+            return out.hidden_states[1]
         return out.logits
+
+    def _layer0(self):
+        m = self.lm
+        for attr in ("model", "transformer", "lm"):
+            m = getattr(m, attr, m)
+            if hasattr(m, "layers"):
+                return m.layers[0]
+        raise AttributeError("could not find decoder layers")
 
 
 def get_model_and_inputs():

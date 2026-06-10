@@ -20,13 +20,16 @@ class SmolVLADenoiseStep(nn.Module):
         self.model = model
 
     def forward(self, img, img_mask, lang_tokens, lang_masks, state, noise):
+        import os
         m = self.model
         prefix_embs, prefix_pad_masks, prefix_att_masks = m.embed_prefix(
             [img], [img_mask], lang_tokens, lang_masks, state=state
         )
+        if os.environ.get("M2M_SMOLVLA_TAP") == "prefix":   # bisection: embed/conv/dequant only
+            return prefix_embs
         prefix_att_2d = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_pos = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        _, past_key_values = m.vlm_with_expert.forward(
+        vlm_out, past_key_values = m.vlm_with_expert.forward(
             attention_mask=prefix_att_2d,
             position_ids=prefix_pos,
             past_key_values=None,
@@ -34,6 +37,9 @@ class SmolVLADenoiseStep(nn.Module):
             use_cache=m.config.use_cache,
             fill_kv_cache=True,
         )
+        if os.environ.get("M2M_SMOLVLA_TAP") == "lm":   # bisection: LM output (RoPE/attention)
+            o = vlm_out[0] if isinstance(vlm_out, (list, tuple)) else vlm_out
+            return o.float()
         timestep = torch.ones(state.shape[0], dtype=torch.float32)
         return m.denoise_step(prefix_pad_masks, past_key_values, noise, timestep)
 
