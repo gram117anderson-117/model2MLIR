@@ -215,13 +215,24 @@ def _forward_fx_meta(
         # module provenance: the top-level source nn.Module (VLM / action expert / vision /
         # ...) this op came from -- the basis for per-section partitioning and per-frequency
         # scheduling. Derived from the FX nn_module_stack (first non-empty path component).
-        if "prov.module" not in op.attributes:
+        if "prov.module" not in op.attributes or "prov.fqn" not in op.attributes:
             stack = fx_meta.get("nn_module_stack")
             if isinstance(stack, dict) and stack:
                 paths = [v[0] for v in stack.values() if isinstance(v, (tuple, list)) and v]
                 nonempty = [p for p in paths if p]
                 if nonempty:
-                    op.attributes["prov.module"] = StringAttr(str(nonempty[0]).split(".")[0])
+                    # prov.module: first path component -- the (usually monolithic) top-level
+                    # source module; the basis for the existing per-section partitioning.
+                    if "prov.module" not in op.attributes:
+                        op.attributes["prov.module"] = StringAttr(str(nonempty[0]).split(".")[0])
+                    # prov.fqn: the DEEPEST (most specific) module path for this op, e.g.
+                    # "model.vision_backbone.layers.3.attn" vs "model.action_expert.denoise.2".
+                    # This is the signal that lets a downstream tool distinguish backbone from
+                    # action head -- prov.module is usually just the wrapper and cannot. The
+                    # full nn_module_stack is available here; we no longer discard the depth.
+                    if "prov.fqn" not in op.attributes:
+                        deepest = max(nonempty, key=lambda p: str(p).count("."))
+                        op.attributes["prov.fqn"] = StringAttr(str(deepest))
 
 
 def _torch_dtype_to_xdsl(dtype: torch.dtype) -> Attribute:
