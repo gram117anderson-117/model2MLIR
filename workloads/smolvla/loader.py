@@ -7,6 +7,8 @@ on already-preprocessed tensors (host-side preprocessing stays out of the graph)
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
@@ -47,6 +49,11 @@ class SmolVLADenoiseStep(nn.Module):
 def get_model_and_inputs():
     cfg = SmolVLAConfig()
     cfg.device = "cpu"
+    # Keep the capture a small/random-config instance (structure real, magnitudes a small
+    # instance) — consistent with the other workloads (rdt2 M2M_RDT2_DEPTH, groot M2M_GROOT_LAYERS).
+    cfg.num_vlm_layers = int(os.environ.get("M2M_SMOLVLA_VLM_LAYERS", cfg.num_vlm_layers))
+    if os.environ.get("M2M_SMOLVLA_EXPERT_LAYERS"):
+        cfg.num_expert_layers = int(os.environ["M2M_SMOLVLA_EXPERT_LAYERS"])
     model = VLAFlowMatching(cfg).eval()
 
     b = 1
