@@ -407,10 +407,32 @@ class FakeQuantOp(IRDLOperation):
         _verify_quant_range(self, self.quant_min, self.quant_max)
 
 
+@irdl_op_definition
+class UnpackInt2Op(IRDLOperation):
+    """Native int2 unpack: extract the four 2-bit lanes packed in each i8 byte.
+
+    Recognized (opt-in) from bitvla's BitNet ternary weight path -- the opaque
+    ``& 0x03`` / ``>> 2,4,6`` / ``stack`` chain that materializes the packed-int2
+    weight into its four ternary lanes. Naming it makes the native low-bit storage
+    datapath a first-class op instead of opaque bitwise func.calls. Pure.
+    """
+
+    name = "quant_ext.unpack_int2"
+
+    input = operand_def(Attribute)        # packed i8 tensor (4 ternary values / byte)
+    result = result_def(Attribute)        # unpacked lanes (i8)
+
+    bits = opt_prop_def(IntegerAttr)
+    lanes = opt_prop_def(IntegerAttr)
+
+    traits = traits_def(Pure())
+
+
 # -- Top-level registry --------------------------------------------------------
 
 
 QUANT_OPS: list[type[IRDLOperation]] = [
+    UnpackInt2Op,
     QuantizePerTensorOp,
     DequantizePerTensorOp,
     QuantizePerChannelOp,
@@ -428,6 +450,7 @@ QUANT_OPS: list[type[IRDLOperation]] = [
 
 __all__ = [
     "QUANT_OPS",
+    "UnpackInt2Op",
     "ChooseQParamsPerChannelOp",
     "ChooseQParamsPerTensorOp",
     "DequantizePerChannelOp",

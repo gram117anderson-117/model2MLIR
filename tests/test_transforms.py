@@ -29,6 +29,53 @@ def _wrap(build_op, in_shape):
     return ModuleOp([fn])
 
 
+def test_fuse_int2_unpack_recognizes_ternary_chain():
+    """The opt-in int2-unpack recognizer folds the bitvla `& 0x03 / >> 2,4,6 / stack` opaque
+    chain into one `quant_ext.unpack_int2`, verify-guarded, and is a no-op on unrelated graphs."""
+    from xdsl.dialects.builtin import IntegerType
+    from xdsl.dialects.func import CallOp
+
+    from m2m.transforms.fuse_int2_unpack import fuse_int2_unpack
+
+    i8 = IntegerType(8)
+    t = TensorType(i8, [16])
+    t4 = TensorType(i8, [16, 4])
+    ext_and = FuncOp.external("aten___and___Scalar", [t], [t])
+    ext_rsh = FuncOp.external("aten___rshift___Scalar", [t], [t])
+    ext_stk = FuncOp.external("aten_stack_default", [t, t, t, t], [t4])
+
+    blk = Block(arg_types=[t])                       # %packed
+    packed = blk.args[0]
+    q0 = CallOp("aten___and___Scalar", [packed], [t])
+    lanes = [q0.results[0]]
+    rsh_ops = []
+    for _ in range(3):                               # q1..q3 = and(rshift(packed))
+        r = CallOp("aten___rshift___Scalar", [packed], [t])
+        a = CallOp("aten___and___Scalar", [r.results[0]], [t])
+        rsh_ops += [r, a]
+        lanes.append(a.results[0])
+    stk = CallOp("aten_stack_default", lanes, [t4])
+    blk.add_ops([q0, *rsh_ops, stk, ReturnOp(stk.results[0])])
+    fn = FuncOp("f", ((t,), (t4,)), region=Region(blk))
+    m = ModuleOp([ext_and, ext_rsh, ext_stk, fn])
+
+    out, n = fuse_int2_unpack(m)
+    txt = module_to_text(out)
+    assert n == 1
+    assert txt.count("quant_ext.unpack_int2") == 1
+    assert "call @aten_stack_default" not in txt       # the stack CALL-SITE is gone (decl may remain)
+    out.verify()
+
+    # no-op on an unrelated graph (a plain 2-input stack must NOT be folded)
+    blk2 = Block(arg_types=[t, t])
+    s2 = CallOp("aten_stack_default", [blk2.args[0], blk2.args[1]], [TensorType(i8, [16, 2])])
+    blk2.add_ops([s2, ReturnOp(s2.results[0])])
+    m2_ = ModuleOp([FuncOp.external("aten_stack_default", [t, t], [TensorType(i8, [16, 2])]),
+                    FuncOp("g", ((t, t), (TensorType(i8, [16, 2]),)), region=Region(blk2))])
+    _, n2 = fuse_int2_unpack(m2_)
+    assert n2 == 0
+
+
 def test_expand_softmax_lowers_to_standard():
     m = _wrap(lambda a, t: SoftmaxOp(a, 1, t), [2, 8])
     assert any(isinstance(o, SoftmaxOp) for o in m.walk())
