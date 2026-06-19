@@ -187,6 +187,32 @@ def get_model_and_inputs():
     from bitvla_for_action_prediction import BitVLAForActionPrediction
 
     vla = BitVLAForActionPrediction(cfg).to(torch.float32).eval()
+    # P21-S4 native low-bit datapath: with BITVLA_NATIVE_QUANT=1, materialize the
+    # packed-int2 ternary weights (BitLinear.quantize_weights()) so the captured
+    # graph takes the NATIVE path -- packed int2 storage + dequantize_from_int2
+    # (bit-unpack + per-tensor absmean scale) + matmul -- instead of the f32
+    # fake-quant (absmean round/clamp) branch. Makes the native W1.58 ternary
+    # storage + scale visible in the IR (the capture-gap the audit flagged).
+    if os.environ.get("BITVLA_NATIVE_QUANT") == "1":
+        import sys as _sys
+        n_q = 0
+        for mod in vla.modules():
+            if type(mod).__name__ != "BitLinear" or getattr(mod, "weight", None) is None:
+                continue
+            # Replicate BitLinear.quantize_weights() WITHOUT its buggy bf16-vs-f32
+            # self-check assert (which crashes on an f32 model). This materializes the
+            # packed-int2 ternary weight + per-tensor absmean scale and flips the module
+            # to the native dequantize_from_int2 (bit-unpack + scale) + matmul forward.
+            q2 = _sys.modules[type(mod).__module__].quantize_to_int2
+            packed, step, orig_shape, n_elems = q2(mod.weight.data)
+            mod.register_buffer("q_weight", packed)
+            mod.register_buffer("w_step", torch.tensor(step, dtype=torch.float32))
+            mod.orig_shape = orig_shape
+            mod.n_elems = n_elems
+            mod.weight = None
+            mod.enable_qlora = True
+            n_q += 1
+        print(f"[bitvla] native-quant: materialized packed-int2 ternary for {n_q} BitLinear")
     # Constants only matter for the host-side path we skip; set benign values.
     vla.set_constant(
         image_token_idx=10,

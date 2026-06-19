@@ -39,9 +39,26 @@ def externalize_weights(exported: Any, module: ModuleOp, path: str) -> dict:
             try:
                 t = sd[wname]
                 t = t.detach() if hasattr(t, "detach") else t
-                # plain-tensor-ify exotic (e.g. quantized subclass) storage for serialization
-                if type(t).__name__ not in ("Tensor", "Parameter"):
-                    t = t.dequantize() if hasattr(t, "dequantize") else torch.as_tensor(t)
+                # Quantized tensor-subclass weights (torchao AffineQuantizedTensor & friends)
+                # are NOT serialized as their dequantized fp32: torch.export unfolds them into
+                # access_subclass_inner_tensor chains, so the matmul consumes the int8 ``int_data``
+                # + ``scale`` inner tensors (bound at runtime via the ``qinner::`` / prov.quant_inner
+                # channel from extra.npz), and the original fused weight ARG IS DEAD in the graph.
+                # Dequantizing it (the old behavior) wrote a full-size fp32 copy of every quantized
+                # weight to the blob -- e.g. pi0.5's 458 quantized Linears bloated weights.bin to
+                # 16 GB of never-read fp32. Emit a 1-element zero STUB instead and flag the manifest
+                # entry ``stub: true`` so the runtimes synthesize a zero buffer of the arg's true
+                # shape/dtype for the (dead) descriptor rather than reading the blob.
+                is_subclass = type(t).__name__ not in ("Tensor", "Parameter") or hasattr(
+                    t, "__tensor_flatten__")
+                if is_subclass:
+                    full_shape = list(getattr(t, "shape", []))
+                    dtype_str = str(getattr(t, "dtype", torch.float32)).replace("torch.", "")
+                    tensors[wname] = torch.zeros(1, dtype=getattr(t, "dtype", torch.float32))
+                    manifest[str(idx)] = {"weight": wname, "kind": kind,
+                                          "dtype": dtype_str, "shape": full_shape,
+                                          "stub": True}
+                    continue
                 t = t.contiguous().cpu().clone()
                 tensors[wname] = t
                 manifest[str(idx)] = {"weight": wname, "kind": kind,
