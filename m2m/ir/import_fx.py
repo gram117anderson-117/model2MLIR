@@ -345,9 +345,146 @@ class FXImporter:
         total = self.decomposed_count + self.opaque_count
         return self.decomposed_count / total if total > 0 else 1.0
 
+    @staticmethod
+    def _while_loop_bound(cond_gm):
+        """Extract the constant K from a while_loop cond subgraph whose body is ``i < K``."""
+        try:
+            for n in cond_gm.graph.nodes:
+                if n.op == "call_function" and ("lt" in str(n.target) or "ge" in str(n.target)
+                                                or "<" in str(n.target)):
+                    for arg in list(n.args)[1:]:
+                        if isinstance(arg, (int, float)):
+                            return int(arg)
+                        v = getattr(arg, "meta", {}).get("val") if hasattr(arg, "meta") else None
+                        try:
+                            return int(v.item())
+                        except Exception:  # noqa: BLE001
+                            pass
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _lower_while_loop(self, node, value_map, multi_results, block, exported_program) -> bool:
+        """Lower a ``torch.while_loop`` HOP to ``scf.for(0, K, 1)`` with carried state as iter_args (P21).
+
+        The cond is ``i < K`` with K a captured constant, so scf.for fits. The loop-body subgraph is
+        imported recursively (a fresh ``import_graph``) and its ops are transplanted into the for-region;
+        closed-over additional inputs are referenced directly from the region (legal in scf -> avoids the
+        torch-mlir additional_inputs defect). Fully additive: only fires on while_loop nodes (never present
+        before), and any failure returns False without touching existing-capture behavior."""
+        from types import SimpleNamespace
+
+        from xdsl.dialects.arith import ConstantOp, IndexCastOp
+        from xdsl.dialects.builtin import IndexType, IntegerAttr, TensorType, i64
+        from xdsl.dialects.scf import ForOp
+        from xdsl.dialects.scf import YieldOp as ScfYield
+        from xdsl.dialects.tensor import FromElementsOp
+        from xdsl.ir import Block, Region
+        try:
+            root = exported_program.graph_module
+            a = list(node.args)
+
+            def _gm(x):
+                return getattr(root, x.target) if hasattr(x, "op") and x.op == "get_attr" else x
+            cond_gm, body_gm = _gm(a[0]), _gm(a[1])
+            carried = list(a[2]) if isinstance(a[2], (list, tuple)) else [a[2]]
+            additional = (list(a[3]) if isinstance(a[3], (list, tuple)) else [a[3]]) if len(a) > 3 else []
+            K = self._while_loop_bound(cond_gm)
+            carried_ssa = [value_map[c.name] for c in carried if hasattr(c, "name") and c.name in value_map]
+            add_ssa = [value_map[x.name] for x in additional if hasattr(x, "name") and x.name in value_map]
+            if K is None or len(carried_ssa) != len(carried):
+                return False
+            carried_types = [v.type for v in carried_ssa]
+
+            sub = FXImporter(allow_opaque_fallback=self.allow_opaque_fallback,
+                             emit_named_ops=self.emit_named_ops)
+            fake_ep = SimpleNamespace(graph=body_gm.graph, graph_module=body_gm,
+                                      graph_signature=getattr(body_gm, "graph_signature", None))
+            sub_mod = sub.import_graph(fake_ep)
+            sub_func = next(o for o in sub_mod.body.block.ops
+                            if isinstance(o, FuncOp) and list(o.body.blocks)
+                            and list(o.body.block.ops))
+            sub_block = sub_func.body.block
+            if not hasattr(self, "_pending_extern_funcs"):
+                self._pending_extern_funcs = []
+            # torch.while_loop body_fn(*carried, *additional); carried[0] is the
+            # loop counter `i` (the cond is `i < K`) -> it is a normal iter_arg,
+            # NOT the scf.for induction variable. The induction var (block arg 0)
+            # is left unused; the counter is threaded through iter_args so the
+            # body's own `i + 1` is what gets yielded.
+            sub_args = list(sub_block.args)              # [*carried, *additional]
+            nc = len(carried_ssa)
+
+            c0 = ConstantOp(IntegerAttr(0, IndexType()), IndexType())
+            cK = ConstantOp(IntegerAttr(int(K), IndexType()), IndexType())
+            c1 = ConstantOp(IntegerAttr(1, IndexType()), IndexType())
+            for_blk = Block(arg_types=[IndexType()] + carried_types)
+            iter_args = list(for_blk.args[1:])           # nc carried iter_args
+
+            mapping = iter_args + add_ssa                # carried -> iter_args, additional -> closed-over SSA
+            for arg, repl in zip(sub_args, mapping):
+                arg.replace_by(repl)
+            ret_op = None
+            for op in list(sub_block.ops):
+                if isinstance(op, ReturnOp):
+                    ret_op = op
+                    continue
+                op.detach()
+                for_blk.add_op(op)
+            ret_vals = list(ret_op.operands) if ret_op is not None else []
+            # the body returns the new carry tuple (nc values); yield them all
+            new_carried = ret_vals[:nc] if len(ret_vals) >= nc else ret_vals
+            for_blk.add_op(ScfYield(*new_carried))
+
+            # The body sub-import emitted opaque extern FuncOps into its own
+            # (discarded) module. After remapping placeholders to iter_args /
+            # closed-over SSA, some call-operand types change (e.g. a carried
+            # token inferred as 1xi64 outside the body but 1x1xi64 inside), so the
+            # original decls no longer match. Rebuild every opaque extern fresh
+            # from its LIVE call-site types (deduped, globally-unique names) and
+            # repoint the call; merge the rebuilt externs into the main module.
+            from xdsl.dialects.builtin import SymbolRefAttr
+            local_sigs: dict = {}
+            for op in for_blk.walk():
+                callee = op.properties.get("callee") if hasattr(op, "properties") else None
+                if callee is None or not hasattr(callee, "root_reference"):
+                    continue
+                base_name = callee.root_reference.data
+                opnd_types = [o.type for o in op.operands]
+                res_types = [r.type for r in op.results]
+                sig_key = (base_name,
+                           tuple(str(t) for t in opnd_types),
+                           tuple(str(t) for t in res_types))
+                if sig_key not in local_sigs:
+                    uniq = f"{base_name}_wl{len(self._pending_extern_funcs)}"
+                    self._pending_extern_funcs.append(
+                        FuncOp.external(uniq, opnd_types, res_types))
+                    local_sigs[sig_key] = uniq
+                op.properties["callee"] = SymbolRefAttr(local_sigs[sig_key])
+
+            forop = ForOp(c0.results[0], cK.results[0], c1.results[0], carried_ssa, Region(for_blk))
+            for op in (c0, cK, c1, forop):
+                op.attributes["prov.op"] = StringAttr("while_loop")
+                op.attributes["prov.family"] = StringAttr("loop")
+            block.add_ops([c0, cK, c1, forop])
+            # while_loop returns the final carry tuple; getitem(node, k) -> results[k]
+            multi_results[node.name] = list(forop.results)
+            if forop.results:
+                value_map[node.name] = forop.results[0]
+            self.decomposed_count += 1
+            self.diagnostics.append(ImportDiagnostic(
+                fx_node=node.name, level="info",
+                message=f"Lowered while_loop -> scf.for(0,{int(K)},1); {nc} iter_args, {len(add_ssa)} additional"))
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.diagnostics.append(ImportDiagnostic(
+                fx_node=node.name, level="warning", message=f"while_loop->scf.for failed: {e}"))
+            return False
+
     def import_graph(self, exported_program: Any) -> ModuleOp:
         """Convert an ExportedProgram's FX graph to an xDSL module."""
         reset_region_counters()
+        self._pending_extern_funcs = []
         graph = exported_program.graph
         nodes = list(graph.nodes)
 
@@ -505,6 +642,12 @@ class FXImporter:
         # Process call_function nodes
         for node in call_nodes:
             target_str = _canonicalize_fx_target_str(str(node.target))
+            # P21: lower a torch.while_loop HOP to scf.for (loop-preserving capture). Additive — only
+            # fires for while_loop nodes; on any failure falls through (no loop emitted) without affecting
+            # the existing per-node path below.
+            if "while_loop" in target_str:
+                if self._lower_while_loop(node, value_map, multi_results, block, exported_program):
+                    continue
             result_type = node_types.get(node.name)
             if result_type is None:
                 self.diagnostics.append(
@@ -713,7 +856,10 @@ class FXImporter:
                     ret_values.append(value_map[a.name])
 
         if ret_values:
-            block.add_op(ReturnOp(ret_values[0]))
+            # Emit ALL outputs, not just the first: a single-output collapse here
+            # silently drops the extra results of any multi-output graph (e.g. a
+            # while_loop body returning the full carry tuple (i+1, latent, ...)).
+            block.add_op(ReturnOp(*ret_values))
 
         # Reconcile the func signature with the actual return-value types.
         # The original ret_types snapshot (line ~189) was taken from the
@@ -726,13 +872,15 @@ class FXImporter:
         # types as the function output types".
         if ret_values:
             actual_ret_types: list[Attribute] = [v.type for v in ret_values]
-            if actual_ret_types != ret_types:
+            if list(func_type.outputs) != actual_ret_types:
                 func_type = FunctionType.from_lists(arg_types, actual_ret_types)
 
         region = Region([block])
         main_func = FuncOp("forward", func_type, region)
 
-        all_ops = list(extern_funcs) + [main_func]
+        # Externs merged from while_loop body sub-imports (renamed, collision-free).
+        pending = getattr(self, "_pending_extern_funcs", [])
+        all_ops = list(extern_funcs) + list(pending) + [main_func]
         module = ModuleOp(all_ops)
 
         # REQ-023 (generalised): every ``linalg.transpose`` gets a
