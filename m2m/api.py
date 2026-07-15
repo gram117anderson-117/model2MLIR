@@ -80,9 +80,15 @@ def convert(
     if backend == "torch_mlir":
         allow_fallback = False
 
-    # Frontend dispatch: torch nn.Module / ExportedProgram -> torch path;
-    # any other callable -> jax path (StableHLO), when jax is available.
+    # Frontend dispatch: a .gguf path -> GGUF frontend (graph reconstructed from GGUF metadata);
+    # torch nn.Module / ExportedProgram -> torch path; any other callable -> jax path (StableHLO).
     import torch
+    from pathlib import Path as _Path
+
+    if isinstance(model, (str, _Path)) and str(model).endswith(".gguf"):
+        from m2m.frontends.gguf import convert_gguf
+
+        return convert_gguf(model, example_inputs, level=level)
 
     _is_torch = isinstance(model, torch.nn.Module) or type(model).__name__ == "ExportedProgram"
     if not _is_torch:
