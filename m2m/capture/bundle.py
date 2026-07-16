@@ -14,6 +14,42 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch import nn
+
+
+class _LogitsOnly(nn.Module):
+    """Wrap a HF causal LM so export sees a clean ``input_ids -> logits`` forward."""
+
+    def __init__(self, lm: nn.Module) -> None:
+        super().__init__()
+        self.lm = lm
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.lm(input_ids=input_ids, use_cache=False).logits
+
+
+def capture_hf_bundle(model_dir, out, *, quant_scheme: str | None = None, seq_len: int = 8,
+                      dtype: "torch.dtype" = torch.float32) -> dict:
+    """Capture a HuggingFace causal-LM (local dir or hub id) into a Merlin bundle via the torch path.
+
+    ``quant_scheme`` is a torchAO scheme name (e.g. ``"int8_weight_only"``) or ``None`` for fp. This
+    is the torch/torchAO ingestion arm (the GGUF arm is :func:`m2m.frontends.gguf.capture_gguf_bundle`).
+    """
+    from transformers import AutoModelForCausalLM
+
+    lm = AutoModelForCausalLM.from_pretrained(str(model_dir), dtype=dtype, use_cache=False).eval()
+    model = _LogitsOnly(lm).eval()
+    vocab = int(lm.config.vocab_size)
+    torch.manual_seed(0)
+    input_ids = torch.randint(0, vocab, (1, seq_len))
+    quant = None
+    if quant_scheme:
+        from m2m.capture.torchao_pipeline import QuantizationConfig
+        quant = QuantizationConfig(scheme=quant_scheme)
+    summary = write_bundle(model, (input_ids,), out, quant=quant)
+    summary["hf"] = str(model_dir)
+    summary["quant_scheme"] = quant_scheme
+    return summary
 
 
 def _flatten_subclass(obj: Any, prefix: str, out: dict) -> None:
