@@ -65,3 +65,24 @@ def convert_gguf(gguf_path: str | Path, example_inputs: tuple[Any, ...] | None =
     except Exception:  # noqa: BLE001 - ConversionResult may not be frozen; best-effort provenance
         pass
     return result
+
+
+def capture_gguf_bundle(gguf_path: str | Path, out: str | Path, *, seq_len: int = 8,
+                        dtype: torch.dtype = torch.float32) -> dict:
+    """Produce a runnable Merlin capture bundle from a GGUF checkpoint (mlir + weights + golden + ...).
+
+    Reconstructs the graph from GGUF metadata (weights dequantized by transformers — the v1 baseline),
+    seeds an ``input_ids`` row, and writes a self-consistent bundle via the shared
+    :func:`m2m.capture.bundle.write_bundle` (golden = this instance's forward). The bundle ingests
+    straight into the Merlin pipeline / RVV runtime like any capture bundle.
+    """
+    from m2m.capture.bundle import write_bundle
+
+    lm = load_gguf_torch_model(gguf_path, dtype=dtype)
+    model = _LogitsOnly(lm).eval()
+    vocab = int(lm.config.vocab_size)
+    torch.manual_seed(0)
+    input_ids = torch.randint(0, vocab, (1, seq_len))
+    summary = write_bundle(model, (input_ids,), out, quant=None)
+    summary["gguf"] = str(gguf_path)
+    return summary
