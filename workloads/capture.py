@@ -32,11 +32,17 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent          # model2MLIR/
 WORKLOADS = REPO / "workloads"
 BASE_DEPS = ["xdsl", "structlog", "ml_dtypes", "torchao"]  # always needed by m2m
-SCHEME = {  # datatype/format -> torchao scheme (None = fp32, no quantization)
+SCHEME = {  # datatype/format -> torchao scheme (None = no torchao quantization)
     "fp32": None,
+    "bf16": None,   # base weights cast to the dtype (no torchao) — see DTYPE_CAST
+    "fp16": None,
     "int8": "int8_weight_only",
     "fp8": "float8_weight_only_e4m3",
 }
+
+# Formats that are a plain dtype cast of the base weights (no torchao scheme): the model is cast to
+# this torch dtype before export, so the emitted MLIR is bf16/fp16 end to end.
+DTYPE_CAST = {"bf16": "bfloat16", "fp16": "float16"}
 
 
 def _load_toml(model_dir: Path) -> dict:
@@ -100,13 +106,16 @@ def _inner_capture(model: str, formats: list[str], level: str) -> None:
     sys.path.insert(0, str(model_dir))
     from loader import get_model_and_inputs  # type: ignore
 
-    suffix = {"fp32": "", "int8": "_int8", "fp8": "_fp8"}
+    suffix = {"fp32": "", "bf16": "_bf16", "fp16": "_fp16", "int8": "_int8", "fp8": "_fp8"}
     results = {}
     for fmt in formats:
         try:
             # re-build the model per format: torchao quantize_ mutates in place, so reusing
             # one instance across formats would double-quantize.
             mdl, inputs = get_model_and_inputs()
+            if fmt in DTYPE_CAST:  # base-weight dtype cast (bf16/fp16); no torchao
+                import torch
+                mdl = mdl.to(getattr(torch, DTYPE_CAST[fmt]))
             q = _quant_for(cfg, fmt)
             weights_path = str(model_dir / f"{model}{suffix[fmt]}.safetensors")
             r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=q, level=level,
