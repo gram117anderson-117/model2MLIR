@@ -96,11 +96,77 @@ def _lifted_constants(mdl, inputs, extra: dict) -> None:
         print(f"[warn] lifted-constant export failed: {exc}\n{traceback.format_exc()[-800:]}")
 
 
-def write_bundle(mdl, inputs, out: str | Path, *, quant=None) -> dict:
+def _extract_prov_fqns(mlir_text: str) -> list[str]:
+    """The distinct ``prov.fqn`` module paths the export tagged, in first-seen order.
+
+    Structured scan of the emitted MLIR (locate the ``prov.fqn = "..."`` attribute literal and read to
+    the closing quote) — deterministic string handling, never a semantic regex.
+    """
+    marker = 'prov.fqn = "'
+    out: list[str] = []
+    seen: set[str] = set()
+    i = mlir_text.find(marker)
+    while i != -1:
+        j = mlir_text.find('"', i + len(marker))
+        if j == -1:
+            break
+        fqn = mlir_text[i + len(marker):j]
+        if fqn and fqn not in seen:
+            seen.add(fqn)
+            out.append(fqn)
+        i = mlir_text.find(marker, j + 1)
+    return out
+
+
+# npz key convention for region_goldens.npz, SHARED with the Merlin reader
+# (merlin.baselines.bundle.CaptureBundle.region_goldens): one entry per (region fqn, slot) where slot
+# is ``in<k>`` (the region's k-th boundary input = the upstream region's output) or ``out`` (the
+# region's output golden). Flat, self-describing keys so np.load needs no sidecar.
+_REGION_KEY = "{fqn}::{slot}"
+
+
+def _capture_region_goldens(mdl, inputs, fqns) -> dict[str, "np.ndarray"]:
+    """Register forward hooks on the nn.Modules named by ``fqns`` and capture, during ONE forward,
+    each region's boundary tensors: its positional INPUTS and its OUTPUT. Best-effort — a module that
+    is not registered under that exact name, or whose IO is not a plain tensor, is simply skipped."""
+    named = dict(mdl.named_modules())
+    caught: dict[str, np.ndarray] = {}
+    handles = []
+
+    def _mk(fqn: str):
+        def hook(_m, args, output):
+            for k, a in enumerate(args):
+                if isinstance(a, torch.Tensor):
+                    caught[_REGION_KEY.format(fqn=fqn, slot=f"in{k}")] = \
+                        a.detach().float().cpu().numpy()
+            out_t = output[0] if isinstance(output, (tuple, list)) else output
+            if isinstance(out_t, torch.Tensor):
+                caught[_REGION_KEY.format(fqn=fqn, slot="out")] = \
+                    out_t.detach().float().cpu().numpy()
+        return hook
+
+    for fqn in fqns:
+        mod = named.get(fqn)
+        if mod is not None:
+            handles.append(mod.register_forward_hook(_mk(fqn)))
+    try:
+        with torch.no_grad():
+            g = mdl(*inputs)
+    finally:
+        for h in handles:
+            h.remove()
+    return caught, g
+
+
+def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: bool = True) -> dict:
     """Convert ``mdl`` and write the full bundle to ``out``. Returns a summary dict.
 
     ``quant`` is an m2m ``QuantizationConfig`` (or ``None`` for an unquantized/fp bundle). The golden
     is the forward of the SAME instance on the SAME inputs, so the bundle is self-consistent.
+
+    ``capture_regions`` (default on) additionally records per-region boundary tensors to
+    ``region_goldens.npz`` (keyed by the ``prov.fqn`` modules the export tagged) — the shared substrate
+    for per-region equivalence + standalone-section profiling. Captured in the SAME golden forward.
     """
     import m2m
 
@@ -115,8 +181,16 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None) -> dict:
     assert r.ok, "m2m.convert failed"
     (out / "model.mlir").write_text(r.mlir_text)
 
-    with torch.no_grad():
-        g = mdl(*inputs)
+    n_regions = 0
+    if capture_regions:
+        fqns = _extract_prov_fqns(r.mlir_text)
+        region_goldens, g = _capture_region_goldens(mdl, inputs, fqns)
+        if region_goldens:
+            np.savez(out / "region_goldens.npz", **region_goldens)
+        n_regions = len({k.split("::", 1)[0] for k in region_goldens})
+    else:
+        with torch.no_grad():
+            g = mdl(*inputs)
     golden = g[0] if isinstance(g, (tuple, list)) else g
     np.save(out / "golden.npy", golden.detach().float().cpu().numpy())
 
@@ -150,5 +224,5 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None) -> dict:
         "n_lifted": sum(1 for kk in extra if kk.startswith("c_lifted")),
         "n_qinner": sum(1 for kk in extra if kk.startswith("qinner::")),
         "golden_shape": list(golden.shape), "linalg": r.mlir_text.count("linalg."),
-        "input_order": order,
+        "input_order": order, "n_regions": n_regions,
     }
