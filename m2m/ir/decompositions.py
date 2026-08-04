@@ -714,11 +714,20 @@ def decompose_mul_tensor(
 ) -> DecompResult:
     """Decompose aten.mul.Tensor(a, b) -> element-wise mul.
 
-    Handles the (tensor, scalar) form like ``decompose_add_tensor``.
+    Handles the (tensor, scalar) form like ``decompose_add_tensor``. A COMPLEX multiply is
+    dispatched to ``_complex_mul``: complex operands are carried as a real trailing-(re, im)
+    pair, so multiplying them elementwise as reals would quietly compute two real products
+    instead of one complex product -- wrong numbers rather than a failure.
     """
     from xdsl.dialects.func import CallOp
 
     val: Any = meta["val"]
+    if _is_complex_val(val):
+        cm = _complex_mul(operands, meta, node_name)
+        if cm is not None:
+            return cm
+        return _opaque_decomp("aten_complex_mul", operands[:2], meta, "elementwise",
+                              pattern_hint="mul")
     elem = _element_type_from_meta(meta)
     result_type = TensorType(elem, [_coerce_static_dim(d) for d in val.shape])
 
@@ -2330,6 +2339,538 @@ def decompose_convolution(operands, meta, node_name):
         op.attributes["prov.conv_path"] = StringAttr(conv_path)
     return DecompResult(ops=ops, result=res, region_ids=[rid],
                         pattern_hint="convolution_im2col_matmul")
+
+
+# ---------------------------------------------------------------------------
+# Real-valued DFT lowering for the torch.fft ops.
+#
+# xDSL 0.65 has no complex element type, so a complex tensor of logical shape S is
+# represented here as a REAL tensor of shape S + [2], (re, im) innermost. That layout is not
+# incidental: it is exactly torch's own `view_as_complex` / `view_as_real` memory layout, so
+# those two ops become identities and a learned "complex" parameter (which torch stores as a
+# real (..., 2) Parameter) needs no conversion at all.
+#
+# Every transform is emitted as `linalg.matmul` against CONSTANT twiddle matrices rather than
+# as a radix-decomposed butterfly network. Three reasons, in order of importance:
+#
+#   1. A consumer's vector schedule matches contractions. A DFT expressed as matmuls
+#      therefore inherits that target's tiling, its integer/half datapath and its
+#      parallel-loop split with no FFT-specific lowering anywhere -- the same argument that
+#      makes conv an im2col matmul above.
+#   2. The contraction is over the SPATIAL axis with the channel axis left free and
+#      innermost, so the vector lanes land on channels at unit stride. A hand-written
+#      channel-vectorized FFT kernel gets its speed from precisely that layout; here it falls
+#      out of the shape.
+#   3. It is exact for any length, with no radix cases to get wrong.
+#
+# The cost is O(n^2) per axis instead of O(n log n). That is a real trade and it is bounded
+# rather than assumed away: above M2M_DFT_MAX_LEN we fail closed to an opaque call instead of
+# emitting a quadratic transform (and a matching quadratic constant) for a long signal.
+# ---------------------------------------------------------------------------
+
+_DFT_MAX_LEN_DEFAULT = 64
+
+
+def _dft_max_len() -> int:
+    import os
+
+    raw = os.environ.get("M2M_DFT_MAX_LEN")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return _DFT_MAX_LEN_DEFAULT
+
+
+def _is_complex_val(val: Any) -> bool:
+    """True when a node's fake tensor is complex (so its xDSL form carries a trailing 2)."""
+    dt = getattr(val, "dtype", None)
+    return dt is not None and "complex" in str(dt)
+
+
+def _const_matrix(rows: list[list[float]], elem: Any):
+    """A dense 2-D constant, as ``(ops, ssa)``. Twiddles are compile-time data."""
+    from xdsl.dialects.arith import ConstantOp
+    from xdsl.dialects.builtin import DenseIntOrFPElementsAttr
+
+    m, n = len(rows), len(rows[0])
+    t = TensorType(elem, [m, n])
+    flat = [float(v) for r in rows for v in r]
+    const = ConstantOp(DenseIntOrFPElementsAttr.from_list(t, flat), t)
+    return [const], const.result
+
+
+def _matmul_2d(a, b, m: int, n: int, elem: Any):
+    """``linalg.matmul`` on a zeroed accumulator, as ``(ops, ssa)``."""
+    rt = TensorType(elem, [m, n])
+    z_ops, acc = _zero_acc(rt, elem)
+    mm = MatmulOp(inputs=[a, b], outputs=[acc], res=[rt])
+    return [*z_ops, mm], mm.results[0]
+
+
+def _move_axis_last(src, shape: list[int], axis: int, elem: Any):
+    """Permute ``axis`` to the end, then flatten to 2-D ``(prod(rest), shape[axis])``.
+
+    A contraction reads its reduction dim from the inner axis of the left operand, so the
+    transposed axis has to be innermost before the reshape. Returns
+    ``(ops, ssa_2d, rest_shape)``; ``rest_shape`` is what to expand back to afterwards.
+    """
+    from xdsl.dialects.builtin import DenseArrayBase
+    from xdsl.dialects.linalg import TransposeOp
+
+    rank = len(shape)
+    ops: list[Operation] = []
+    cur = src
+    perm = [i for i in range(rank) if i != axis] + [axis]
+    rest = [shape[i] for i in perm[:-1]]
+    if perm != list(range(rank)):
+        t_type = TensorType(elem, [shape[i] for i in perm])
+        t_empty = _make_empty(t_type)
+        tr = TransposeOp(input=cur, init=t_empty.results[0],
+                         permutation=DenseArrayBase.from_list(i64, perm), result=t_type)
+        ops += [t_empty, tr]
+        cur = tr.results[0]
+    prod = 1
+    for d in rest:
+        prod *= d
+    flat = _emit_reshape(cur, [prod, shape[axis]], elem)
+    if flat is None:
+        return None
+    ops += flat[0]
+    return ops, flat[1], rest
+
+
+def _restore_axis(src, rest: list[int], out_len: int, axis: int, rank: int, elem: Any):
+    """Inverse of ``_move_axis_last``: expand ``(prod(rest), out_len)`` and permute back."""
+    from xdsl.dialects.builtin import DenseArrayBase
+    from xdsl.dialects.linalg import TransposeOp
+
+    ops: list[Operation] = []
+    exp = _emit_reshape(src, [*rest, out_len], elem)
+    if exp is None:
+        return None
+    ops += exp[0]
+    cur = exp[1]
+    perm = [i for i in range(rank) if i != axis] + [axis]
+    inv = [perm.index(i) for i in range(rank)]
+    if inv != list(range(rank)):
+        cur_shape = [*rest, out_len]
+        t_type = TensorType(elem, [cur_shape[i] for i in inv])
+        t_empty = _make_empty(t_type)
+        tr = TransposeOp(input=cur, init=t_empty.results[0],
+                         permutation=DenseArrayBase.from_list(i64, inv), result=t_type)
+        ops += [t_empty, tr]
+        cur = tr.results[0]
+    return ops, cur
+
+
+def _twiddles(length: int, n_out: int, *, sign: float, scale: float, period: int | None = None,
+              fold: list[float] | None = None):
+    """``(cos_matrix, sin_matrix)`` of shape ``(length, n_out)`` for ``e^{sign*i*2*pi*kn/period}``.
+
+    ``length`` is the CONTRACTION extent (how many input elements are summed) and ``n_out`` the
+    number of outputs; ``period`` is the signal length that sets the angle, which is NOT always
+    ``length``. It differs for exactly one case, the half-spectrum inverse: there the sum runs
+    over ``n//2 + 1`` stored bins while the angle still divides by the full ``n``. Defaulting
+    ``period`` to ``length`` and quietly using it everywhere is how that case comes out wrong.
+
+    ``scale`` folds in the normalization and ``fold`` an optional per-INPUT-bin multiplicity
+    (the Hermitian doubling of a real inverse transform), so neither needs a run-time op.
+    """
+    import math
+
+    per = length if period is None else period
+    cos_m, sin_m = [], []
+    for n in range(length):
+        cr, sr = [], []
+        mult = scale * (fold[n] if fold is not None else 1.0)
+        for k in range(n_out):
+            w = 2.0 * math.pi * k * n / per
+            cr.append(mult * math.cos(w))
+            sr.append(mult * sign * math.sin(w))
+        cos_m.append(cr)
+        sin_m.append(sr)
+    return cos_m, sin_m
+
+
+def _dft_axis_real_in(x, shape, axis, length, n_out, elem, *, scale):
+    """Forward DFT over ``axis`` of a REAL tensor -> ``(ops, re, im, out_shape)``.
+
+    The imaginary half of a real-input transform is known zero, so this costs two matmuls
+    rather than four.
+    """
+    mv = _move_axis_last(x, shape, axis, elem)
+    if mv is None:
+        return None
+    ops, flat, rest = mv
+    m = 1
+    for d in rest:
+        m *= d
+    cos_m, sin_m = _twiddles(length, n_out, sign=-1.0, scale=scale)
+    c_ops, c_ssa = _const_matrix(cos_m, elem)
+    s_ops, s_ssa = _const_matrix(sin_m, elem)
+    ops += c_ops + s_ops
+    re_ops, re_flat = _matmul_2d(flat, c_ssa, m, n_out, elem)
+    im_ops, im_flat = _matmul_2d(flat, s_ssa, m, n_out, elem)
+    ops += re_ops + im_ops
+    out_shape = list(shape)
+    out_shape[axis] = n_out
+    r_re = _restore_axis(re_flat, rest, n_out, axis, len(shape), elem)
+    r_im = _restore_axis(im_flat, rest, n_out, axis, len(shape), elem)
+    if r_re is None or r_im is None:
+        return None
+    ops += r_re[0] + r_im[0]
+    return ops, r_re[1], r_im[1], out_shape
+
+
+def _dft_axis_complex(re, im, shape, axis, length, n_out, elem, *, sign, scale,
+                      period=None, fold=None, real_out=False):
+    """DFT over ``axis`` of a COMPLEX tensor held as separate re/im planes.
+
+    ``(Zr, Zi) = (Xr@C - s*Xi@S, Xi@C + s*Xr@S)`` for ``e^{s*i*w}`` -- four matmuls, two when
+    ``real_out`` (the imaginary half is discarded, so it is never computed).
+    Returns ``(ops, re, im_or_None, out_shape)``.
+    """
+    from xdsl.dialects.arith import AddfOp, SubfOp
+
+    mv_r = _move_axis_last(re, shape, axis, elem)
+    mv_i = _move_axis_last(im, shape, axis, elem)
+    if mv_r is None or mv_i is None:
+        return None
+    ops = mv_r[0] + mv_i[0]
+    fr, fi, rest = mv_r[1], mv_i[1], mv_r[2]
+    m = 1
+    for d in rest:
+        m *= d
+    cos_m, sin_m = _twiddles(length, n_out, sign=sign, scale=scale, period=period, fold=fold)
+    c_ops, c_ssa = _const_matrix(cos_m, elem)
+    s_ops, s_ssa = _const_matrix(sin_m, elem)
+    ops += c_ops + s_ops
+    flat_t = TensorType(elem, [m, n_out])
+
+    rc_ops, rc = _matmul_2d(fr, c_ssa, m, n_out, elem)
+    is_ops, is_ = _matmul_2d(fi, s_ssa, m, n_out, elem)
+    ops += rc_ops + is_ops
+    # Zr = Xr@C - Xi@S  (the sign of the sine term is already inside S via `sign`)
+    zr = _elementwise([rc, is_], flat_t, _bin_build(SubfOp))
+    if zr is None:
+        return None
+    ops += zr[0]
+    out_shape = list(shape)
+    out_shape[axis] = n_out
+    rr = _restore_axis(zr[1], rest, n_out, axis, len(shape), elem)
+    if rr is None:
+        return None
+    ops += rr[0]
+    if real_out:
+        return ops, rr[1], None, out_shape
+
+    ic_ops, ic = _matmul_2d(fi, c_ssa, m, n_out, elem)
+    rs_ops, rs = _matmul_2d(fr, s_ssa, m, n_out, elem)
+    ops += ic_ops + rs_ops
+    zi = _elementwise([ic, rs], flat_t, _bin_build(AddfOp))
+    if zi is None:
+        return None
+    ops += zi[0]
+    ri = _restore_axis(zi[1], rest, n_out, axis, len(shape), elem)
+    if ri is None:
+        return None
+    ops += ri[0]
+    return ops, rr[1], ri[1], out_shape
+
+
+def _interleave_complex(re, im, shape, elem):
+    """Pack separate re/im planes into the canonical trailing-2 layout, ``(ops, ssa)``."""
+    from xdsl.dialects.tensor import InsertSliceOp
+
+    out_shape = [*shape, 2]
+    z_ops, base = _zero_acc(TensorType(elem, out_shape), elem)
+    ops = list(z_ops)
+    cur = base
+    for k, plane in ((0, re), (1, im)):
+        exp = _emit_reshape(plane, [*shape, 1], elem)
+        if exp is None:
+            return None
+        ops += exp[0]
+        ins = InsertSliceOp.from_static_parameters(
+            exp[1], cur, [0] * len(shape) + [k], [*shape, 1], [1] * (len(shape) + 1))
+        ops.append(ins)
+        cur = ins.results[0]
+    return ops, cur
+
+
+def _split_complex(src, shape_with_pair: list[int], elem):
+    """Unpack the trailing-2 layout into ``(ops, re, im, logical_shape)``."""
+    from xdsl.dialects.tensor import ExtractSliceOp
+
+    shape = list(shape_with_pair[:-1])
+    rank = len(shape_with_pair)
+    ops: list[Operation] = []
+    planes = []
+    for k in range(2):
+        sl = ExtractSliceOp.from_static_parameters(
+            src, [0] * len(shape) + [k], [*shape, 1], [1] * rank)
+        ops.append(sl)
+        red = _emit_reshape(sl.results[0], shape, elem)
+        if red is None:
+            return None
+        ops += red[0]
+        planes.append(red[1])
+    return ops, planes[0], planes[1], shape
+
+
+#: torch's ``fft_norm_mode`` enum, as it reaches ``aten._fft_r2c`` / ``aten._fft_c2r``:
+#: 0 = none, 1 = divide by sqrt(n) ("ortho"), 2 = divide by n. Read as data, never assumed --
+#: an unrecognized value falls back to opaque rather than picking a scale.
+_FFT_NORM_NONE, _FFT_NORM_ROOT_N, _FFT_NORM_N = 0, 1, 2
+
+
+def _fft_norm_factor(mode: Any, n_total: int) -> float | None:
+    import math
+
+    try:
+        m = int(mode)
+    except (TypeError, ValueError):
+        return None
+    if m == _FFT_NORM_NONE:
+        return 1.0
+    if m == _FFT_NORM_ROOT_N:
+        return 1.0 / math.sqrt(n_total)
+    if m == _FFT_NORM_N:
+        return 1.0 / n_total
+    return None
+
+
+def _fft_norm_dims(raw: Any, rank: int) -> list[int] | None:
+    if raw is None:
+        return None
+    dims = [int(d) for d in raw] if isinstance(raw, (list, tuple)) else [int(raw)]
+    dims = [d + rank if d < 0 else d for d in dims]
+    if any(not 0 <= d < rank for d in dims) or len(set(dims)) != len(dims):
+        return None
+    return dims
+
+
+def decompose_fft_r2c(operands, meta, node_name):
+    """aten._fft_r2c(self, dim, normalization, onesided) -> real DFT matmuls.
+
+    The LAST entry of ``dim`` is the real-input transform (two matmuls, since a real signal's
+    imaginary half is zero and ``onesided`` keeps only ``n//2 + 1`` bins); every earlier dim is
+    a full complex transform (four matmuls). Result is the canonical trailing-(re, im) pair.
+
+    Generic in the number of transform dims, so ``rfft``, ``rfft2`` and ``rfftn`` all land
+    here -- there is no per-rank special case to keep in sync.
+    """
+    x = operands[0]
+    in_shape = _shape_of(x)
+    val: Any = meta.get("val")
+    if in_shape is None or val is None or any(d <= 0 for d in in_shape):
+        return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
+    elem = _t_elem(x)
+    rank = len(in_shape)
+    dims = _fft_norm_dims(_fx_arg(meta, 1, None), rank)
+    if not dims:
+        return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
+    onesided = bool(_fx_arg(meta, 3, True))
+    if not onesided:
+        # A two-sided real transform would emit the full spectrum; no caller needs it, and
+        # guessing is how a half/full spectrum mix-up becomes silent wrong data.
+        return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
+    lengths = [in_shape[d] for d in dims]
+    if max(lengths) > _dft_max_len():
+        return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
+    n_total = 1
+    for n in lengths:
+        n_total *= n
+    scale = _fft_norm_factor(_fx_arg(meta, 2, 0), n_total)
+    if scale is None:
+        return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
+
+    last = dims[-1]
+    n_last = in_shape[last]
+    wf = n_last // 2 + 1
+    # meta['val'].shape is torch's LOGICAL complex shape; the trailing (re, im) axis belongs to
+    # the xDSL type only (added centrally in _tensor_type_from_meta), so compare without it.
+    expect = [wf if i == last else in_shape[i] for i in range(rank)]
+    if list(_static_shape(val.shape)) != expect:
+        return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
+
+    # Whole normalization rides on the first transform; the rest carry 1.0.
+    step = _dft_axis_real_in(x, list(in_shape), last, n_last, wf, elem, scale=scale)
+    if step is None:
+        return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
+    ops, re, im, cur_shape = step
+    for d in reversed(dims[:-1]):
+        nxt = _dft_axis_complex(re, im, cur_shape, d, cur_shape[d], cur_shape[d], elem,
+                                sign=-1.0, scale=1.0)
+        if nxt is None:
+            return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
+        ops += nxt[0]
+        re, im, cur_shape = nxt[1], nxt[2], nxt[3]
+    packed = _interleave_complex(re, im, cur_shape, elem)
+    if packed is None:
+        return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
+    ops += packed[0]
+    rid = _next_region_id("fft")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("spectral")
+    return DecompResult(ops=ops, result=packed[1], region_ids=[rid], pattern_hint="fft_rfft2")
+
+
+def decompose_fft_c2r(operands, meta, node_name):
+    """aten._fft_c2r(self, dim, normalization, last_dim_size) -> real DFT matmuls.
+
+    Mirror of ``_fft_r2c``: the earlier dims invert as full complex transforms, and the last
+    inverts from a half spectrum to a real signal. Hermitian symmetry means every bin except
+    DC (and Nyquist, when the length is even) stands for a conjugate pair and so contributes
+    twice; that multiplicity is folded into the twiddle constants rather than applied at run
+    time, and the imaginary half of the result is never computed because it is discarded.
+    """
+    x = operands[0]
+    packed_shape = _shape_of(x)
+    val: Any = meta.get("val")
+    if packed_shape is None or val is None or len(packed_shape) < 2 or packed_shape[-1] != 2:
+        return _opaque_decomp("aten__fft_c2r", operands[:1], meta, "fft", pattern_hint="fft_irfft2")
+    elem = _t_elem(x)
+    split = _split_complex(x, list(packed_shape), elem)
+    if split is None:
+        return _opaque_decomp("aten__fft_c2r", operands[:1], meta, "fft", pattern_hint="fft_irfft2")
+    ops, re, im, in_shape = split
+    rank = len(in_shape)
+    dims = _fft_norm_dims(_fx_arg(meta, 1, None), rank)
+    if not dims:
+        return _opaque_decomp("aten__fft_c2r", operands[:1], meta, "fft", pattern_hint="fft_irfft2")
+    out_shape = _static_shape(val.shape)
+    if len(out_shape) != rank:
+        return _opaque_decomp("aten__fft_c2r", operands[:1], meta, "fft", pattern_hint="fft_irfft2")
+    last = dims[-1]
+    n_last = int(_fx_arg(meta, 3, out_shape[last]) or out_shape[last])
+    wf = in_shape[last]
+    if n_last != out_shape[last] or wf != n_last // 2 + 1:
+        return _opaque_decomp("aten__fft_c2r", operands[:1], meta, "fft", pattern_hint="fft_irfft2")
+    lengths = [out_shape[d] for d in dims]
+    if max(lengths) > _dft_max_len():
+        return _opaque_decomp("aten__fft_c2r", operands[:1], meta, "fft", pattern_hint="fft_irfft2")
+    if any(in_shape[d] != out_shape[d] for d in dims[:-1]):
+        return _opaque_decomp("aten__fft_c2r", operands[:1], meta, "fft", pattern_hint="fft_irfft2")
+    n_total = 1
+    for n in lengths:
+        n_total *= n
+    scale = _fft_norm_factor(_fx_arg(meta, 2, 0), n_total)
+    if scale is None:
+        return _opaque_decomp("aten__fft_c2r", operands[:1], meta, "fft", pattern_hint="fft_irfft2")
+
+    cur_shape = list(in_shape)
+    first = True
+    for d in dims[:-1]:
+        nxt = _dft_axis_complex(re, im, cur_shape, d, cur_shape[d], cur_shape[d], elem,
+                                sign=+1.0, scale=(scale if first else 1.0))
+        if nxt is None:
+            return _opaque_decomp("aten__fft_c2r", operands[:1], meta, "fft", pattern_hint="fft_irfft2")
+        ops += nxt[0]
+        re, im, cur_shape = nxt[1], nxt[2], nxt[3]
+        first = False
+    # Hermitian doubling per STORED BIN: DC (and Nyquist for an even length) have no conjugate
+    # partner, every other bin stands for a pair. The angle still divides by the full n_last.
+    fold = [1.0 if (b == 0 or (n_last % 2 == 0 and b == n_last // 2)) else 2.0 for b in range(wf)]
+    final = _dft_axis_complex(re, im, cur_shape, last, wf, n_last, elem, sign=+1.0,
+                              scale=(scale if first else 1.0), period=n_last, fold=fold,
+                              real_out=True)
+    if final is None:
+        return _opaque_decomp("aten__fft_c2r", operands[:1], meta, "fft", pattern_hint="fft_irfft2")
+    ops += final[0]
+    if list(final[3]) != list(out_shape):
+        return _opaque_decomp("aten__fft_c2r", operands[:1], meta, "fft", pattern_hint="fft_irfft2")
+    rid = _next_region_id("fft")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("spectral")
+    return DecompResult(ops=ops, result=final[1], region_ids=[rid], pattern_hint="fft_irfft2")
+
+
+def decompose_view_as_complex(operands, meta, node_name):
+    """aten.view_as_complex(x[..., 2]) -> identity.
+
+    torch stores a complex tensor as (re, im) innermost, which is exactly the layout used
+    here, so this is a relabeling with no data movement. A learned "complex" parameter is a
+    real (..., 2) Parameter on both sides of the boundary.
+    """
+    x = operands[0]
+    shape = _shape_of(x)
+    if shape is None or not shape or shape[-1] != 2:
+        return _opaque_decomp("aten_view_as_complex", operands[:1], meta, "layout",
+                              pattern_hint="view")
+    return DecompResult(ops=[], result=x, region_ids=[], pattern_hint="view")
+
+
+def decompose_view_as_real(operands, meta, node_name):
+    """aten.view_as_real(complex x) -> identity (same trailing-(re, im) layout)."""
+    x = operands[0]
+    shape = _shape_of(x)
+    if shape is None or not shape or shape[-1] != 2:
+        return _opaque_decomp("aten_view_as_real", operands[:1], meta, "layout",
+                              pattern_hint="view")
+    return DecompResult(ops=[], result=x, region_ids=[], pattern_hint="view")
+
+
+def _complex_mul(operands, meta, node_name):
+    """Complex elementwise multiply on the trailing-(re, im) layout.
+
+    ``(ar + i*ai)(br + i*bi) = (ar*br - ai*bi) + i*(ar*bi + ai*br)``. Reached from
+    ``decompose_mul_tensor`` when the traced result dtype is complex -- treating that as a
+    real multiply would silently compute the wrong thing (two real products instead of a
+    complex one) rather than fail, which is the whole reason this is dispatched on dtype.
+    """
+    from xdsl.dialects.arith import AddfOp, MulfOp, SubfOp
+
+    if len(operands) < 2:
+        return None
+    a, b = operands[0], operands[1]
+    sa, sb = _shape_of(a), _shape_of(b)
+    if sa is None or sb is None or not sa or not sb or sa[-1] != 2 or sb[-1] != 2:
+        return None
+    elem = _t_elem(a)
+    if _t_elem(b) != elem:
+        return None
+    ops: list[Operation] = []
+    sp_a = _split_complex(a, list(sa), elem)
+    sp_b = _split_complex(b, list(sb), elem)
+    if sp_a is None or sp_b is None:
+        return None
+    ops += sp_a[0] + sp_b[0]
+    ar, ai, la = sp_a[1], sp_a[2], sp_a[3]
+    br, bi, lb = sp_b[1], sp_b[2], sp_b[3]
+    # Broadcast shape of the two logical operands (the pair axis is not broadcast).
+    out_logical = la if len(la) >= len(lb) else lb
+    rt = TensorType(elem, out_logical)
+
+    def _mul(u, us, v, vs):
+        maps = [_broadcast_map(us, out_logical), _broadcast_map(vs, out_logical)]
+        if any(m is None for m in maps):
+            return None
+        return _elementwise([u, v], rt, _bin_build(MulfOp), input_maps=maps, promote=True)
+
+    p_rr, p_ii, p_ri, p_ir = _mul(ar, la, br, lb), _mul(ai, la, bi, lb), _mul(ar, la, bi, lb), _mul(ai, la, br, lb)
+    if any(p is None for p in (p_rr, p_ii, p_ri, p_ir)):
+        return None
+    for p in (p_rr, p_ii, p_ri, p_ir):
+        ops += p[0]
+    re = _elementwise([p_rr[1], p_ii[1]], rt, _bin_build(SubfOp))
+    im = _elementwise([p_ri[1], p_ir[1]], rt, _bin_build(AddfOp))
+    if re is None or im is None:
+        return None
+    ops += re[0] + im[0]
+    packed = _interleave_complex(re[1], im[1], out_logical, elem)
+    if packed is None:
+        return None
+    ops += packed[0]
+    rid = _next_region_id("complex_mul")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("elementwise")
+    return DecompResult(ops=ops, result=packed[1], region_ids=[rid], pattern_hint="mul")
 
 
 def decompose_select_int(operands, meta, node_name):
@@ -4733,6 +5274,12 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     # decomposition function consumes both.
     "aten.conv2d.default": decompose_convolution,
     "aten.constant_pad_nd.default": decompose_constant_pad_nd,
+    # torch.fft: real DFT contractions, complex carried as a trailing (re, im) pair.
+    "aten._fft_r2c.default": decompose_fft_r2c,
+    "aten._fft_c2r.default": decompose_fft_c2r,
+    "aten.view_as_complex.default": decompose_view_as_complex,
+    "aten.view_as_real.default": decompose_view_as_real,
+    "aten.view_as_real_copy.default": decompose_view_as_real,
     "aten.embedding.default": decompose_embedding,
     "aten.sigmoid.default": decompose_sigmoid,
     "aten.neg.default": decompose_neg,

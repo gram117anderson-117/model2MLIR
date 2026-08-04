@@ -222,3 +222,118 @@ def test_grouped_conv_records_its_non_matmul_path():
     assert "aten_convolution" not in r.mlir_text, "grouped conv fell back to an opaque call"
     assert 'prov.conv_path = "im2col_matmul"' in r.mlir_text
     assert "linalg.generic" in r.mlir_text
+
+
+# ---------------------------------------------------------------------------
+# torch.fft: complex tensors are carried as a real trailing-(re, im) pair and every transform
+# is emitted as linalg.matmul against constant twiddles, so a spectral model inherits the
+# consumer's contraction schedule with no FFT-specific lowering.
+# ---------------------------------------------------------------------------
+
+
+class _SpectralGating(torch.nn.Module):
+    """SpectFormer's SpectralGatingNetwork: rfft2 -> complex gate -> irfft2, norm='ortho'."""
+
+    def __init__(self, dim, h=14, w=8):
+        super().__init__()
+        self.complex_weight = torch.nn.Parameter(torch.randn(h, w, dim, 2) * 0.02)
+
+    def forward(self, x):
+        import math
+
+        b_, n, c = x.shape
+        a = b = int(math.sqrt(n))
+        y = x.view(b_, a, b, c).to(torch.float32)
+        y = torch.fft.rfft2(y, dim=(1, 2), norm="ortho")
+        y = y * torch.view_as_complex(self.complex_weight)
+        y = torch.fft.irfft2(y, s=(a, b), dim=(1, 2), norm="ortho")
+        return y.reshape(b_, n, c)
+
+
+def test_spectral_gating_lowers_to_contractions():
+    """The whole rfft2 -> gate -> irfft2 chain must reach real matmuls with nothing opaque."""
+    import m2m
+    from m2m.coverage import opaque_report
+
+    torch.manual_seed(0)
+    r = m2m.convert(_SpectralGating(8).eval(), (torch.randn(1, 196, 8),),
+                    backend="fx_importer", level="linalg-on-tensors")
+    assert r.ok
+    assert sum(opaque_report(r.mlir_text).values()) == 0, opaque_report(r.mlir_text)
+    # 2 for the real-input forward axis, 4 for the complex forward axis, 4 + 2 inverse.
+    assert r.mlir_text.count("linalg.matmul") == 12, r.mlir_text.count("linalg.matmul")
+    # No complex ELEMENT TYPE may survive (a `prov.orig_dtype = "complex64"` annotation is
+    # expected and wanted -- it records what the value logically was).
+    assert "complex<" not in r.mlir_text, "a complex element type leaked into the IR"
+
+
+@pytest.mark.parametrize("norm", ["ortho", "backward", "forward"])
+def test_rfft_roundtrip_lowers(norm):
+    """rfft2 -> irfft2 lowers for each normalization mode (the aten norm enum is read as data)."""
+    import m2m
+    from m2m.coverage import opaque_report
+
+    class _RT(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = torch.nn.Linear(6, 6, bias=False)
+
+        def forward(self, x):
+            y = self.lin(x)
+            y = torch.fft.rfft2(y, dim=(1, 2), norm=norm)
+            return torch.fft.irfft2(y, s=(8, 8), dim=(1, 2), norm=norm)
+
+    torch.manual_seed(0)
+    r = m2m.convert(_RT().eval(), (torch.randn(1, 8, 8, 6),), backend="fx_importer",
+                    level="linalg-on-tensors")
+    assert r.ok
+    assert sum(opaque_report(r.mlir_text).values()) == 0, opaque_report(r.mlir_text)
+
+
+def test_rfft1d_lowers():
+    """A 1-D rfft goes through the same generic path -- no per-rank special case."""
+    import m2m
+    from m2m.coverage import opaque_report
+
+    class _R1(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = torch.nn.Linear(16, 16, bias=False)
+
+        def forward(self, x):
+            y = self.lin(x)
+            y = torch.fft.rfft(y, dim=-1, norm="ortho")
+            return torch.view_as_real(y)
+
+    torch.manual_seed(0)
+    r = m2m.convert(_R1().eval(), (torch.randn(1, 4, 16),), backend="fx_importer",
+                    level="linalg-on-tensors")
+    assert r.ok
+    assert sum(opaque_report(r.mlir_text).values()) == 0, opaque_report(r.mlir_text)
+
+
+def test_complex_unaware_op_fails_closed():
+    """An op that is NOT written against the (re, im) pair layout must refuse a complex operand.
+
+    Its xDSL value has one more axis than torch's logical shape, so slicing or padding by
+    logical dim would hit the wrong axis and produce plausible wrong numbers. The guard turns
+    that into a visible opaque call instead.
+    """
+    import m2m
+    from m2m.coverage import opaque_report
+
+    class _SliceComplex(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = torch.nn.Linear(4, 4, bias=False)
+
+        def forward(self, x):
+            y = torch.fft.rfft2(self.lin(x), dim=(1, 2))
+            return torch.view_as_real(y[:, :, 1:])
+
+    torch.manual_seed(0)
+    r = m2m.convert(_SliceComplex().eval(), (torch.randn(1, 6, 6, 4),), backend="fx_importer",
+                    level="linalg-on-tensors")
+    assert r.ok, "must still produce a module"
+    opq = opaque_report(r.mlir_text)
+    assert sum(opq.values()) > 0, "a complex slice must NOT be silently lowered as a real slice"

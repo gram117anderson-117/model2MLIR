@@ -113,6 +113,7 @@ _reg("contraction", "matmul", "batch_matmul", "int_matmul", "addmm", "linear",
      "conv2d", "convolution", "convolution_im2col_matmul",
      "weight_int8pack_mm", "weight_int4pack_mm", "weight_int4pack_qm")
 _reg("normalization", "softmax", "layer_norm")
+_reg("spectral", "fft_rfft2", "fft_irfft2")
 _reg("attention", "sdpa")
 _reg("layout", "view", "reshape", "unsqueeze", "squeeze", "flatten", "permute",
      "transpose", "expand", "slice", "select", "slice_scatter", "split", "repeat",
@@ -266,6 +267,16 @@ def _torch_dtype_to_xdsl(dtype: torch.dtype) -> Attribute:
     int_bits = {torch.int8: 8, torch.uint8: 8, torch.int16: 16, torch.int32: 32, torch.int64: 64}
     if dtype in int_bits:
         return IntegerType(int_bits[dtype])
+    # Complex: no complex element type exists here, so a complex tensor is carried as a REAL
+    # tensor with a trailing size-2 (re, im) axis -- torch's own view_as_complex layout. This
+    # returns the element type of that PAIR; the trailing axis itself is added centrally by
+    # `_tensor_type_from_meta`, so shape and element type never disagree.
+    if dtype == torch.complex64:
+        return Float32Type()
+    if dtype == torch.complex128:
+        return Float64Type()
+    if dtype == getattr(torch, "complex32", None):
+        return Float16Type()
     factory = mapping.get(dtype, Float32Type)
     return factory()  # type: ignore[abstract]
 
@@ -285,6 +296,41 @@ def _coerce_static_dim(dim: Any) -> int:
         return -1
 
 
+#: The only aten targets whose decompositions are written against the trailing-(re, im) pair
+#: layout used for complex tensors. Anything else that touches a complex value falls back to an
+#: opaque call (see the guard in ``import_graph``) rather than indexing a logical dim that is
+#: off by one in the pair layout. Extend this ONLY together with the decomposition.
+_COMPLEX_AWARE_TARGETS = frozenset({
+    "aten._fft_r2c.default",
+    "aten._fft_c2r.default",
+    "aten.view_as_complex.default",
+    "aten.view_as_real.default",
+    "aten.view_as_real_copy.default",
+    "aten.mul.Tensor",
+})
+
+
+def _is_complex_meta(val: Any) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, (tuple, list)):
+        return any(_is_complex_meta(v) for v in val)
+    dt = getattr(val, "dtype", None)
+    return dt is not None and "complex" in str(dt)
+
+
+def _node_touches_complex(node: Any, value_map: dict) -> bool:
+    """True if the node's result or any tensor argument is complex."""
+    if _is_complex_meta(node.meta.get("val")):
+        return True
+    for arg in node.args:
+        cands = arg if isinstance(arg, (list, tuple)) else [arg]
+        for c in cands:
+            if hasattr(c, "meta") and _is_complex_meta(c.meta.get("val")):
+                return True
+    return False
+
+
 def _tensor_type_from_meta(val: Any) -> TensorType | None:
     """Extract a TensorType from an FX node's meta['val'].
 
@@ -301,6 +347,12 @@ def _tensor_type_from_meta(val: Any) -> TensorType | None:
     if hasattr(val, "shape") and hasattr(val, "dtype"):
         elem = _torch_dtype_to_xdsl(val.dtype)
         shape = [_coerce_static_dim(d) for d in val.shape]
+        # A complex tensor is represented as a real tensor with a trailing size-2 (re, im)
+        # axis -- the same layout torch uses, so view_as_complex/view_as_real are identities.
+        # Adding the axis HERE keeps every consumer (decompositions and the opaque fallback
+        # alike) agreeing on the shape; doing it per-op is how the two drift apart.
+        if "complex" in str(val.dtype):
+            shape = [*shape, 2]
         return TensorType(elem, shape)
     if isinstance(val, (tuple, list)) and val:
         # Tuple-returning op — recurse on the primary element.
@@ -734,6 +786,24 @@ class FXImporter:
 
             # Try decomposition table first
             decomp_fn = self.dynamic_decompositions.get(target_str, DECOMPOSITION_TABLE.get(target_str))
+            # A complex tensor is carried as a real trailing-(re, im) pair, so its xDSL value
+            # has ONE MORE axis than torch's logical shape. Any decomposition that indexes,
+            # reshapes or concatenates by logical dim would therefore act on the wrong axis --
+            # silently, with plausible-looking output. Only the ops written against the pair
+            # layout may see a complex value; everything else falls back to an opaque call that
+            # is visible in the coverage report.
+            if decomp_fn is not None and target_str not in _COMPLEX_AWARE_TARGETS:
+                if _node_touches_complex(node, value_map):
+                    self.diagnostics.append(
+                        ImportDiagnostic(
+                            fx_node=node.name,
+                            level="warning",
+                            message=(f"{target_str} has a complex operand/result and is not "
+                                     f"written against the (re, im) pair layout; falling back "
+                                     f"to opaque rather than indexing the wrong axis"),
+                        )
+                    )
+                    decomp_fn = None
             if decomp_fn is not None:
                 meta = dict(node.meta)
                 # Forward FX-level args / kwargs to the decomposition so it
