@@ -2886,10 +2886,23 @@ def decompose_abs(operands, meta, node_name):
 
     src_type = operands[0].type if operands else None
     if isinstance(src_type, TensorType) and isinstance(src_type.element_type, IntegerType):
-        cls = _M.AbsIOp
+        # max(x, -x) in core arith, NOT math.absi. `math.absf` legalizes through
+        # convert-math-to-llvm but `math.absi` does not, so emitting it produced a module that
+        # failed to lower ("failed to legalize operation 'math.absi'"). arith is always legal, so
+        # this keeps integer abs working without making the frontend depend on a consumer's pass
+        # set. Same INT_MIN behavior as math.absi.
+        from xdsl.dialects.arith import ConstantOp, MaxSIOp, SubiOp
+        from xdsl.dialects.builtin import IntegerAttr
+
+        def _build(args, out_elem):
+            zero = ConstantOp(IntegerAttr(0, out_elem), out_elem)
+            neg = SubiOp(zero.results[0], args[0])
+            mx = MaxSIOp(args[0], neg.results[0])
+            return [zero, neg, mx], mx.results[0]
+
+        real = _unary_elementwise(operands, meta, "abs", _build)
     else:
-        cls = _M.AbsFOp
-    real = _unary_elementwise(operands, meta, "abs", _un_build(cls))
+        real = _unary_elementwise(operands, meta, "abs", _un_build(_M.AbsFOp))
     if real is not None:
         return real
     return _opaque_decomp("aten_abs", operands[:1], meta, "elementwise", pattern_hint="abs")
