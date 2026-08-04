@@ -1962,19 +1962,32 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
         prod = mm.results[0]
         prod_shape = [g, fg, m_dim]
 
-    # (F, N*Oh*Ow) -> (F, N, Oh, Ow) -> transpose to NCHW.
+    # (F, N*Oh*Ow) -> (F, N, Oh, Ow) -> NCHW.
     fr = _emit_reshape(prod, [f_out, n_out, h_out, w_out], elem)
     if fr is None:
         return None
     ops += fr[0]
     del prod_shape
     out_type = TensorType(elem, [n_out, f_out, h_out, w_out])
-    t_empty = _make_empty(out_type)
-    tr = TransposeOp(input=fr[1], init=t_empty.results[0],
-                     permutation=DenseArrayBase.from_list(i64, [1, 0, 2, 3]),
-                     result=out_type)
-    ops += [t_empty, tr]
-    res = tr.results[0]
+    if n_out == 1:
+        # The permutation only swaps the BATCH dim with the channel dim, so at N=1 it moves no
+        # element: (F, 1, Oh, Ow) and (1, F, Oh, Ow) have the same row-major order. Emit the
+        # reshape instead of a transpose -- it is free (a view) where the transpose is a full
+        # gather, and it keeps a fragile op out of the graph: a transpose of a reshape-of-a-matmul
+        # produced an alternating +-0.0 buffer on the bare-metal RISC-V target (correct on x86 from
+        # the SAME IR), which is a codegen defect worth reporting but not worth depending on.
+        rr = _emit_reshape(fr[1], [n_out, f_out, h_out, w_out], elem)
+        if rr is None:
+            return None
+        ops += rr[0]
+        res = rr[1]
+    else:
+        t_empty = _make_empty(out_type)
+        tr = TransposeOp(input=fr[1], init=t_empty.results[0],
+                         permutation=DenseArrayBase.from_list(i64, [1, 0, 2, 3]),
+                         result=out_type)
+        ops += [t_empty, tr]
+        res = tr.results[0]
 
     if bias is not None and isinstance(bias.type, TensorType):
         from xdsl.dialects.arith import AddfOp
