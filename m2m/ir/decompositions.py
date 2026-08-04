@@ -1695,6 +1695,293 @@ def decompose_mean_dim(operands, meta, node_name):
     return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="reduce_mean")
 
 
+def _zero_acc(result_type: TensorType, elem: Any):
+    """A ZEROED contraction accumulator (``tensor.splat 0``), as ``(ops, ssa)``.
+
+    Never ``tensor.empty`` here: a contraction computes ``out += A·B``, so an unfilled
+    accumulator reads undefined memory. That was the root cause of whole-model NaN output once
+    already (see ``_zero_fill_contraction_accumulators``); emit the fill at the source instead
+    of relying on a later pass to notice.
+    """
+    from xdsl.dialects.arith import ConstantOp
+    from xdsl.dialects.builtin import FloatAttr, IntegerAttr, IntegerType
+    from xdsl.dialects.tensor import SplatOp
+
+    zero_attr = IntegerAttr(0, elem) if isinstance(elem, IntegerType) else FloatAttr(0.0, elem)
+    zero = ConstantOp(zero_attr, elem)
+    splat = SplatOp(zero.results[0], [], result_type)
+    return [zero, splat], splat.results[0]
+
+
+def _zero_pad_ops(src: SSAValue, elem: Any, in_shape: list[int], pads: list[tuple[int, int]]):
+    """Zero-pad ``src`` per-dimension, as ``tensor.splat 0`` + ``tensor.insert_slice``.
+
+    ``pads[i] == (lo, hi)`` is the amount prepended/appended on dim ``i``. Negative amounts
+    CROP that side instead (torch's ``constant_pad_nd`` accepts negative pads), which is an
+    ``extract_slice`` rather than an insert. Returns ``(ops, result_ssa, out_shape)``, or
+    ``None`` when the request is degenerate (a crop larger than the dim).
+
+    Deliberately not ``tensor.pad``: the splat+insert form needs no pad-region lowering pass
+    and both halves are already exercised by the host dispatch runtime.
+    """
+    from xdsl.dialects.arith import ConstantOp
+    from xdsl.dialects.builtin import FloatAttr, IntegerAttr, IntegerType
+    from xdsl.dialects.tensor import ExtractSliceOp, InsertSliceOp, SplatOp
+
+    if len(pads) != len(in_shape):
+        return None
+    ops: list[Operation] = []
+    cur = src
+    cur_shape = list(in_shape)
+
+    # Crops first (negative pads), so the subsequent insert sees final source sizes.
+    if any(lo < 0 or hi < 0 for lo, hi in pads):
+        offsets = [(-lo if lo < 0 else 0) for lo, _ in pads]
+        sizes = [d - (-lo if lo < 0 else 0) - (-hi if hi < 0 else 0)
+                 for d, (lo, hi) in zip(cur_shape, pads)]
+        if any(s <= 0 for s in sizes):
+            return None
+        crop = ExtractSliceOp.from_static_parameters(cur, offsets, sizes, [1] * len(sizes))
+        ops.append(crop)
+        cur, cur_shape = crop.results[0], sizes
+
+    grow = [(max(lo, 0), max(hi, 0)) for lo, hi in pads]
+    if any(lo or hi for lo, hi in grow):
+        out_shape = [d + lo + hi for d, (lo, hi) in zip(cur_shape, grow)]
+        zero_attr = IntegerAttr(0, elem) if isinstance(elem, IntegerType) else FloatAttr(0.0, elem)
+        zero = ConstantOp(zero_attr, elem)
+        base = SplatOp(zero.results[0], [], TensorType(elem, out_shape))
+        ins = InsertSliceOp.from_static_parameters(
+            cur, base.results[0], [lo for lo, _ in grow], cur_shape, [1] * len(cur_shape))
+        ops += [zero, base, ins]
+        cur, cur_shape = ins.results[0], out_shape
+    return ops, cur, cur_shape
+
+
+def decompose_constant_pad_nd(operands, meta, node_name):
+    """aten.constant_pad_nd(input, pad, value) -> splat + insert_slice (family slice).
+
+    ``pad`` is torch's trailing-dims-first flat list ``[lo_last, hi_last, lo_last-1, ...]``.
+    Only value == 0 lowers here; a non-zero fill would need the splat constant to carry it,
+    which is a one-line change but has no caller yet, so it stays an honest opaque fallback.
+    """
+    x = operands[0]
+    in_shape = _shape_of(x)
+    if in_shape is None or any(d < 0 for d in in_shape):
+        return _opaque_decomp("aten_constant_pad_nd", operands[:1], meta, "pad", pattern_hint="pad")
+    pad_list = _fx_arg(meta, 1, None)
+    value = _fx_arg(meta, 2, 0)
+    if not isinstance(pad_list, (list, tuple)) or len(pad_list) % 2 != 0:
+        return _opaque_decomp("aten_constant_pad_nd", operands[:1], meta, "pad", pattern_hint="pad")
+    if value not in (0, 0.0, None):
+        return _opaque_decomp("aten_constant_pad_nd", operands[:1], meta, "pad", pattern_hint="pad")
+    rank = len(in_shape)
+    pads: list[tuple[int, int]] = [(0, 0)] * rank
+    for j in range(len(pad_list) // 2):
+        dim = rank - 1 - j
+        if dim < 0:
+            return _opaque_decomp("aten_constant_pad_nd", operands[:1], meta, "pad", pattern_hint="pad")
+        pads[dim] = (int(pad_list[2 * j]), int(pad_list[2 * j + 1]))
+    built = _zero_pad_ops(x, _t_elem(x), in_shape, pads)
+    if built is None:
+        return _opaque_decomp("aten_constant_pad_nd", operands[:1], meta, "pad", pattern_hint="pad")
+    ops, res, _ = built
+    if not ops:  # all-zero pad list: identity
+        return DecompResult(ops=[], result=x, region_ids=[], pattern_hint="pad")
+    rid = _next_region_id("pad")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("slice")
+    return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="pad")
+
+
+#: Element budget for the im2col intermediate (K x M). im2col expands the input by
+#: kh*kw/(sh*sw), so an overlapping conv on a large feature map can materialize a tensor far
+#: bigger than the activation itself. Above this many elements we take the direct-contraction
+#: path instead, which is memory-safe but does NOT match a matmul-only vector schedule (so it
+#: runs scalar on such a target). The choice is recorded as ``prov.conv_path`` either way --
+#: never silently.
+_IM2COL_MAX_ELEMS_DEFAULT = 64 << 20
+
+
+def _im2col_max_elems() -> int:
+    import os
+
+    raw = os.environ.get("M2M_IM2COL_MAX_ELEMS")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return _IM2COL_MAX_ELEMS_DEFAULT
+
+
+def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, padding,
+                        dilation, groups, elem):
+    """N-D-spatial conv as im2col + ``linalg.matmul`` (or ``linalg.batch_matmul`` per group).
+
+    Why a contraction rather than one fused conv ``linalg.generic``: a vector schedule that
+    matches contractions -- which is what a matmul-providing target ships -- then covers conv
+    with no conv-specific lowering, and a parallel-loop split over the matmul's N dimension
+    covers it too. A fused conv generic matches neither and falls back to scalar loops.
+
+    Shapes (2-D spatial; the caller normalizes 1-D to a degenerate H=1):
+
+      in   (N, C, H, W)      w (F, C/G, kh, kw)      out (N, F, Oh, Ow)
+
+    im2col is built as a rank-6/7 gather and then reshaped, because the flat column index
+    ``c*kh*kw + i*kw + j`` is not an affine function of separate loop dims -- keeping the
+    components as their own iteration dims makes every access map affine, and the reshape to
+    ``(K, M)`` is a pure row-major collapse.
+
+    Returns ``(ops, result_ssa)`` or ``None`` (caller falls back).
+    """
+    from xdsl.dialects.arith import AddfOp, MulfOp
+    from xdsl.dialects.builtin import AffineMapAttr, DenseArrayBase
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, TransposeOp, YieldOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    n_in, c_in, h_in, w_in = in_shape
+    f_out, c_per_g, kh, kw = w_shape
+    n_out, f_chk, h_out, w_out = out_shape
+    g = int(groups or 1)
+    if g < 1 or f_out % g or c_in % g:
+        return None
+    if n_in != n_out or f_out != f_chk or c_per_g != c_in // g:
+        return None
+    sh, sw = int(stride[0]), int(stride[1])
+    ph, pw = int(padding[0]), int(padding[1])
+    dh, dw = int(dilation[0]), int(dilation[1])
+    if min(sh, sw, dh, dw) < 1 or ph < 0 or pw < 0:
+        return None
+
+    # Cross-check the arithmetic against the traced output shape. A mismatch means we
+    # mis-read an argument; bail rather than emit a plausible-but-wrong contraction.
+    exp_h = (h_in + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+    exp_w = (w_in + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+    if (exp_h, exp_w) != (h_out, w_out):
+        return None
+
+    cg, fg = c_in // g, f_out // g
+    k_g = cg * kh * kw
+    m_dim = n_out * h_out * w_out
+    if k_g * m_dim * g > _im2col_max_elems():
+        return None
+
+    ops: list[Operation] = []
+    cur = inp
+    if ph or pw:
+        padded = _zero_pad_ops(inp, elem, list(in_shape), [(0, 0), (0, 0), (ph, ph), (pw, pw)])
+        if padded is None:
+            return None
+        ops += padded[0]
+        cur = padded[1]
+
+    D = AffineExpr.dimension
+    par = IteratorTypeAttr(IteratorType.PARALLEL)
+
+    def _gather(col_shape, in_map_exprs, n_dims):
+        """One all-parallel linalg.generic copying padded input into the column tensor."""
+        col_type = TensorType(elem, col_shape)
+        empty = _make_empty(col_type)
+        blk = Block(arg_types=[elem, elem])
+        blk.add_op(YieldOp(blk.args[0]))
+        gen = GenericOp(
+            inputs=[cur],
+            outputs=[empty.results[0]],
+            body=Region(blk),
+            indexing_maps=[AffineMapAttr(AffineMap(n_dims, 0, tuple(in_map_exprs))),
+                           AffineMapAttr(AffineMap(n_dims, 0, tuple(D(i) for i in range(n_dims))))],
+            iterator_types=[par] * n_dims,
+            result_types=[col_type],
+        )
+        return [empty, gen], gen.results[0]
+
+    if g == 1:
+        # dims: c=0, kh=1, kw=2, n=3, oh=4, ow=5
+        gops, col = _gather([c_in, kh, kw, n_out, h_out, w_out],
+                            [D(3), D(0), D(4) * sh + D(1) * dh, D(5) * sw + D(2) * dw], 6)
+        ops += gops
+        rs = _emit_reshape(col, [k_g, m_dim], elem)
+        wf = _emit_reshape(w, [f_out, k_g], elem)
+        if rs is None or wf is None:
+            return None
+        ops += rs[0] + wf[0]
+        mm_type = TensorType(elem, [f_out, m_dim])
+        z_ops, z_acc = _zero_acc(mm_type, elem)
+        mm = MatmulOp(inputs=[wf[1], rs[1]], outputs=[z_acc], res=[mm_type])
+        ops += [*z_ops, mm]
+        prod = mm.results[0]
+        prod_shape = [f_out, m_dim]
+    else:
+        # dims: g=0, cg=1, kh=2, kw=3, n=4, oh=5, ow=6
+        gops, col = _gather([g, cg, kh, kw, n_out, h_out, w_out],
+                            [D(4), D(0) * cg + D(1), D(5) * sh + D(2) * dh, D(6) * sw + D(3) * dw], 7)
+        ops += gops
+        rs = _emit_reshape(col, [g, k_g, m_dim], elem)
+        wf = _emit_reshape(w, [g, fg, k_g], elem)
+        if rs is None or wf is None:
+            return None
+        ops += rs[0] + wf[0]
+        # A grouped conv is inherently batched over the group axis. xDSL 0.65 registers no
+        # ``linalg.batch_matmul``, so this is the same batched ``linalg.generic`` m2m already
+        # emits for ``aten.bmm`` -- bare-AffineDimExpr maps, mulf+addf body, one reduction dim,
+        # which is the form a consumer's contraction matcher looks for. Be aware that a vector
+        # schedule matching contractions BY OP NAME will not claim a generic; ``prov.conv_path``
+        # says so explicitly rather than leaving a scalar fallback to be discovered later.
+        mm_type = TensorType(elem, [g, fg, m_dim])
+        z_ops, z_acc = _zero_acc(mm_type, elem)
+        Db = AffineExpr.dimension  # dims: g=0, fg=1, m=2, k=3
+        bblk = Block(arg_types=[elem, elem, elem])
+        bprod = MulfOp(bblk.args[0], bblk.args[1])
+        bacc = AddfOp(bblk.args[2], bprod.results[0])
+        bblk.add_op(bprod)
+        bblk.add_op(bacc)
+        bblk.add_op(YieldOp(bacc.results[0]))
+        mm = GenericOp(
+            inputs=[wf[1], rs[1]],
+            outputs=[z_acc],
+            body=Region(bblk),
+            indexing_maps=[AffineMapAttr(AffineMap(4, 0, (Db(0), Db(1), Db(3)))),
+                           AffineMapAttr(AffineMap(4, 0, (Db(0), Db(3), Db(2)))),
+                           AffineMapAttr(AffineMap(4, 0, (Db(0), Db(1), Db(2))))],
+            iterator_types=[par, par, par, IteratorTypeAttr(IteratorType.REDUCTION)],
+            result_types=[mm_type],
+        )
+        ops += [*z_ops, mm]
+        prod = mm.results[0]
+        prod_shape = [g, fg, m_dim]
+
+    # (F, N*Oh*Ow) -> (F, N, Oh, Ow) -> transpose to NCHW.
+    fr = _emit_reshape(prod, [f_out, n_out, h_out, w_out], elem)
+    if fr is None:
+        return None
+    ops += fr[0]
+    del prod_shape
+    out_type = TensorType(elem, [n_out, f_out, h_out, w_out])
+    t_empty = _make_empty(out_type)
+    tr = TransposeOp(input=fr[1], init=t_empty.results[0],
+                     permutation=DenseArrayBase.from_list(i64, [1, 0, 2, 3]),
+                     result=out_type)
+    ops += [t_empty, tr]
+    res = tr.results[0]
+
+    if bias is not None and isinstance(bias.type, TensorType):
+        from xdsl.dialects.arith import AddfOp
+
+        bias_map = AffineMap(4, 0, (AffineExpr.dimension(1),))
+        em = _elementwise([res, bias], out_type, _bin_build(AddfOp),
+                          input_maps=[_broadcast_map([n_out, f_out, h_out, w_out],
+                                                     [n_out, f_out, h_out, w_out]), bias_map],
+                          promote=True)
+        if em is None:
+            return None
+        ops += em[0]
+        res = em[1]
+    return ops, res
+
+
 def _try_direct_conv2d(operands, meta, in_shape, w_shape):
     """2-D conv as a single linalg.generic contraction (groups=1, no padding, dilation 1).
 
@@ -1799,176 +2086,250 @@ def decompose_conv2d_padding(operands, meta, node_name):
     return _opaque_decomp("aten_conv2d", operands[:1], meta, "conv", pattern_hint="conv2d")
 
 
-def decompose_convolution(operands, meta, node_name):
-    """aten.convolution.default → im2col + linalg.matmul + reshape (REQ-021).
+def _conv_transposed_to_direct(inp, w, *, in_shape, w_shape, out_shape, stride, padding,
+                               dilation, output_padding, groups, elem):
+    """Rewrite a transposed conv into an equivalent DIRECT conv, then let the caller lower it.
 
-    Most SIMT targets ship a matmul provider but no conv provider.
-    Decomposing here means every such target gets conv "for free" via
-    its existing matmul kernel, with no per-pack convolution lowering.
+    ConvTranspose is the gradient of a strided conv, and the textbook identity is exact:
+    insert ``stride-1`` zeros between input samples, pad by ``dilation*(k-1) - padding``
+    (plus ``output_padding`` on the high side), spatially flip the kernel and swap its
+    in/out channel axes, then run a stride-1 conv.
 
-    Shape contract:
+    Doing it this way -- rather than teaching the gather a transposed index -- keeps every
+    access map affine. The direct-index form needs ``(oh + p - kh) / s`` to divide exactly,
+    which is a predicate, not an affine expression.
 
-    - ``input``: ``(N, C, H, W)``
-    - ``weight``: ``(F, C, kH, kW)``
-    - ``output``: ``(N, F, H', W')`` — read straight off ``meta['val'].shape``.
+    Only ``groups == 1`` is handled; grouped transposed conv would need the flip to be
+    per-group and has no caller yet, so it stays an honest opaque fallback.
 
-    Decomposition (im2col + matmul):
-
-    - ``im2col``  ``(N, C, H, W)`` → ``(K, N*H'*W')`` where ``K = C*kH*kW``
-    - ``matmul``  ``W_flat (F, K) @ im2col (K, N*H'*W')`` → ``(F, N*H'*W')``
-    - ``reshape`` ``(F, N*H'*W')`` → ``(N, F, H', W')``
-
-    The im2col + reshape steps are opaque ``func.call``s with their own
-    ``region_id``s — providers can claim them or skip them (the pack
-    composer falls back to its own im2col helper when no provider
-    matches). The middle matmul is a real ``linalg.matmul`` with
-    ``compgen.region_id`` so any matmul provider claims it.
-
-    For unusual conv shapes (no static dimensions / non-MVP groups /
-    transposed conv), this falls back to the prior opaque-conv path.
+    Returns ``(ops, new_input, new_weight, new_in_shape, new_w_shape)`` or ``None``.
     """
-    from xdsl.dialects.func import CallOp
+    from xdsl.dialects.arith import ConstantOp
+    from xdsl.dialects.builtin import (AffineMapAttr, FloatAttr, IntegerAttr, IntegerType)
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import InsertSliceOp, SplatOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
 
-    # Need at least input + weight; bias is optional.
-    if len(operands) < 2:
-        return _opaque_decomp(
-            "aten_convolution",
-            list(operands[:3]),
-            meta,
-            "convolution",
-            pattern_hint="convolution",
-        )
+    if int(groups or 1) != 1:
+        return None
+    n_in, c_in, h_in, w_in = in_shape
+    c_w, f_per_g, kh, kw = w_shape          # transposed weight is (Cin, Cout/G, kh, kw)
+    n_out, f_out, h_out, w_out = out_shape
+    if c_w != c_in or f_per_g != f_out:
+        return None
+    sh, sw = int(stride[0]), int(stride[1])
+    ph, pw = int(padding[0]), int(padding[1])
+    dh, dw = int(dilation[0]), int(dilation[1])
+    oph, opw = (int(output_padding[0]), int(output_padding[1])) if output_padding else (0, 0)
+    lo_h, lo_w = dh * (kh - 1) - ph, dw * (kw - 1) - pw
+    hi_h, hi_w = lo_h + oph, lo_w + opw
+    if min(lo_h, lo_w, hi_h, hi_w) < 0:
+        return None                          # negative pad here would be a crop; not handled
 
-    in_v = operands[0]
-    w_v = operands[1]
-
-    # Pull static shapes off operand types. Bail to opaque for any
-    # non-rank-4 / dynamic-shape case; the existing opaque path is the
-    # safety net.
-    in_type = in_v.type
-    w_type = w_v.type
-    if not (isinstance(in_type, TensorType) and isinstance(w_type, TensorType)):
-        return _opaque_decomp(
-            "aten_convolution",
-            list(operands[:3]),
-            meta,
-            "convolution",
-            pattern_hint="convolution",
-        )
-    in_shape = in_type.get_shape()
-    w_shape = w_type.get_shape()
-    if len(in_shape) != 4 or len(w_shape) != 4:
-        return _opaque_decomp(
-            "aten_convolution",
-            list(operands[:3]),
-            meta,
-            "convolution",
-            pattern_hint="convolution",
-        )
-    if any(d <= 0 for d in (*in_shape, *w_shape)):
-        return _opaque_decomp(
-            "aten_convolution",
-            list(operands[:3]),
-            meta,
-            "convolution",
-            pattern_hint="convolution",
-        )
-
-    # Direct convolution as a single linalg.generic contraction, for the common
-    # 2-D, groups=1, no-padding, dilation-1 case (patch-embed convs). Falls through to
-    # the im2col path otherwise.
-    direct = _try_direct_conv2d(operands, meta, in_shape, w_shape)
-    if direct is not None:
-        return direct
-
-    val: Any = meta.get("val")
-    if val is None or not hasattr(val, "shape"):
-        return _opaque_decomp(
-            "aten_convolution",
-            list(operands[:3]),
-            meta,
-            "convolution",
-            pattern_hint="convolution",
-        )
-    out_shape = _static_shape(val.shape)
-    if len(out_shape) != 4 or any(d <= 0 for d in out_shape):
-        return _opaque_decomp(
-            "aten_convolution",
-            list(operands[:3]),
-            meta,
-            "convolution",
-            pattern_hint="convolution",
-        )
-
-    n_in, c_in, _h_in, _w_in = in_shape
-    f_out, c_w, kh, kw = w_shape
-    n_out, f_check, h_out, w_out = out_shape
-    if n_in != n_out or f_out != f_check or c_in != c_w:
-        # Group conv / weird channel layout — opaque fallback.
-        return _opaque_decomp(
-            "aten_convolution",
-            list(operands[:3]),
-            meta,
-            "convolution",
-            pattern_hint="convolution",
-        )
-
-    elem = w_type.element_type
-    k_dim = c_in * kh * kw
-    nhw = n_out * h_out * w_out
+    # Verify the identity reproduces the traced output shape before emitting anything.
+    dil_h, dil_w = (h_in - 1) * sh + 1, (w_in - 1) * sw + 1
+    eff_h, eff_w = dil_h + lo_h + hi_h, dil_w + lo_w + hi_w
+    if (eff_h - dh * (kh - 1) - 1 + 1, eff_w - dw * (kw - 1) - 1 + 1) != (h_out, w_out):
+        return None
 
     ops: list[Operation] = []
-    region_ids: list[str] = []
+    zero_attr = IntegerAttr(0, elem) if isinstance(elem, IntegerType) else FloatAttr(0.0, elem)
 
-    # 1. im2col: (N, C, H, W) → (K, N*H'*W'), opaque (target may
-    # ship a real im2col kernel, or the pack composer can do it).
-    im2col_type = TensorType(elem, [k_dim, nhw])
-    im2col_call = CallOp("aten_im2col", [in_v], [im2col_type])
-    im2col_rid = _next_region_id("im2col")
-    _attach_region_id(im2col_call, im2col_rid)
-    im2col_call.attributes["prov.dispatch_id"] = StringAttr(im2col_rid)
-    region_ids.append(im2col_rid)
-    ops.append(im2col_call)
+    # 1. stride-dilate the input: zeros between samples, via a strided insert_slice.
+    dil_shape = [n_in, c_in, dil_h, dil_w]
+    z0 = ConstantOp(zero_attr, elem)
+    base = SplatOp(z0.results[0], [], TensorType(elem, dil_shape))
+    ins = InsertSliceOp.from_static_parameters(
+        inp, base.results[0], [0, 0, 0, 0], [n_in, c_in, h_in, w_in], [1, 1, sh, sw])
+    ops += [z0, base, ins]
+    cur, cur_shape = ins.results[0], dil_shape
 
-    # 2. flatten weight (F, C, kH, kW) → (F, K) — opaque.
-    w_flat_type = TensorType(elem, [f_out, k_dim])
-    w_flat_call = CallOp("aten_flatten_weight", [w_v], [w_flat_type])
-    w_flat_rid = _next_region_id("flatten")
-    _attach_region_id(w_flat_call, w_flat_rid)
-    w_flat_call.attributes["prov.dispatch_id"] = StringAttr(w_flat_rid)
-    region_ids.append(w_flat_rid)
-    ops.append(w_flat_call)
+    # 2. full padding.
+    if lo_h or hi_h or lo_w or hi_w:
+        padded = _zero_pad_ops(cur, elem, cur_shape, [(0, 0), (0, 0), (lo_h, hi_h), (lo_w, hi_w)])
+        if padded is None:
+            return None
+        ops += padded[0]
+        cur, cur_shape = padded[1], padded[2]
 
-    # 3. linalg.matmul: W_flat (F, K) @ im2col (K, N*H'*W') → (F, N*H'*W').
-    mm_out_type = TensorType(elem, [f_out, nhw])
-    mm_empty = _make_empty(mm_out_type)
-    ops.append(mm_empty)
-    matmul = MatmulOp(
-        inputs=[w_flat_call.res[0], im2col_call.res[0]],
-        outputs=[mm_empty.results[0]],
-        res=[mm_out_type],
+    # 3. flip the kernel spatially and swap its channel axes: (Cin, Cout, kh, kw) ->
+    #    (Cout, Cin, kh, kw) reversed on both spatial dims. One all-parallel copy; the
+    #    reversal is the affine expression (k-1) - d, which linalg accepts on an input map.
+    D = AffineExpr.dimension
+    wf_shape = [f_out, c_in, kh, kw]
+    wf_type = TensorType(elem, wf_shape)
+    wf_empty = _make_empty(wf_type)
+    blk = Block(arg_types=[elem, elem])
+    blk.add_op(YieldOp(blk.args[0]))
+    flip = GenericOp(
+        inputs=[w],
+        outputs=[wf_empty.results[0]],
+        body=Region(blk),
+        indexing_maps=[
+            AffineMapAttr(AffineMap(4, 0, (D(1), D(0),
+                                           AffineExpr.constant(kh - 1) - D(2),
+                                           AffineExpr.constant(kw - 1) - D(3)))),
+            AffineMapAttr(AffineMap(4, 0, (D(0), D(1), D(2), D(3)))),
+        ],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * 4,
+        result_types=[wf_type],
     )
-    mm_rid = _next_region_id("matmul")
-    _attach_region_id(matmul, mm_rid)
-    matmul.attributes["prov.dispatch_id"] = StringAttr(mm_rid)
-    region_ids.append(mm_rid)
-    ops.append(matmul)
+    ops += [wf_empty, flip]
+    return ops, cur, flip.results[0], cur_shape, wf_shape
 
-    # 4. reshape (F, N*H'*W') → (N, F, H', W') — opaque.
-    out_type = TensorType(elem, [n_out, f_out, h_out, w_out])
-    reshape_call = CallOp("aten_reshape", [matmul.res[0]], [out_type])
-    reshape_rid = _next_region_id("reshape")
-    _attach_region_id(reshape_call, reshape_rid)
-    reshape_call.attributes["prov.dispatch_id"] = StringAttr(reshape_rid)
-    region_ids.append(reshape_rid)
-    ops.append(reshape_call)
 
-    return DecompResult(
-        ops=ops,
-        result=reshape_call.res[0],
-        region_ids=region_ids,
-        pattern_hint="convolution_im2col_matmul",
-    )
+def decompose_convolution(operands, meta, node_name):
+    """aten.convolution.default -> im2col + linalg.matmul (REQ-021).
+
+    Most targets ship a matmul provider and no conv provider, so lowering conv to a
+    contraction gives every such target conv for free -- and, on a vector target whose
+    schedule matches contractions, gives it vectorization and a parallel-loop split too. A
+    fused conv ``linalg.generic`` matches neither and falls back to scalar loops, which is why
+    the contraction form is preferred over the direct one even though both are valid IR.
+
+    Handles, all by normalizing to a 2-D-spatial stride-1-or-more direct conv:
+
+    - **1-D** (``Conv1d``): rank-3 input/weight are viewed as a degenerate ``H=1`` 2-D conv
+      and the result is reshaped back, so no separate 1-D path exists.
+    - **padding**: materialized as ``splat 0`` + ``insert_slice`` (``_zero_pad_ops``).
+    - **groups > 1** (incl. depthwise): the contraction becomes a ``linalg.batch_matmul``
+      batched over the group axis.
+    - **transposed** (``ConvTranspose``): rewritten to a direct conv by the exact
+      zero-insert / full-pad / flipped-kernel identity (``_conv_transposed_to_direct``).
+    - **dilation**: folded into the gather's affine access map.
+
+    Falls back to ``_try_direct_conv2d`` when the im2col intermediate would exceed
+    ``M2M_IM2COL_MAX_ELEMS`` elements, and to an opaque ``func.call`` when a shape is dynamic
+    or an argument combination is genuinely unhandled. The path taken is recorded on every
+    emitted op as ``prov.conv_path`` so a downstream audit can see whether a conv landed on a
+    contraction or not -- never silently.
+    """
+    if len(operands) < 2:
+        return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
+                              pattern_hint="convolution")
+
+    in_v, w_v = operands[0], operands[1]
+    bias_v = operands[2] if len(operands) >= 3 and isinstance(operands[2].type, TensorType) else None
+    in_type, w_type = in_v.type, w_v.type
+    val: Any = meta.get("val")
+    if not (isinstance(in_type, TensorType) and isinstance(w_type, TensorType)):
+        return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
+                              pattern_hint="convolution")
+    if val is None or not hasattr(val, "shape"):
+        return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
+                              pattern_hint="convolution")
+
+    in_shape = list(in_type.get_shape())
+    w_shape = list(w_type.get_shape())
+    out_shape = _static_shape(val.shape)
+    rank = len(in_shape)
+    if rank not in (3, 4) or len(w_shape) != rank or len(out_shape) != rank:
+        return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
+                              pattern_hint="convolution")
+    if any(d <= 0 for d in (*in_shape, *w_shape, *out_shape)):
+        return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
+                              pattern_hint="convolution")
+    elem = w_type.element_type
+    if in_type.element_type != elem:
+        return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
+                              pattern_hint="convolution")
+
+    def _pair(v, default):
+        if v is None:
+            return [default, default]
+        if isinstance(v, (list, tuple)):
+            vals = [int(x) for x in v]
+            return [default, vals[0]] if rank == 3 else vals[:2]
+        return [default, int(v)] if rank == 3 else [int(v), int(v)]
+
+    # Two aten spellings reach here with DIFFERENT arg layouts, and conflating them is a
+    # silent-wrongness trap rather than a crash:
+    #   convolution(in, w, bias, stride, padding, dilation, transposed, output_padding, groups)
+    #   conv2d     (in, w, bias, stride, padding, dilation, groups)
+    # so in the conv2d spelling index 6 is GROUPS, not `transposed` -- a depthwise conv2d
+    # (groups=32) would otherwise be read as a transposed conv. Branch on the recorded target.
+    target = str(meta.get("_aten_target") or "")
+    is_full_conv = target.startswith("aten.convolution")
+    stride = _pair(_fx_arg(meta, 3, None), 1)
+    padding = _pair(_fx_arg(meta, 4, None), 0)
+    dilation = _pair(_fx_arg(meta, 5, None), 1)
+    if is_full_conv:
+        transposed = bool(_fx_arg(meta, 6, False))
+        output_padding = _pair(_fx_arg(meta, 7, None), 0)
+        groups = int(_fx_arg(meta, 8, 1) or 1)
+    else:
+        transposed = False
+        output_padding = [0, 0]
+        groups = int(_fx_arg(meta, 6, 1) or 1)
+
+    ops: list[Operation] = []
+    cur_in, cur_w = in_v, w_v
+
+    # 1-D -> degenerate 2-D: (N,C,L) -> (N,C,1,L), (F,C,k) -> (F,C,1,k).
+    if rank == 3:
+        in4 = [in_shape[0], in_shape[1], 1, in_shape[2]]
+        w4 = [w_shape[0], w_shape[1], 1, w_shape[2]]
+        out4 = [out_shape[0], out_shape[1], 1, out_shape[2]]
+        ri = _emit_reshape(cur_in, in4, elem)
+        rw = _emit_reshape(cur_w, w4, elem)
+        if ri is None or rw is None:
+            return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
+                                  pattern_hint="convolution")
+        ops += ri[0] + rw[0]
+        cur_in, cur_w = ri[1], rw[1]
+        in_shape, w_shape, out_shape = in4, w4, out4
+
+    if transposed:
+        rewritten = _conv_transposed_to_direct(
+            cur_in, cur_w, in_shape=in_shape, w_shape=w_shape, out_shape=out_shape,
+            stride=stride, padding=padding, dilation=dilation,
+            output_padding=output_padding, groups=groups, elem=elem)
+        if rewritten is None:
+            return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
+                                  pattern_hint="convolution")
+        t_ops, cur_in, cur_w, in_shape, w_shape = rewritten
+        ops += t_ops
+        stride, padding, output_padding = [1, 1], [0, 0], [0, 0]
+
+    built = _conv_im2col_matmul(
+        cur_in, cur_w, bias_v, in_shape=in_shape, w_shape=w_shape, out_shape=out_shape,
+        stride=stride, padding=padding, dilation=dilation, groups=groups, elem=elem)
+    conv_path = "im2col_matmul"
+    if built is None:
+        # Memory-bounded or unhandled: the fused direct contraction is still correct IR.
+        m = dict(meta)
+        m["_fx_args"] = (cur_in, cur_w, bias_v, stride, padding, dilation, False,
+                         output_padding, groups)
+        direct = _try_direct_conv2d([cur_in, cur_w] + ([bias_v] if bias_v is not None else []),
+                                    m, in_shape, w_shape)
+        if direct is None:
+            return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
+                                  pattern_hint="convolution")
+        ops += direct.ops
+        res = direct.result
+        conv_path = "direct_contraction"
+    else:
+        ops += built[0]
+        res = built[1]
+
+    # Fold the degenerate H back out for the 1-D case.
+    if rank == 3:
+        val_shape = _static_shape(val.shape)
+        back = _emit_reshape(res, val_shape, elem)
+        if back is None:
+            return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
+                                  pattern_hint="convolution")
+        ops += back[0]
+        res = back[1]
+
+    rid = _next_region_id("conv")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("conv")
+        op.attributes["prov.conv_path"] = StringAttr(conv_path)
+    return DecompResult(ops=ops, result=res, region_ids=[rid],
+                        pattern_hint="convolution_im2col_matmul")
 
 
 def decompose_select_int(operands, meta, node_name):
@@ -4371,6 +4732,7 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     # (not ``aten.convolution.default``). Same shape contract; same
     # decomposition function consumes both.
     "aten.conv2d.default": decompose_convolution,
+    "aten.constant_pad_nd.default": decompose_constant_pad_nd,
     "aten.embedding.default": decompose_embedding,
     "aten.sigmoid.default": decompose_sigmoid,
     "aten.neg.default": decompose_neg,

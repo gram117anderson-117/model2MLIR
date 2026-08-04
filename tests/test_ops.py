@@ -15,6 +15,47 @@ X = (torch.randn(4, 8),)
 XY = (torch.randn(4, 8), torch.randn(4, 8))
 XPOS = (torch.randn(4, 8).abs() + 1,)
 
+
+def _conv_cases():
+    """The conv/pad variants the vision, audio and control workloads need.
+
+    Before these lowered, only a rank-4 groups=1 zero-padded conv reached real linalg;
+    Conv1d, any non-zero padding, groups>1 and ConvTranspose each left an opaque
+    ``func.call`` -- an undefined symbol at link time, not a slow path. Numerical agreement
+    with torch is gated on the consumer side (the emitted MLIR has to be executed to check
+    an index map, which needs a runtime this repo does not host); here we gate that they
+    lower with no opaque calls and with the result type eager produced.
+    """
+    from torch import nn
+
+    specs = [
+        ("2d_patchembed", nn.Conv2d(3, 16, 4, stride=4), (1, 3, 16, 16)),
+        ("2d_pad1", nn.Conv2d(4, 8, 3, padding=1), (1, 4, 8, 8)),
+        ("2d_pad1_stride2", nn.Conv2d(4, 8, 3, stride=2, padding=1), (1, 4, 8, 8)),
+        ("2d_k7_s4_p3", nn.Conv2d(1, 8, 7, stride=4, padding=3), (1, 1, 12, 16)),
+        ("2d_depthwise", nn.Conv2d(8, 8, 3, padding=1, groups=8), (1, 8, 6, 6)),
+        ("2d_groups2", nn.Conv2d(4, 8, 3, padding=1, groups=2), (1, 4, 6, 6)),
+        ("2d_dilation2", nn.Conv2d(4, 8, 3, padding=2, dilation=2), (1, 4, 8, 8)),
+        ("2d_nobias", nn.Conv2d(4, 8, 3, padding=1, bias=False), (1, 4, 6, 6)),
+        ("1d_k3_p1", nn.Conv1d(8, 12, 3, padding=1), (1, 8, 20)),
+        ("1d_k3_s2_p1", nn.Conv1d(8, 12, 3, stride=2, padding=1), (1, 8, 20)),
+        ("transpose2d_s2_p1", nn.ConvTranspose2d(8, 4, 3, stride=2, padding=1), (1, 8, 6, 6)),
+        ("transpose2d_outpad", nn.ConvTranspose2d(8, 4, 3, stride=2, padding=1,
+                                                 output_padding=1), (1, 8, 6, 6)),
+        ("transpose2d_s1_p0", nn.ConvTranspose2d(8, 4, 3), (1, 8, 6, 6)),
+        ("transpose2d_s3_p2", nn.ConvTranspose2d(4, 6, 5, stride=3, padding=2), (1, 4, 5, 5)),
+        ("pad2d_sym", nn.ZeroPad2d(2), (1, 3, 6, 6)),
+        ("pad2d_asym", nn.ZeroPad2d((1, 2, 3, 0)), (1, 3, 6, 6)),
+        ("pad1d", nn.ConstantPad1d((2, 3), 0.0), (1, 4, 9)),
+    ]
+    torch.manual_seed(0)
+    cases = []
+    for nm, mod, shape in specs:
+        mod = mod.eval()
+        cases.append((f"conv_{nm}", (lambda x, _m=mod: _m(x)), (torch.randn(*shape),)))
+    return cases
+
+
 CASES = [
     ("view", lambda a: a.view(2, 16), X),
     ("reshape", lambda a: a.reshape(8, 4), X),
@@ -90,6 +131,7 @@ CASES = [
     ("unbind", lambda a: torch.unbind(a, 2)[1], (torch.randn(1, 4, 3, 8),)),
     ("repeat_interleave", lambda a: a.repeat_interleave(2, dim=1), (torch.randn(1, 4, 8),)),
     ("matmul_3d_2d", lambda a, b: a @ b, (torch.randn(1, 30, 32), torch.randn(32, 64))),
+    *_conv_cases(),
 ]
 
 # Data-dependent ops: output has a dynamic (?) dim, so shape can't match eager exactly --
@@ -115,3 +157,68 @@ def test_dynamic_op_lowers_to_standard_dialects(name, fn, inputs):
     v = validate_op(fn, inputs, name=name)
     assert v.error is None, v.error
     assert v.lowered, f"{name} left opaque calls: {v.opaque_calls}"
+
+
+# The conv variants a consumer's vector schedule can claim. A schedule matches contractions
+# BY OP NAME, so a conv that lowers to a fused conv-shaped linalg.generic is correct but gets
+# neither vectorization nor a parallel-loop split -- it runs scalar. These assert conv lands on
+# a real linalg.matmul, which is the property that makes conv fast on a matmul-only target.
+_CONV_TO_MATMUL = [
+    ("patchembed", torch.nn.Conv2d(3, 16, 4, stride=4), (1, 3, 16, 16)),
+    ("padded", torch.nn.Conv2d(4, 8, 3, padding=1), (1, 4, 8, 8)),
+    ("strided_padded", torch.nn.Conv2d(4, 8, 3, stride=2, padding=1), (1, 4, 8, 8)),
+    ("dilated", torch.nn.Conv2d(4, 8, 3, padding=2, dilation=2), (1, 4, 8, 8)),
+    ("conv1d", torch.nn.Conv1d(8, 12, 3, padding=1), (1, 8, 20)),
+    ("transposed", torch.nn.ConvTranspose2d(8, 4, 3, stride=2, padding=1), (1, 8, 6, 6)),
+]
+
+
+@pytest.mark.parametrize("name,mod,shape", _CONV_TO_MATMUL, ids=[c[0] for c in _CONV_TO_MATMUL])
+def test_conv_lowers_to_a_named_matmul(name, mod, shape):
+    import m2m
+
+    torch.manual_seed(0)
+    mod = mod.eval()
+
+    class _W(torch.nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def forward(self, x):
+            return self.m(x)
+
+    r = m2m.convert(_W(mod).eval(), (torch.randn(*shape),), backend="fx_importer",
+                    level="linalg-on-tensors")
+    assert r.ok, f"{name} failed to convert"
+    assert "linalg.matmul" in r.mlir_text, (
+        f"{name} did not lower to a named linalg.matmul; a matmul-matching vector schedule "
+        f"cannot claim it and it would run scalar")
+    assert 'prov.conv_path = "im2col_matmul"' in r.mlir_text, (
+        f"{name} took an unexpected conv path (prov.conv_path should record it)")
+
+
+def test_grouped_conv_records_its_non_matmul_path():
+    """A grouped conv is batched over the group axis, and xDSL registers no
+    ``linalg.batch_matmul``, so it lands on a batched ``linalg.generic``. That is correct but
+    NOT claimable by a name-matching contraction schedule -- assert the provenance says so
+    rather than letting a scalar fallback be discovered on a board."""
+    import m2m
+
+    torch.manual_seed(0)
+    dw = torch.nn.Conv2d(8, 8, 3, padding=1, groups=8).eval()
+
+    class _W(torch.nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def forward(self, x):
+            return self.m(x)
+
+    r = m2m.convert(_W(dw).eval(), (torch.randn(1, 8, 6, 6),), backend="fx_importer",
+                    level="linalg-on-tensors")
+    assert r.ok
+    assert "aten_convolution" not in r.mlir_text, "grouped conv fell back to an opaque call"
+    assert 'prov.conv_path = "im2col_matmul"' in r.mlir_text
+    assert "linalg.generic" in r.mlir_text

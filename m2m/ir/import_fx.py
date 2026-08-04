@@ -115,7 +115,8 @@ _reg("contraction", "matmul", "batch_matmul", "int_matmul", "addmm", "linear",
 _reg("normalization", "softmax", "layer_norm")
 _reg("attention", "sdpa")
 _reg("layout", "view", "reshape", "unsqueeze", "squeeze", "flatten", "permute",
-     "transpose", "expand", "slice", "select", "slice_scatter", "split", "repeat")
+     "transpose", "expand", "slice", "select", "slice_scatter", "split", "repeat",
+     "pad")
 _reg("concat", "cat", "concat")
 _reg("gather_scatter", "gather", "embedding", "embedding_lookup", "index_gather",
      "mask_gather", "index_put", "mask_scatter")
