@@ -112,8 +112,9 @@ _reg("arg_reduce", "aten_min_dim", "aten_max_dim", "aten_argmin", "aten_argmax")
 _reg("contraction", "matmul", "batch_matmul", "int_matmul", "addmm", "linear",
      "conv2d", "convolution", "convolution_im2col_matmul",
      "weight_int8pack_mm", "weight_int4pack_mm", "weight_int4pack_qm")
-_reg("normalization", "softmax", "layer_norm")
+_reg("normalization", "softmax", "layer_norm", "batch_norm")
 _reg("spectral", "fft_rfft2", "fft_irfft2")
+_reg("resize", "resize")
 _reg("attention", "sdpa")
 _reg("layout", "view", "reshape", "unsqueeze", "squeeze", "flatten", "permute",
      "transpose", "expand", "slice", "select", "slice_scatter", "split", "repeat",

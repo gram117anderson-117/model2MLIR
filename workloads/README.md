@@ -84,6 +84,13 @@ If a new op shows up opaque, add its decomposition (one entry in
 far have needed at most one new op each (RDT=`squeeze`, GR00T=`bitwise_not`, xr0=`repeat`,
 BitVLA=`mean.default`).
 
+The four vision/audio/control workloads below broke that pattern and are the honest exception:
+they are the first conv-heavy, spectral and recurrent models here, and between them they needed
+the conv family generalized (padding, rank-3/Conv1d, groups, transposed), `torch.fft` as real DFT
+contractions with a `(re, im)` pair layout for complex tensors, bilinear/nearest resize, inference
+BatchNorm, `constant_pad_nd`, and integer `abs`. Those are shared capability rather than per-model
+glue — see each workload's README for which one needed what.
+
 ## Models & status
 Each has a `loader.py` + `capture.toml`; per-model env notes in `workloads/<model>/README.md`.
 ```bash
@@ -102,8 +109,12 @@ python workloads/capture.py --all     # capture/refresh all 10 in fp32+int8+fp8
 | bitvla | 0 | 0 | 0 | int8/fp8 quantize lm_head only (BitNet W1.58 stays) |
 | groot_n1d7 | 0 | 0 | 0 | |
 | pi05 | 0 | 0 | 0 | 3.6B; recursive HOP flattener + SDPA/N-D-matmul/dequant decompositions (was 5193) |
+| spectformer | 0 | 0 | — | SpectFormer-Ti; **torch.fft** spectral gating + trained ImageNet weights |
+| whisper_tiny | 0 | 0 | — | encoder + ONE decoder step; Conv1d stem |
+| lstmnetvit | 0 | 0 | — | ViT+LSTM depth controller; PixelShuffle + bilinear upsample |
+| deepjscc | 0 | 0 | — | JSCC codec only (not DiffJSCC's diffusion stage); ConvTranspose + BN |
 
-**All 10 models lower to 0 opaque ops in fp32, int8, and fp8 (30/30 artifacts).** Each capture
+**All 10 original models lower to 0 opaque ops in fp32, int8, and fp8 (30/30 artifacts).** Each capture
 also emits `<model>{,_int8,_fp8}.safetensors` (+ manifest) with the real weights, and (with
 `--sections`) per-source-module `.mlir` files. "0" = 0 opaque ops. Re-run `capture.py <model>`
 to regenerate after converter changes.

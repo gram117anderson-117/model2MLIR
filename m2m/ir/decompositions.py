@@ -2873,6 +2873,271 @@ def _complex_mul(operands, meta, node_name):
     return DecompResult(ops=ops, result=packed[1], region_ids=[rid], pattern_hint="mul")
 
 
+def decompose_abs(operands, meta, node_name):
+    """aten.abs.default -> linalg.generic{math.absf | math.absi}, chosen by element type.
+
+    ``abs`` on an INTEGER tensor is not exotic: torch decomposes reflection padding into index
+    reflection, which takes ``abs`` of int64 index tensors. Emitting ``math.absf`` for those
+    produced ill-typed IR that the verify-fallback then discarded into an opaque call, so a
+    model using ReflectionPad2d failed to link for a reason nothing named.
+    """
+    import xdsl.dialects.math as _M
+    from xdsl.dialects.builtin import IntegerType
+
+    src_type = operands[0].type if operands else None
+    if isinstance(src_type, TensorType) and isinstance(src_type.element_type, IntegerType):
+        cls = _M.AbsIOp
+    else:
+        cls = _M.AbsFOp
+    real = _unary_elementwise(operands, meta, "abs", _un_build(cls))
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_abs", operands[:1], meta, "elementwise", pattern_hint="abs")
+
+
+def decompose_batch_norm_inference(operands, meta, node_name):
+    """aten._native_batch_norm_legit_no_training(x, w, b, mean, var, momentum, eps).
+
+    Inference batch norm is pure elementwise arithmetic over the channel axis: statistics are
+    frozen buffers, not reductions. Emitted as
+    ``(x - mean) * rsqrt(var + eps) * weight + bias`` with each rank-1 channel operand
+    broadcast over dim 1, so no reduction op is needed at all.
+
+    ``weight``/``bias`` are optional (``affine=False``), and the op returns a 3-tuple whose
+    auxiliary saved-statistics outputs are inference-time dead; the importer already surfaces
+    element 0 as the node's value (REQ-020).
+    """
+    from xdsl.dialects.arith import AddfOp, ConstantOp, MulfOp, SubfOp
+    from xdsl.dialects.builtin import FloatAttr
+    from xdsl.dialects.math import RsqrtOp
+
+    if len(operands) < 3:
+        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
+                              "normalization", pattern_hint="batch_norm")
+    x = operands[0]
+    x_shape = _shape_of(x)
+    val: Any = meta.get("val")
+    if x_shape is None or val is None or len(x_shape) < 2:
+        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
+                              "normalization", pattern_hint="batch_norm")
+    primary = val[0] if isinstance(val, (tuple, list)) and val else val
+    out_shape = _static_shape(getattr(primary, "shape", []))
+    if list(out_shape) != list(x_shape):
+        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
+                              "normalization", pattern_hint="batch_norm")
+    elem = _t_elem(x)
+    rt = TensorType(elem, list(x_shape))
+
+    # Positional operands, per the aten schema. `weight` and `bias` may be absent (affine=False)
+    # or the running stats may arrive as buffers; anything not a rank-1 tensor is refused rather
+    # than guessed at, because guessing which slot is which is how normalization silently
+    # scales by the wrong tensor.
+    def _rank1(i):
+        if len(operands) <= i:
+            return None
+        o = operands[i]
+        s = _shape_of(o)
+        if s is None or len(s) != 1 or s[0] != x_shape[1] or _t_elem(o) != elem:
+            return None
+        return o
+
+    weight, bias, mean, var = _rank1(1), _rank1(2), _rank1(3), _rank1(4)
+    if mean is None or var is None:
+        # torchAO/export sometimes drops the affine operands, shifting the stats up two slots.
+        mean, var = _rank1(1), _rank1(2)
+        weight = bias = None
+    if mean is None or var is None:
+        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
+                              "normalization", pattern_hint="batch_norm")
+    eps = _fx_arg(meta, 6, 1e-5)
+    try:
+        eps = float(eps)
+    except (TypeError, ValueError):
+        eps = 1e-5
+
+    chan_map = _channel_broadcast_map(len(x_shape))
+    ident = _broadcast_map(list(x_shape), list(x_shape))
+    if chan_map is None or ident is None:
+        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
+                              "normalization", pattern_hint="batch_norm")
+    ops: list[Operation] = []
+
+    def _bin(a, b, build, maps):
+        em = _elementwise([a, b], rt, build, input_maps=maps, promote=True)
+        if em is None:
+            return None
+        ops.extend(em[0])
+        return em[1]
+
+    cur = _bin(x, mean, _bin_build(SubfOp), [ident, chan_map])
+    if cur is None:
+        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
+                              "normalization", pattern_hint="batch_norm")
+    # rsqrt(var + eps) on the rank-1 channel vector, so the reciprocal square root is computed
+    # once per channel rather than once per element.
+    var_t = TensorType(elem, [x_shape[1]])
+    eps_c = ConstantOp(FloatAttr(eps, elem), elem)
+    from xdsl.dialects.tensor import SplatOp
+
+    eps_t = SplatOp(eps_c.results[0], [], var_t)
+    ops += [eps_c, eps_t]
+    ve = _elementwise([var, eps_t.results[0]], var_t, _bin_build(AddfOp))
+    if ve is None:
+        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
+                              "normalization", pattern_hint="batch_norm")
+    ops += ve[0]
+    inv_ops, inv_ssa = _rank1_rsqrt(ve[1], var_t, elem)
+    ops += inv_ops
+    cur = _bin(cur, inv_ssa, _bin_build(MulfOp), [ident, chan_map])
+    if cur is None:
+        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
+                              "normalization", pattern_hint="batch_norm")
+    if weight is not None:
+        cur = _bin(cur, weight, _bin_build(MulfOp), [ident, chan_map])
+    if cur is not None and bias is not None:
+        cur = _bin(cur, bias, _bin_build(AddfOp), [ident, chan_map])
+    if cur is None:
+        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
+                              "normalization", pattern_hint="batch_norm")
+    rid = _next_region_id("batch_norm")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("normalization")
+    return DecompResult(ops=ops, result=cur, region_ids=[rid], pattern_hint="batch_norm")
+
+
+def _rank1_rsqrt(src, rt: TensorType, elem):
+    """``math.rsqrt`` over a rank-1 tensor, as ``(ops, ssa)``."""
+    from xdsl.dialects.builtin import AffineMapAttr
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.math import RsqrtOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    empty = _make_empty(rt)
+    blk = Block(arg_types=[elem, elem])
+    r = RsqrtOp(blk.args[0])
+    blk.add_op(r)
+    blk.add_op(YieldOp(r.results[0]))
+    ident = AffineMapAttr(AffineMap(1, 0, (AffineExpr.dimension(0),)))
+    gen = GenericOp(
+        inputs=[src],
+        outputs=[empty.results[0]],
+        body=Region(blk),
+        indexing_maps=[ident, ident],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)],
+        result_types=[rt],
+    )
+    return [empty, gen], gen.results[0]
+
+
+def _channel_broadcast_map(rank: int):
+    """Affine map projecting an NCHW... iteration space onto a rank-1 per-CHANNEL operand.
+
+    ``_broadcast_map`` aligns a lower-rank operand to the TRAILING dims (numpy rules), which is
+    right for a bias over [M, N] but wrong here: a batch-norm statistic is indexed by dim 1.
+    """
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    if rank < 2:
+        return None
+    return AffineMap(rank, 0, (AffineExpr.dimension(1),))
+
+
+def _resize_matrix(n_in: int, n_out: int, *, align_corners: bool, nearest: bool):
+    """``(n_in, n_out)`` weight matrix for a 1-D resize -- the transform as pure data.
+
+    Every size is static, so the source positions and interpolation weights are compile-time
+    constants and the whole resize is a contraction against this matrix. Same reasoning as the
+    DFT twiddles above: it lands on ``linalg.matmul``, so it inherits the consumer's vector
+    schedule instead of needing a resize kernel.
+    """
+    import math
+
+    mat = [[0.0] * n_out for _ in range(n_in)]
+    for i in range(n_out):
+        if nearest:
+            src = i * (n_in / n_out)
+            y = min(int(math.floor(src)), n_in - 1)
+            mat[y][i] += 1.0
+            continue
+        if align_corners:
+            src = 0.0 if n_out == 1 else i * (n_in - 1) / (n_out - 1)
+        else:
+            src = max((i + 0.5) * (n_in / n_out) - 0.5, 0.0)
+        y0 = min(int(math.floor(src)), n_in - 1)
+        y1 = min(y0 + 1, n_in - 1)
+        t = src - y0
+        mat[y0][i] += 1.0 - t
+        mat[y1][i] += t
+    return mat
+
+
+def _resize_axis(x, shape: list[int], axis: int, mat, n_out: int, elem):
+    """Resize one axis by contracting it with ``mat``. Returns ``(ops, ssa, new_shape)``."""
+    mv = _move_axis_last(x, shape, axis, elem)
+    if mv is None:
+        return None
+    ops, flat, rest = mv
+    m = 1
+    for d in rest:
+        m *= d
+    c_ops, c_ssa = _const_matrix(mat, elem)
+    ops += c_ops
+    mm_ops, prod = _matmul_2d(flat, c_ssa, m, n_out, elem)
+    ops += mm_ops
+    back = _restore_axis(prod, rest, n_out, axis, len(shape), elem)
+    if back is None:
+        return None
+    ops += back[0]
+    new_shape = list(shape)
+    new_shape[axis] = n_out
+    return ops, back[1], new_shape
+
+
+def _decompose_upsample2d(operands, meta, node_name, *, nearest: bool, align_arg: int | None):
+    """aten.upsample_{bilinear,nearest}2d.vec -> two resize contractions (H then W)."""
+    x = operands[0]
+    in_shape = _shape_of(x)
+    val: Any = meta.get("val")
+    name = "aten_upsample_nearest2d_vec" if nearest else "aten_upsample_bilinear2d_vec"
+    if in_shape is None or val is None or len(in_shape) != 4 or any(d <= 0 for d in in_shape):
+        return _opaque_decomp(name, operands[:1], meta, "resize", pattern_hint="resize")
+    out_shape = _static_shape(val.shape)
+    if len(out_shape) != 4 or out_shape[:2] != list(in_shape[:2]) or any(d <= 0 for d in out_shape):
+        return _opaque_decomp(name, operands[:1], meta, "resize", pattern_hint="resize")
+    align = bool(_fx_arg(meta, align_arg, False)) if align_arg is not None else False
+    elem = _t_elem(x)
+    ops: list[Operation] = []
+    cur, cur_shape = x, list(in_shape)
+    for axis in (2, 3):
+        if cur_shape[axis] == out_shape[axis]:
+            continue
+        mat = _resize_matrix(cur_shape[axis], out_shape[axis], align_corners=align, nearest=nearest)
+        step = _resize_axis(cur, cur_shape, axis, mat, out_shape[axis], elem)
+        if step is None:
+            return _opaque_decomp(name, operands[:1], meta, "resize", pattern_hint="resize")
+        ops += step[0]
+        cur, cur_shape = step[1], step[2]
+    if cur is x:
+        return DecompResult(ops=[], result=x, region_ids=[], pattern_hint="resize")
+    rid = _next_region_id("resize")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("resize")
+    return DecompResult(ops=ops, result=cur, region_ids=[rid], pattern_hint="resize")
+
+
+def decompose_upsample_bilinear2d(operands, meta, node_name):
+    """aten.upsample_bilinear2d.vec(input, output_size, align_corners, scale_factors)."""
+    return _decompose_upsample2d(operands, meta, node_name, nearest=False, align_arg=2)
+
+
+def decompose_upsample_nearest2d(operands, meta, node_name):
+    """aten.upsample_nearest2d.vec(input, output_size, scale_factors) -- no align_corners."""
+    return _decompose_upsample2d(operands, meta, node_name, nearest=True, align_arg=None)
+
+
 def decompose_select_int(operands, meta, node_name):
     """aten.select.int(input, dim, index) -> rank-reducing tensor.extract_slice (family slice)."""
     if not operands or not isinstance(operands[0].type, TensorType):
@@ -2892,11 +3157,30 @@ def decompose_select_int(operands, meta, node_name):
     sizes[dim] = 1
     from xdsl.dialects.tensor import ExtractSliceOp
 
-    op = ExtractSliceOp.from_static_parameters(src, offsets, sizes, [1] * rank, reduce_rank=True)
+    # Slice at FULL rank and reshape to the traced output shape, rather than asking
+    # extract_slice to rank-reduce. A rank-reducing extract_slice drops EVERY unit dim in
+    # `sizes`, not just the selected one, so selecting from e.g. (2,1,2,6,32) yielded
+    # (2,6,32) where torch says (1,2,6,32) -- and every consumer then saw the wrong rank.
+    # (This surfaced as a permute silently falling back to opaque: the emitted transpose was
+    # ill-typed and the verify-fallback discarded it.)
+    val: Any = meta.get("val")
+    out_shape = _static_shape(getattr(val, "shape", [])) if val is not None else None
+    if not out_shape or any(d < 0 for d in out_shape):
+        return _opaque_decomp("aten_select", operands[:1], meta, "layout", pattern_hint="select")
+    elem = src.type.element_type
+    op = ExtractSliceOp.from_static_parameters(src, offsets, sizes, [1] * rank)
+    ops: list[Operation] = [op]
+    res = op.results[0]
+    red = _emit_reshape(res, list(out_shape), elem)
+    if red is None:
+        return _opaque_decomp("aten_select", operands[:1], meta, "layout", pattern_hint="select")
+    ops += red[0]
+    res = red[1]
     rid = _next_region_id("select")
-    _attach_region_id(op, rid)
-    op.attributes["prov.family"] = StringAttr("slice")
-    return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="select")
+    for o in ops:
+        _attach_region_id(o, rid)
+        o.attributes["prov.family"] = StringAttr("slice")
+    return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="select")
 
 
 def decompose_embedding(operands, meta, node_name):
@@ -5239,7 +5523,7 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.exp.default": _make_math_unary("ExpOp", "exp"),
     "aten.sqrt.default": _make_math_unary("SqrtOp", "sqrt"),
     "aten.tanh.default": _make_math_unary("TanhOp", "tanh"),
-    "aten.abs.default": _make_math_unary("AbsFOp", "abs"),
+    "aten.abs.default": decompose_abs,
     "aten.floor.default": _make_math_unary("FloorOp", "floor"),
     "aten.ceil.default": _make_math_unary("CeilOp", "ceil"),
     "aten.log.default": _make_math_unary("LogOp", "log"),
@@ -5274,6 +5558,9 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     # decomposition function consumes both.
     "aten.conv2d.default": decompose_convolution,
     "aten.constant_pad_nd.default": decompose_constant_pad_nd,
+    "aten._native_batch_norm_legit_no_training.default": decompose_batch_norm_inference,
+    "aten.upsample_bilinear2d.vec": decompose_upsample_bilinear2d,
+    "aten.upsample_nearest2d.vec": decompose_upsample_nearest2d,
     # torch.fft: real DFT contractions, complex carried as a trailing (re, im) pair.
     "aten._fft_r2c.default": decompose_fft_r2c,
     "aten._fft_c2r.default": decompose_fft_c2r,

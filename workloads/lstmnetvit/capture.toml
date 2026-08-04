@@ -1,0 +1,4 @@
+venv = "/scratch/agustin/projects/model2MLIR/.venv"
+python = "3.12"
+deps = []
+upstream = "/scratch/agustin/projects/vitfly"

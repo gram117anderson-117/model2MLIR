@@ -1,0 +1,8 @@
+venv = "/scratch/agustin/projects/model2MLIR/.venv"
+python = "3.12"
+deps = ["timm"]
+upstream = "/scratch/agustin/projects/DiffJSCC"
+
+# Upstream's deepjscc_cnn.py imports a training stack (pytorch_lightning, LPIPS,
+# pytorch_msssim, einops) at module scope for its LightningModule. loader.py stubs those --
+# the captured encoder/decoder are plain nn.Modules -- so they are deliberately NOT deps.
