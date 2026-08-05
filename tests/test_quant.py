@@ -114,3 +114,57 @@ def test_mixed_precision_lowers():
     assert r.ok
     assert sum(opaque_report(r.mlir_text).values()) == 0
     assert "prov.quantization_mixed" in r.mlir_text
+
+
+class _EmbedAndNorm(nn.Module):
+    """An embedding, a Linear, and a LayerNorm — the shape that broke mixed precision.
+
+    The LayerNorm matters: it is the module with no quantizable `weight` that a name-only filter
+    offered to a Linear-only transform.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(512, 32)
+        self.norm = nn.LayerNorm(32)
+        self.proj = nn.Linear(32, 16)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.norm(self.embed_tokens(idx)))
+
+
+def test_per_module_default_rule_keeps_torchaos_linear_only_filter() -> None:
+    """Passing any ``filter_fn`` REPLACES torchao's own (``_is_linear``), so a name-based default rule
+    used to offer every module in the tree to a Linear-only transform — and the first one without a
+    ``weight`` asserted ("applying int8 weight only quant requires module to have weight attribute").
+    Mixed precision therefore only worked when the rules happened to cover every non-Linear module.
+    """
+    from m2m.capture.torchao_pipeline import apply_quantization
+
+    model = _EmbedAndNorm().eval()
+    cfg = QuantizationConfig(scheme="int8_weight_only",
+                             per_module={"embed_tokens": "int8_embedding_weight_only"})
+    quantized = apply_quantization(model, cfg)          # used to raise AssertionError
+
+    # The named rule reached the embedding: int8 storage, a quarter of the fp32 bytes.
+    emb = quantized.embed_tokens.weight
+    inner = getattr(emb, "qdata", getattr(emb, "int_data", None))
+    assert inner is not None and inner.dtype is torch.int8
+    # The default rule still reached the Linear.
+    assert type(quantized.proj.weight).__name__ != "Parameter"
+    # And the LayerNorm was left alone rather than asserting.
+    assert quantized.norm.weight.dtype is torch.float32
+    # The gather still returns floats, so downstream ops are unchanged.
+    out = quantized(torch.tensor([[1, 2, 3]]))
+    assert out.dtype is torch.float32 and out.shape == (1, 3, 16)
+
+
+def test_an_embedding_is_not_quantized_without_an_explicit_rule() -> None:
+    """The reason a large-vocabulary "int8" bundle can be dominated by one fp32 table: torchao's
+    default filter matches nn.Linear only. Measured on whisper-tiny, 76.0 MB of a 116.8 MB int8
+    bundle was the fp32 token-embedding table."""
+    from m2m.capture.torchao_pipeline import apply_quantization
+
+    model = _EmbedAndNorm().eval()
+    quantized = apply_quantization(model, QuantizationConfig(scheme="int8_weight_only"))
+    assert quantized.embed_tokens.weight.dtype is torch.float32

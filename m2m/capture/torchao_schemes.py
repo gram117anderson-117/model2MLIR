@@ -77,6 +77,19 @@ _STABLE: tuple[TorchAOScheme, ...] = (
         target_hardware="any",
     ),
     TorchAOScheme(
+        name="int8_embedding_weight_only",
+        config_class_path="torchao.quantization.IntxWeightOnlyConfig",
+        weight_dtype="int8",
+        granularity="per_channel",
+        stability="stable",
+        target_hardware="any",
+        params={"weight_dtype": "int8", "granularity": "PerAxis(0)"},
+        notes="For nn.Embedding, which torchao's default quantize_ filter (nn.Linear only) leaves "
+              "in fp32 -- so a weight-only 'int8' capture of a model with a large vocabulary is "
+              "dominated by one fp32 table. Measured on whisper-tiny: 76.0 of 116.8 MB. Apply by FQN "
+              "via per_module; per-axis(0) gives each vocabulary row its own scale.",
+    ),
+    TorchAOScheme(
         name="int4_weight_only",
         config_class_path="torchao.quantization.Int4WeightOnlyConfig",
         weight_dtype="int4",

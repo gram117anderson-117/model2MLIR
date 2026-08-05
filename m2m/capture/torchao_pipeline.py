@@ -150,6 +150,31 @@ def apply_quantization(model: Any, config: QuantizationConfig) -> Any:
     except ImportError:
         pass
 
+    # EMBEDDING tables. torchao's `quantize_` default filter matches nn.Linear only, so an
+    # `nn.Embedding` stays fp32 no matter which weight-only scheme is asked for -- which is how an
+    # "int8" bundle ends up dominated by one fp32 matrix. Measured on whisper-tiny: 76.0 MB of a
+    # 116.8 MB int8 bundle was `decoder.embed_tokens.weight` [51865, 384] in fp32, while the TIED
+    # `proj_out.weight` (same tensor, verified by data_ptr) was already stored int8 at 19.0 MB -- the
+    # same matrix shipped twice, once at 4x the size. On a board loaded over a serial link that is not
+    # a footprint nicety: the loader transmits MemSiz, so it was 13 extra minutes per upload.
+    #
+    # Reach it with a per-axis intx config, which does support nn.Embedding, and apply it by FQN
+    # through `per_module` (whose filter matches on name, not module class).
+    try:
+        import torch as _torch
+        from torchao.quantization import IntxWeightOnlyConfig
+        from torchao.quantization.granularity import PerAxis
+
+        def _int8_embedding_weight_only() -> Any:
+            # Per-axis(0) = one scale per vocabulary row, so a gathered row dequantizes with its own
+            # scale. Per-tensor over a 51865-row table would let one outlier row set the scale for
+            # every token.
+            return IntxWeightOnlyConfig(weight_dtype=_torch.int8, granularity=PerAxis(0))
+
+        scheme_map["int8_embedding_weight_only"] = _int8_embedding_weight_only
+    except ImportError:
+        pass
+
     # torchao <0.17: function-based API (fallback)
     if "int8_weight_only" not in scheme_map:
         try:
@@ -215,9 +240,21 @@ def apply_quantization(model: Any, config: QuantizationConfig) -> Any:
         # default scheme (if not the "none" sentinel) covers everything still unmatched
         if config.scheme and config.scheme != "none":
             default_factory = _resolve_factory(config.scheme)
+            # Passing ANY filter_fn replaces torchao's own, which is `_is_linear` -- so a
+            # name-based filter alone offers every module in the tree to a Linear-only transform,
+            # and the first one without a `weight` (a LayerNorm, a container, the root) asserts:
+            #   "applying int8 weight only quant requires module to have weight attribute"
+            # Keep torchao's structural test and AND the name rule onto it. Without this, mixed
+            # precision only worked when the rules happened to cover every non-Linear module.
+            try:
+                from torchao.quantization.quant_api import _is_linear
+            except ImportError:                                 # pragma: no cover - old torchao
+                def _is_linear(mod: Any, *_a: Any) -> bool:
+                    return isinstance(mod, torch.nn.Linear) and hasattr(mod, "weight")
 
             def default_filter(module: Any, fqn: str) -> bool:
-                return not any(re.search(pat, fqn) for pat, _ in rules)
+                return (_is_linear(module, fqn)
+                        and not any(re.search(pat, fqn) for pat, _ in rules))
 
             quantize_(model, default_factory(), filter_fn=default_filter)
             _reset_swap()

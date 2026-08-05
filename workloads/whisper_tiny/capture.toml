@@ -2,3 +2,14 @@ venv = "/scratch/agustin/projects/model2MLIR/.venv"
 python = "3.12"
 deps = ["transformers"]
 upstream = "/scratch/agustin/projects/whisper"
+
+# The int8 capture must quantize the token-embedding table too. torchao's default `quantize_` filter
+# matches nn.Linear only, so `embed_tokens` stayed fp32 and dominated the bundle: 76.0 MB of 116.8 MB,
+# while the TIED `proj_out.weight` (the same tensor -- verified by data_ptr) was already stored int8 at
+# 19.0 MB. The same matrix twice, once at 4x the size. That is 13 extra minutes on every upload to a
+# board loaded over a serial link, because the loader transmits MemSiz.
+[quant.int8]
+# UNCHANGED from the default for this format: only the embedding rule is added, so every
+# Linear quantizes exactly as before and the existing goldens stay comparable.
+scheme = "int8_weight_only"
+per_module = { "embed_tokens" = "int8_embedding_weight_only" }
