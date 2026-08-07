@@ -71,6 +71,41 @@ def get_model_and_inputs() -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
     model = model.eval()
 
     frames = int(os.environ.get("M2M_WHISPER_FRAMES", cfg.max_source_positions * 2))
+    if frames != cfg.max_source_positions * 2:
+        # Shortening the audio window is not just a smaller input tensor. Whisper's encoder asserts
+        # the mel length matches `max_source_positions * 2` exactly ("expects the mel input features
+        # to be of length 3000"), because its encoder position embedding is a fixed [1500, d_model]
+        # table. Passing fewer frames alone raises; the config and that table have to come with it.
+        #
+        # This matters because the 30-second window is what makes the model unrunnable on a small
+        # board: encoder self-attention materializes [heads, pos, pos] tensors, so at 1500 positions
+        # each is 54 MB and the peak working set is ~2 GB regardless of how well the compiler frees.
+        # Positions enter that quadratically, so a shorter window is the only lever with the right
+        # exponent.
+        #
+        # The position table is TRUNCATED, not re-initialized: rows 0..N-1 of the pretrained
+        # embedding are the ones a real N-position utterance would use, so every weight in the model
+        # stays the trained one. What changes is the audio context, and that is a property of the
+        # capture -- it must be named in the bundle, never passed off as full whisper_tiny.
+        if frames % 2:
+            raise ValueError(f"M2M_WHISPER_FRAMES must be even (2 mel frames per encoder "
+                             f"position); got {frames}")
+        positions = frames // 2
+        if positions > cfg.max_source_positions:
+            raise ValueError(f"M2M_WHISPER_FRAMES={frames} asks for {positions} encoder positions "
+                             f"but the checkpoint only has {cfg.max_source_positions}")
+        emb = model.model.encoder.embed_positions
+        with torch.no_grad():
+            kept = emb.weight[:positions].clone()
+        model.model.encoder.embed_positions = nn.Embedding(positions, kept.shape[1])
+        with torch.no_grad():
+            model.model.encoder.embed_positions.weight.copy_(kept)
+        model.model.encoder.embed_positions.requires_grad_(False)
+        cfg.max_source_positions = positions
+        model.config.max_source_positions = positions
+        print(f"[whisper_tiny] audio window shortened to {positions} encoder positions "
+              f"({frames} mel frames, {frames / 100:.1f}s) — pretrained weights, TRUNCATED "
+              f"position table", file=sys.stderr)
     features = torch.randn(1, cfg.num_mel_bins, frames)
     # One decode step from the start-of-transcript token.
     start = getattr(cfg, "decoder_start_token_id", None) or 0
