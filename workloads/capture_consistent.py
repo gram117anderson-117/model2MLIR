@@ -91,9 +91,10 @@ def _bundle(model: str, fmt: str, out: Path) -> None:
                     _flatten_subclass(child, f"{prefix}.{nm}", out)
         elif hasattr(obj, "detach"):                       # a leaf torch.Tensor
             t = obj.detach().cpu()
-            # numpy has no float8 dtype; decode fp8 inner data to f32 (the graph casts the
-            # inner tensor to f32 before the matmul anyway, so f32 is the bound value).
-            arr = t.float().numpy() if "float8" in str(t.dtype) else t.numpy()
+            # numpy has no float8/bfloat16 dtype; decode fp8/bf16 inner data to f32 (the graph
+            # casts the inner tensor to f32 before the matmul anyway, so f32 is the bound value).
+            _dt = str(t.dtype)
+            arr = t.float().numpy() if ("float8" in _dt or "bfloat16" in _dt) else t.numpy()
             out[f"qinner::{prefix}"] = arr
     for pname, p in mdl.named_parameters():
         if type(p).__name__ not in ("Parameter", "Tensor") or hasattr(p, "__tensor_flatten__"):
