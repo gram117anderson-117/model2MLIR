@@ -2262,7 +2262,6 @@ def decompose_convolution(operands, meta, node_name):
             return [default, default]
         if isinstance(v, (list, tuple)):
             vals = [int(x) for x in v]
-            # prev: return [default, vals[0]] if rank == 3 else vals[:2]
             if rank == 3:
                 return [default, vals[0]]
             # ATen broadcasts single elem int[] (e.g. from Conv2d(padding="valid"), 
