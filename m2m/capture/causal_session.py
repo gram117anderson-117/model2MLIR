@@ -17,6 +17,7 @@ is functional (updated state is returned explicitly), while eager execution has 
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,26 @@ def _cache_geometry(lm: nn.Module) -> tuple[int, int, int]:
     kv_heads = int(getattr(config, "num_key_value_heads", config.num_attention_heads))
     head_dim = int(getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
     return layers, kv_heads, head_dim
+
+
+def _static_layer_initializer(static_layer: type):
+    """Call ``StaticLayer.lazy_initialization`` across its supported signatures.
+
+    Transformers 4.x initializes from keys only (``early_initialization`` passes one fake keys
+    tensor); 5.x takes keys and values. Subclasses accept both forms and forward what the installed
+    base class expects.
+    """
+    initialize = static_layer.lazy_initialization
+    takes_values = "value_states" in inspect.signature(initialize).parameters
+
+    def lazy_initialization(layer, key_states: torch.Tensor,
+                            value_states: torch.Tensor | None = None) -> None:
+        if takes_values:
+            initialize(layer, key_states, key_states if value_states is None else value_states)
+        else:
+            initialize(layer, key_states)
+
+    return lazy_initialization
 
 
 def _new_static_cache(lm: nn.Module, capacity: int):
@@ -57,7 +78,13 @@ def _new_decode_cache(lm: nn.Module, capacity: int):
     """
     from transformers.cache_utils import Cache, StaticLayer
 
+    initialize = _static_layer_initializer(StaticLayer)
+
     class _FunctionalDecodeLayer(StaticLayer):
+        def lazy_initialization(self, key_states: torch.Tensor,
+                                value_states: torch.Tensor | None = None) -> None:
+            initialize(self, key_states, value_states)
+
         def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs):
             if not self.is_initialized:
                 self.lazy_initialization(key_states, value_states)
@@ -80,9 +107,12 @@ def _new_prefill_cache(lm: nn.Module, capacity: int):
     """Functional cache whose one update fills a fixed-capacity prefix from position zero."""
     from transformers.cache_utils import Cache, StaticLayer
 
+    initialize = _static_layer_initializer(StaticLayer)
+
     class _FunctionalPrefillLayer(StaticLayer):
-        def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
-            super().lazy_initialization(key_states, value_states)
+        def lazy_initialization(self, key_states: torch.Tensor,
+                                value_states: torch.Tensor | None = None) -> None:
+            initialize(self, key_states, value_states)
             # Some supported StaticLayer versions initialize only keys/values. The functional
             # prefill stage owns its length tensor regardless of that upstream implementation.
             if not hasattr(self, "cumulative_length"):
@@ -125,7 +155,9 @@ class FixedCachePrefillStage(nn.Module):
                           for layer in self._static_cache.layers]
         positions = torch.arange(input_ids.shape[1], device=input_ids.device)
         for layer in self._static_cache.layers:
-            layer.cumulative_length = torch.zeros_like(layer.cumulative_length)
+            # Fresh length avoids using a traced tensor in later eager calls.
+            layer.cumulative_length = torch.zeros(
+                tuple(layer.cumulative_length.shape), dtype=torch.long, device=input_ids.device)
         slots = torch.arange(self.capacity, device=input_ids.device)
         visible = slots.unsqueeze(0) <= positions.unsqueeze(1)
         dtype = next(self.lm.parameters()).dtype
@@ -223,7 +255,7 @@ def prefill_state(lm: nn.Module, input_ids: torch.Tensor, capacity: int) \
     keys = torch.stack([layer.keys.detach().clone() for layer in cache.layers])
     values = torch.stack([layer.values.detach().clone() for layer in cache.layers])
     lengths = torch.stack([
-        torch.as_tensor(layer.cumulative_length, device=input_ids.device).reshape(-1)[0]
+        torch.as_tensor(layer.get_seq_length(), device=input_ids.device).reshape(-1)[0]
         for layer in cache.layers
     ]).to(dtype=torch.long)
     expected = torch.full_like(lengths, int(input_ids.shape[1]))
