@@ -200,3 +200,16 @@ def test_prefill_eager_after_export_preserves_full_causal_logits():
     expected = lm(input_ids=tokens, use_cache=False).logits[:, -1, :]
     torch.testing.assert_close(exported(tokens)[0], expected, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(stage(tokens)[0], expected, rtol=1e-5, atol=1e-6)
+
+
+def test_fixed_cache_export_does_not_retain_fake_tensor_constants():
+    from torch._subclasses.fake_tensor import FakeTensor
+    lm = _tiny_llama()
+    tokens = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    stage = FixedCachePrefillStage(lm, capacity=8).eval()
+    for _ in range(2):
+        exported = torch.export.export(stage, (tokens,))
+        assert not any(isinstance(value, FakeTensor) for value in exported.constants.values())
+        assert all(not isinstance(layer.keys, FakeTensor) for layer in stage._static_cache.layers)
+        expected = lm(input_ids=tokens, use_cache=False).logits[:, -1, :]
+        torch.testing.assert_close(stage(tokens)[0], expected, rtol=1e-5, atol=1e-6)

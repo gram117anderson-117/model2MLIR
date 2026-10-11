@@ -121,6 +121,8 @@ class FixedCachePrefillStage(nn.Module):
         self._static_cache = _new_prefill_cache(self.lm, self.capacity)
 
     def forward(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        original_cache = [(layer.keys, layer.values, layer.cumulative_length)
+                          for layer in self._static_cache.layers]
         positions = torch.arange(input_ids.shape[1], device=input_ids.device)
         for layer in self._static_cache.layers:
             layer.cumulative_length = torch.zeros_like(layer.cumulative_length)
@@ -142,6 +144,10 @@ class FixedCachePrefillStage(nn.Module):
         next_position = torch.cat([
             layer.cumulative_length.reshape(1) for layer in self._static_cache.layers
         ])
+        # Export traces cache updates with fake tensors. Keep those tensors in returned
+        # graph values, never in persistent Python cache state used by the next export.
+        for layer, original in zip(self._static_cache.layers, original_cache):
+            layer.keys, layer.values, layer.cumulative_length = original
         return output.logits[:, -1, :], next_cache, next_position
 
 
@@ -161,6 +167,8 @@ class FixedCacheDecodeStep(nn.Module):
         # The private cache object is rebound to the public input tensors on every call. Its update
         # is functional, so callers' state is never mutated and the returned tensors are the only
         # next-state values.
+        original_cache = [(layer.keys, layer.values, layer.cumulative_length)
+                          for layer in self._static_cache.layers]
         for layer_index, layer in enumerate(self._static_cache.layers):
             layer.keys = kv_cache[0, layer_index]
             layer.values = kv_cache[1, layer_index]
@@ -192,6 +200,10 @@ class FixedCacheDecodeStep(nn.Module):
         next_position = torch.cat([
             layer.cumulative_length.reshape(1) for layer in self._static_cache.layers
         ])
+        # Export traces cache updates with fake tensors. Keep those tensors in returned
+        # graph values, never in persistent Python cache state used by the next export.
+        for layer, original in zip(self._static_cache.layers, original_cache):
+            layer.keys, layer.values, layer.cumulative_length = original
         return output.logits[:, -1, :], next_cache, next_position
 
 
