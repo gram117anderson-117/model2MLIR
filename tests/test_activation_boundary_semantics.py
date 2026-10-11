@@ -73,7 +73,7 @@ def native_activation(tmp_path, model, array, optimization):
     source.write_text(str(converted.module), encoding="utf-8")
     pipeline = (
         "builtin.module(one-shot-bufferize{bufferize-function-boundaries},"
-        "buffer-results-to-out-params,convert-linalg-to-loops,"
+        "buffer-results-to-out-params{modify-public-functions},convert-linalg-to-loops,"
         "expand-strided-metadata,lower-affine,convert-scf-to-cf,convert-math-to-libm,"
         "convert-arith-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm,"
         "convert-cf-to-llvm,reconcile-unrealized-casts)"
