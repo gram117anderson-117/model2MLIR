@@ -189,3 +189,14 @@ def test_exported_decode_tensor_position_matches_complete_causal_prefix():
         prefix = torch.cat((prefix, input_ids), dim=1)
         expected = lm(input_ids=prefix, use_cache=False).logits[:, -1, :]
         torch.testing.assert_close(observed, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_prefill_eager_after_export_preserves_full_causal_logits():
+    lm = _tiny_llama()
+    lm.set_attn_implementation('sdpa')
+    tokens = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    stage = FixedCachePrefillStage(lm, capacity=8).eval()
+    exported = torch.export.export(stage, (tokens,), strict=False).module()
+    expected = lm(input_ids=tokens, use_cache=False).logits[:, -1, :]
+    torch.testing.assert_close(exported(tokens)[0], expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(stage(tokens)[0], expected, rtol=1e-5, atol=1e-6)

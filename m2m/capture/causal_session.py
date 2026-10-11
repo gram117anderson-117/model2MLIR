@@ -124,8 +124,16 @@ class FixedCachePrefillStage(nn.Module):
         positions = torch.arange(input_ids.shape[1], device=input_ids.device)
         for layer in self._static_cache.layers:
             layer.cumulative_length = torch.zeros_like(layer.cumulative_length)
+        slots = torch.arange(self.capacity, device=input_ids.device)
+        visible = slots.unsqueeze(0) <= positions.unsqueeze(1)
+        dtype = next(self.lm.parameters()).dtype
+        attention_mask = torch.where(
+            visible, torch.zeros((), dtype=dtype, device=input_ids.device),
+            torch.full((), torch.finfo(dtype).min, dtype=dtype, device=input_ids.device),
+        ).unsqueeze(0).unsqueeze(0)
         output = self.lm(
-            input_ids=input_ids, cache_position=positions, position_ids=positions.unsqueeze(0),
+            input_ids=input_ids, attention_mask=attention_mask,
+            cache_position=positions, position_ids=positions.unsqueeze(0),
             past_key_values=self._static_cache, use_cache=True)
         next_cache = torch.stack((
             torch.stack([layer.keys for layer in self._static_cache.layers]),
