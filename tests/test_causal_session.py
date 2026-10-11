@@ -174,3 +174,18 @@ def test_deferred_causal_bundle_writer_reuses_protocol_and_preserves_fp32_refere
     assert reference.shape == (2, 1, 64)
     assert caught["root"]["quality_program"] == "decode"
     assert caught["kwargs"]["quantization_preapplied"] is False
+
+
+def test_exported_decode_tensor_position_matches_complete_causal_prefix():
+    lm = _tiny_llama()
+    lm.set_attn_implementation('sdpa')
+    prefix = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    cache, position = prefill_state(lm, prefix, capacity=8)
+    step = FixedCacheDecodeStep(lm, capacity=8).eval()
+    exported = torch.export.export(step, (torch.tensor([[4]]), cache, position), strict=False).module()
+    for token in (4, 5, 6):
+        input_ids = torch.tensor([[token]], dtype=torch.long)
+        observed, cache, position = exported(input_ids, cache, position)
+        prefix = torch.cat((prefix, input_ids), dim=1)
+        expected = lm(input_ids=prefix, use_cache=False).logits[:, -1, :]
+        torch.testing.assert_close(observed, expected, rtol=1e-5, atol=1e-6)

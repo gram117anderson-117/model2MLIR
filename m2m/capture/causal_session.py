@@ -160,8 +160,18 @@ class FixedCacheDecodeStep(nn.Module):
 
         cache_position = (torch.arange(input_ids.shape[1], device=input_ids.device)
                           + position[0:1])
+        # Fixed-capacity cache positions are tensor inputs. Supply the actual causal mask
+        # instead of asking SDPA's Python mask-elision heuristic to branch on their values.
+        slots = torch.arange(self.capacity, device=input_ids.device)
+        visible = slots.unsqueeze(0) <= cache_position.unsqueeze(1)
+        dtype = next(self.lm.parameters()).dtype
+        attention_mask = torch.where(
+            visible, torch.zeros((), dtype=dtype, device=input_ids.device),
+            torch.full((), torch.finfo(dtype).min, dtype=dtype, device=input_ids.device),
+        ).unsqueeze(0).unsqueeze(0)
         output = self.lm(
             input_ids=input_ids,
+            attention_mask=attention_mask,
             cache_position=cache_position,
             position_ids=cache_position.unsqueeze(0),
             past_key_values=self._static_cache,
