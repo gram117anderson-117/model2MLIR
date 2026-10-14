@@ -13,7 +13,10 @@ matchable vocabulary, with new ops slotting into it rather than inventing new sh
   arith, math, linalg, tensor, scf, cf` — PLUS `quant_ext.{quantize,dequantize}` as the one
   principled exception (it carries the quantization contract, which has no standard-dialect
   equivalent in xDSL 0.65). The opaque escape hatch is a typed `func.call @aten_*` (never
-  silent-wrong). This artifact parses in real MLIR toolchains.
+  silent-wrong). Registered custom kernels (Triton, `m2m/ir/kernel_registry.py`) are also a
+  typed `func.call`, but tagged `prov.kernel` and **not** opaque: a deliberate black box whose
+  private declaration a downstream lowering binds to the real kernel. This artifact parses in
+  real MLIR toolchains.
 - **`high-level` (opt-in, xDSL/merlin-only):** adds named ops for fundamentally-distinct
   operations (`linalg_ext.{softmax,layer_norm,rms_norm,rope,swiglu,gelu,silu}`,
   `tensor_ext.{concat,pack,unpack}`) so a pass matches one op, not a generic body. The
@@ -30,6 +33,9 @@ stamped centrally in `import_fx._forward_fx_meta` + the `module.walk()` backfill
 | `prov.region_id` | op | transform-unit grouping |
 | `prov.aten` | op | source aten op (e.g. `aten.native_layer_norm.default`) |
 | `prov.orig_dtype` | op | pre-coercion torch dtype (e.g. `float8_e4m3fn` before fp8→f32) |
+| `prov.kernel` | kernel call + decl | registered kernel identity, `"ns::name"` (stable across shapes) |
+| `prov.kernel_operands` | kernel call | schema arg name of each SSA operand, in order |
+| `prov.kernel_args` | kernel call | non-tensor args by name (dict; an absent optional is `unit`); omitted when none |
 | `prov.level` | module | `"linalg-on-tensors"` \| `"high-level"` |
 | `prov.quantization` / `prov.quantization_mixed` | module | scheme / per-module map |
 
@@ -65,7 +71,7 @@ decomposition is added.
 **Coarse families** (keep this list small; add one only for a *fundamentally* different op):
 `elementwise, cast, fill, iota, compare, select, minmax, logical, bitwise, reduce,
 arg_reduce, contraction, normalization, layout, concat, gather_scatter, scan, search,
-quantize`.
+quantize, kernel`. (`kernel` = a registered black-box kernel call; its body isn't IR.)
 
 To add a new aten op: write its decomposition, set a `pattern_hint` (the fine kind), and add
 that hint to the right family in `_FAMILY_OF`. No new pass-matching surface is created.
@@ -126,7 +132,8 @@ portable.
 ## Governance (scalability + coverage)
 - **Coverage** is enforced by: the importer verify-fallback (invalid → opaque, never silent
   wrong IR), the differential oracle (`m2m.coverage.differential_op` vs torch-mlir), and the
-  per-model gap reports. New gaps surface as opaque `func.call @aten_*` you can grep for.
+  per-model gap reports. New gaps surface as opaque `func.call @aten_*` you can grep for
+  (`coverage.opaque_report`; registered kernel calls are excluded -> `coverage.kernel_report`).
 - **Scalability** is enforced by this taxonomy: the matchable vocabulary is bounded
   (~19 families) and fixed; adding ops grows the `aten → family` map, not the pass surface.
 - Measure anytime with `m2m.coverage.dialect_op_histogram(text)` and by grepping

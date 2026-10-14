@@ -13,6 +13,8 @@ python workloads/capture.py --list                  # what's available
 
 Output per model/format:
 - `workloads/<model>/<model>{,_int8,_fp8}.mlir` — the graph, each asserted to **0 opaque ops**.
+  Registered custom kernels (Triton, `m2m/ir/kernel_registry.py`) are black-box `func.call`s,
+  not opaque; the summary line reports them as `kernels=N`.
 - `workloads/<model>/<model>{,_int8,_fp8}.safetensors` (+ `.manifest.json`) — the real
   weights/buffers, keyed by name; the `.mlir` carries `prov.weights_file`. Graph stays small;
   data is fully recoverable. (See `m2m.transforms.externalize`.)

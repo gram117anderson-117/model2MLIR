@@ -91,14 +91,56 @@ differential_op(fn, inputs, name="mul")    # ours vs torch-mlir golden; verdict 
 To support a new op: implement its emitter in `m2m/ir/decompositions.py` (real `tensor`/`linalg`/
 `arith` ops), then confirm `differential_op(...).verdict == "ok"`.
 
+## Custom kernels (Triton) — the kernel registry
+
+A model may call hand-written kernels — e.g. a `@torch.library.triton_op` like
+`torch.ops.triton_exp.fused_mlp2` (see `workloads/mlp_basic_triton`). `torch.export` keeps each
+as ONE custom-op node. If its qualname is in the global table `KERNEL_REGISTRY`
+(`m2m/ir/kernel_registry.py`, the sibling of `decompositions.py`), the FXImporter emits it as a
+**black-box kernel call** instead of an opaque op:
+
+```mlir
+func.func @forward(...) {
+  %7 = func.call @triton_exp__fused_mlp2(%6, %0, %1, %2, %3) {prov.kernel = "triton_exp::fused_mlp2",
+         prov.kernel_operands = ["x", "w1", "b1", "w2", "b2"],
+         prov.family = "kernel", prov.op = "kernel", prov.region_id = ...}
+         : (...) -> tensor<4x32xf32>
+  ...
+}
+func.func private @triton_exp__fused_mlp2(...) -> tensor<4x32xf32> attributes {prov.kernel = "triton_exp::fused_mlp2"}
+```
+
+- Tensor inputs are SSA operands in the op **schema's** argument order (named by
+  `prov.kernel_operands`); every output is an SSA result (multi-output kernels -> multi-result
+  call). Non-tensor args (floats, ints, block sizes, omitted defaults) go in `prov.kernel_args`,
+  which is **omitted** when the kernel has none.
+- That is the whole contract. Where a kernel's implementation lives and what language it is in
+  belong to the consumer's kernel table, not the IR.
+- The private declaration is the hook a downstream lowering (merlin) points at the real kernel;
+  it is placed **after** `@forward`, so the entry function stays the first `func.func`.
+- `prov.kernel` is the stable identity (the symbol gets a `_<n>` suffix per new shape).
+- Registered kernel calls are **not opaque**: `opaque_report` skips them, `kernel_report(text)`
+  lists them, `workloads/capture.py` prints `kernels=N`. torch-mlir can't legalize custom ops,
+  so `backend="auto"` goes straight to the FXImporter when a graph contains one.
+- To add a kernel: append `KernelSpec("ns::name", description=...)` to `_BUILTIN_KERNELS`.
+  Unregistered Triton ops still lower as opaque (with a diagnostic pointing at the registry).
+- The consumer is merlin: `src/merlin/llvmlower/kernel_table.py` maps the same
+  `prov.kernel` names to CPU kernel bodies (LLVM IR / llvm-dialect MLIR under
+  `src/merlin/kernels/triton_llvmir/`) and links one into the model's LLVM IR. A kernel
+  registered here needs a matching merlin entry before its captures can run; merlin's
+  `test_table_keys_match_m2m_registry` fails until it has one.
+- Not yet supported: in-place kernels (`mutates_args`, which export wraps in
+  `auto_functionalized_v2`). A registered one is an import **error**, never silently wrong IR.
+
 ## Layout
 ```
 m2m/
   api.py            convert(), ConversionResult (the common output)
   cli.py            m2m lower-torch | lower-jax | convert | coverage
   capture/          torch.export capture, torchAO, self-update loop (unsupported/)
-  ir/               FXImporter + decomposition tables (aten->linalg), torch-mlir gap decomps
+  ir/               FXImporter + decomposition tables (aten->linalg), torch-mlir gap decomps,
+                    kernel_registry.py (custom kernels -> black-box func.call)
   frontends/jax.py  jax.export -> StableHLO
-  coverage.py       opaque report + single-op validation + torch-mlir differential oracle
+  coverage.py       opaque/kernel reports + single-op validation + torch-mlir differential oracle
 workloads/          one folder per model (loader.py + README with its venv)
 ```
