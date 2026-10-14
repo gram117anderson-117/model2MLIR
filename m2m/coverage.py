@@ -3,7 +3,9 @@
 Two tools for the agent-driven coverage loop:
 
 - ``opaque_report(mlir_text)`` -- inventory the opaque ``func.call`` placeholders in
-  emitted MLIR (the worklist of ops still needing real decompositions).
+  emitted MLIR (the worklist of ops still needing real decompositions). Registered kernel
+  calls (``prov.kernel``, see ``m2m.ir.kernel_registry``) are black boxes by design and are
+  excluded; ``kernel_report`` inventories those.
 - ``validate_op(build_fn, example_inputs)`` -- capture a single-op module through the
   FXImporter and check it lowered to real ops (no opaque call) with a result tensor
   type whose shape/dtype match PyTorch eager. This is the gate every new decomposition
@@ -32,9 +34,32 @@ def opaque_report(mlir_text: str) -> dict[str, int]:
     torch-mlir may print ``func.call @name(%x)``. A text regex can miss the
     former and falsely report a complete capture. Parse only call-bearing
     modules; an unparseable call is unknown, never zero opaque work.
+
+    Registered kernel calls (``prov.kernel``, see ``m2m.ir.kernel_registry``) are deliberate
+    black boxes, not gaps, and are excluded; ``kernel_report`` counts those.
     """
+    calls = Counter()
+    for op in _bodyless_calls(mlir_text):
+        if "prov.kernel" not in op.attributes:
+            calls[op.callee.string_value()] += 1
+    return dict(calls)
+
+
+def kernel_report(mlir_text: str) -> dict[str, int]:
+    """Return {kernel_qualname: launch_count} for every registered kernel call
+    (a ``func.call`` tagged ``prov.kernel = "ns::name"``) in the MLIR."""
+    calls = Counter()
+    for op in _bodyless_calls(mlir_text):
+        kernel = op.attributes.get("prov.kernel")
+        if kernel is not None:
+            calls[kernel.data] += 1
+    return dict(calls)
+
+
+def _bodyless_calls(mlir_text: str) -> list:
+    """Every ``func.call`` whose callee has no body (opaque calls and kernel calls alike)."""
     if "func.call" not in mlir_text:
-        return {}
+        return []
     from xdsl.dialects.func import CallOp, FuncOp
     from xdsl.traits import SymbolTable
 
@@ -44,14 +69,14 @@ def opaque_report(mlir_text: str) -> dict[str, int]:
     if module is None:
         raise ValueError("cannot inspect call-bearing MLIR for unresolved externals")
     module.verify()
-    calls = Counter()
+    out = []
     for op in module.walk():
         if not isinstance(op, CallOp):
             continue
         callee = SymbolTable.lookup_symbol(op, op.callee)
         if not isinstance(callee, FuncOp) or not callee.body.blocks:
-            calls[op.callee.string_value()] += 1
-    return dict(calls)
+            out.append(op)
+    return out
 
 
 @dataclass
@@ -132,7 +157,7 @@ def dialect_op_histogram(mlir_text: str) -> dict[str, int]:
 CANONICAL_FAMILIES = frozenset({
     "elementwise", "cast", "fill", "iota", "compare", "select", "minmax", "logical",
     "bitwise", "reduce", "arg_reduce", "contraction", "normalization", "attention", "layout",
-    "concat", "gather_scatter", "scan", "search", "quantize",
+    "concat", "gather_scatter", "scan", "search", "quantize", "kernel",
 })
 
 
@@ -314,6 +339,7 @@ __all__ = [
     "differential_op",
     "family_histogram",
     "golden_lowering",
+    "kernel_report",
     "op_vocabulary",
     "opaque_report",
     "region_summary",

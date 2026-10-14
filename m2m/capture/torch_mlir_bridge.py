@@ -273,13 +273,15 @@ def bridge_fx_graph(
         result.diagnostics.append(
             f"FXImporter fallback succeeded with "
             f"{importer.decomposed_count} decomposed ops, "
-            f"{importer.opaque_count} opaque"
+            f"{importer.opaque_count} opaque, "
+            f"{importer.kernel_count} kernel calls"
         )
         log.info(
             "torch_mlir_bridge.ok",
             path="fx_importer",
             decomposed=importer.decomposed_count,
             opaque=importer.opaque_count,
+            kernels=importer.kernel_count,
         )
         return result
     except Exception as exc:  # noqa: BLE001

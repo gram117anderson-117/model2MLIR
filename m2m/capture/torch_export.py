@@ -30,6 +30,7 @@ from m2m.capture.torchao_pipeline import QuantizationConfig, apply_quantization
 from m2m.capture.unsupported import UnsupportedOpResolution, recover_unsupported_operators
 from m2m.capture.unsupported.introspect import runtime_versions
 from m2m.ir.decompositions import DECOMPOSITION_TABLE
+from m2m.ir.kernel_registry import registered_kernel_targets
 from m2m.models import CaptureMode
 
 
@@ -340,9 +341,11 @@ def capture_frontend_artifact(
     validation = validate_export(prepared_exported)
     versions = runtime_versions()
 
+    # Registered kernels (m2m.ir.kernel_registry) are supported as black-box calls, so they
+    # must not be classified/synthesized by the unsupported-op loop.
     unsupported_resolutions = recover_unsupported_operators(
         prepared_exported,
-        supported_targets=set(DECOMPOSITION_TABLE.keys()),
+        supported_targets=set(DECOMPOSITION_TABLE.keys()) | registered_kernel_targets(prepared_exported.graph),
         runtime_versions=versions,
     )
     explicit_blackboxes = tuple(

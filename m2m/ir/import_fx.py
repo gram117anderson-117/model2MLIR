@@ -8,6 +8,8 @@ Invariants:
     - Every FX node maps to at least one xDSL op (or a diagnostic).
     - Decomposed ops get ``compgen.region_id`` attributes for Recipe IR targeting.
     - Unsupported ops fall back to ``func.call`` (flagged as opaque).
+    - Registered kernels (``kernel_registry.KERNEL_REGISTRY``) become a ``func.call`` tagged
+      ``prov.kernel`` (a black box, NOT opaque); their declarations follow ``@forward``.
     - The output module passes the xDSL verifier.
 """
 
@@ -66,6 +68,13 @@ from m2m.ir.decompositions import (
     DECOMPOSITION_TABLE,
     DecompFn,
     reset_region_counters,
+)
+from m2m.ir.kernel_registry import (
+    KernelLoweringError,
+    emit_kernel_call,
+    is_triton_op,
+    kernel_decl,
+    lookup_kernel,
 )
 from m2m.ir.types import Float8E4M3FNType, Float8E5M2Type
 
@@ -128,6 +137,9 @@ _reg("search", "bucketize")
 _reg("quantize", "quantize_per_tensor", "quantize_per_channel", "quantize_per_group",
      "dequantize_per_tensor", "dequantize_per_channel", "dequantize_per_group",
      "choose_qparams_per_tensor", "choose_qparams_per_channel", "dequantize", "quant_param")
+# Registered custom kernels (Triton, ...): one black-box func.call per kernel launch, see
+# m2m.ir.kernel_registry. Fundamentally distinct from every family above -- the body isn't IR.
+_reg("kernel", "kernel")
 
 
 def family_of(hint: str | None) -> str | None:
@@ -397,6 +409,7 @@ class FXImporter:
     diagnostics: list[ImportDiagnostic] = field(default_factory=list)
     decomposed_count: int = 0
     opaque_count: int = 0
+    kernel_count: int = 0  # registered black-box kernel calls (not opaque)
     allow_opaque_fallback: bool = True
     explicit_blackboxes: set[str] = field(default_factory=set)
     dynamic_decompositions: dict[str, DecompFn] = field(default_factory=dict)
@@ -508,6 +521,11 @@ class FXImporter:
             # from its LIVE call-site types (deduped, globally-unique names) and
             # repoint the call; merge the rebuilt externs into the main module.
             from xdsl.dialects.builtin import SymbolRefAttr
+            # Registered-kernel decls carry prov.kernel* attributes; copy them onto the
+            # rebuilt extern so a kernel inside a loop body keeps its identity.
+            sub_decl_attrs = {o.sym_name.data: dict(o.attributes) for o in sub_mod.body.block.ops
+                              if isinstance(o, FuncOp) and not o.body.blocks}
+            self.kernel_count += sub.kernel_count
             local_sigs: dict = {}
             for op in for_blk.walk():
                 callee = op.properties.get("callee") if hasattr(op, "properties") else None
@@ -521,8 +539,9 @@ class FXImporter:
                            tuple(str(t) for t in res_types))
                 if sig_key not in local_sigs:
                     uniq = f"{base_name}_wl{len(self._pending_extern_funcs)}"
-                    self._pending_extern_funcs.append(
-                        FuncOp.external(uniq, opnd_types, res_types))
+                    ext = FuncOp.external(uniq, opnd_types, res_types)
+                    ext.attributes.update(sub_decl_attrs.get(base_name, {}))
+                    self._pending_extern_funcs.append(ext)
                     local_sigs[sig_key] = uniq
                 op.properties["callee"] = SymbolRefAttr(local_sigs[sig_key])
 
@@ -544,6 +563,51 @@ class FXImporter:
             self.diagnostics.append(ImportDiagnostic(
                 fx_node=node.name, level="warning", message=f"while_loop->scf.for failed: {e}"))
             return False
+
+    def _lower_kernel(self, spec, node, value_map, multi_results, block,
+                      kernel_decls, kernel_sigs, kernel_names) -> None:
+        """Emit a registered kernel as a black-box ``func.call`` (see m2m.ir.kernel_registry).
+
+        Result types come from ``meta["val"]`` in return order; a tuple-returning kernel
+        registers every result in ``multi_results`` so ``getitem(node, i)`` -> result ``i``
+        (the generic path keeps only the primary output). The declaration is deduped per
+        (callee, signature): the same kernel at a new shape gets ``<callee>_<n>``, and all
+        share the same ``prov.kernel``. A kernel that can't be represented faithfully is an
+        import error, never a silent opaque fallback."""
+        val = node.meta.get("val")
+        vals = list(val) if isinstance(val, (tuple, list)) else ([val] if val is not None else [])
+        result_types = [_tensor_type_from_meta(v) for v in vals]
+        try:
+            if any(t is None for t in result_types):
+                raise KernelLoweringError(f"{spec.qualname}: non-tensor result in {val}")
+            result = emit_kernel_call(spec, node, value_map, result_types)
+        except (KernelLoweringError, TypeError, ValueError) as err:
+            self.diagnostics.append(ImportDiagnostic(
+                fx_node=node.name, level="error", message=f"Kernel lowering failed: {err}"))
+            return
+        call = result.ops[0]
+        meta = dict(node.meta)
+        meta["_aten_target"] = _canonicalize_fx_target_str(str(node.target))  # source torch op
+        _forward_fx_meta(call, meta, result.pattern_hint)
+        sig = (spec.callee, tuple(str(v.type) for v in call.operands),
+               tuple(str(r.type) for r in call.results))
+        if sig not in kernel_sigs:
+            symbol, n = spec.callee, 1
+            while symbol in kernel_names:
+                symbol, n = f"{spec.callee}_{n}", n + 1
+            kernel_names.add(symbol)
+            kernel_sigs[sig] = symbol
+            kernel_decls.append(kernel_decl(spec, symbol, call))
+        call.properties["callee"] = FlatSymbolRefAttr_ref(kernel_sigs[sig])
+        block.add_op(call)
+        if result.result is not None:
+            value_map[node.name] = result.result
+        if isinstance(val, (tuple, list)):
+            multi_results[node.name] = list(result.results)
+        self.kernel_count += 1
+        self.diagnostics.append(ImportDiagnostic(
+            fx_node=node.name, level="info",
+            message=f"Kernel: {spec.qualname} -> func.call @{kernel_sigs[sig]}"))
 
     def import_graph(self, exported_program: Any) -> ModuleOp:
         """Convert an ExportedProgram's FX graph to an xDSL module."""
@@ -667,6 +731,11 @@ class FXImporter:
 
         # Track external function declarations for opaque fallback
         extern_funcs: list[FuncOp] = []
+        # Registered-kernel declarations, kept separate so they can be placed AFTER @forward
+        # (consumers that take the first func.func as the entry point keep working).
+        kernel_decls: list[FuncOp] = []
+        kernel_sigs: dict[tuple, str] = {}       # (callee, operand types, result types) -> symbol
+        kernel_names: set[str] = set()
         declared_sigs: dict[str, str] = {}
         name_counters: dict[str, int] = {}
 
@@ -850,6 +919,25 @@ class FXImporter:
                         if emitted not in preceding:
                             _forward_fx_meta(emitted, node.meta)
                     continue
+            # Registered kernel (m2m.ir.kernel_registry): one black-box func.call with all of
+            # its schema-ordered tensor operands, scalar args as attributes and every result.
+            # Runs before the type check below because a kernel may return a tuple.
+            spec = lookup_kernel(node.target)
+            if spec is not None:
+                self._lower_kernel(spec, node, value_map, multi_results, block,
+                                   kernel_decls, kernel_sigs, kernel_names)
+                continue
+            # In-place (mutates_args) kernels arrive wrapped as auto_functionalized{,_v2}(op,
+            # **kwargs). The tied-result form for those isn't implemented yet: fail loudly for a
+            # registered kernel rather than let the generic path emit an operand-less call.
+            if ("auto_functionalized" in target_str and node.args
+                    and lookup_kernel(node.args[0]) is not None):
+                self.diagnostics.append(ImportDiagnostic(
+                    fx_node=node.name, level="error",
+                    message=(f"registered kernel {node.args[0]} mutates its arguments "
+                             f"(auto_functionalized); in-place kernels are not supported yet")))
+                continue
+
             result_type = node_types.get(node.name)
             if result_type is None:
                 self.diagnostics.append(
@@ -1098,6 +1186,13 @@ class FXImporter:
                     message=f"Opaque: {target_str} -> func.call @{func_name}",
                 )
             )
+            if is_triton_op(node.target):
+                # A Triton kernel that isn't in KERNEL_REGISTRY: the generic opaque call drops
+                # its non-tensor args and extra outputs. Point at the fix.
+                self.diagnostics.append(ImportDiagnostic(
+                    fx_node=node.name, level="warning",
+                    message=(f"{target_str} is a triton_op not in m2m.ir.kernel_registry; "
+                             f"lowered as opaque (register it to emit a kernel call)")))
 
         # Add return
         ret_values: list[SSAValue] = []
@@ -1133,8 +1228,11 @@ class FXImporter:
         main_func = FuncOp("forward", func_type, region)
 
         # Externs merged from while_loop body sub-imports (renamed, collision-free).
+        # Kernel declarations (main body + loop bodies) go after @forward; opaque ones before.
         pending = getattr(self, "_pending_extern_funcs", [])
-        all_ops = list(extern_funcs) + list(pending) + [main_func]
+        pending_kernels = [f for f in pending if "prov.kernel" in f.attributes]
+        pending = [f for f in pending if "prov.kernel" not in f.attributes]
+        all_ops = list(extern_funcs) + list(pending) + [main_func] + kernel_decls + pending_kernels
         module = ModuleOp(all_ops)
 
         # REQ-023 (generalised): every ``linalg.transpose`` gets a

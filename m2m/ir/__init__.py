@@ -8,6 +8,9 @@ new ops). `FXImporter` is the fallback path used when torch-mlir is absent.
 These names are resolved **lazily** (PEP 562) so that importing the pure-xDSL
 ``m2m.ir.quant`` dialect does not pull in the torch-bound FX importer /
 decomposition table.
+
+`KERNEL_REGISTRY` (``m2m.ir.kernel_registry``) is the sibling table for custom kernels
+(Triton ``triton_op``s): registered ones are emitted as black-box ``func.call``s, not opaque.
 """
 
 from __future__ import annotations
@@ -18,11 +21,14 @@ from typing import TYPE_CHECKING
 _LAZY: dict[str, str] = {
     "DECOMPOSITION_TABLE": "m2m.ir.decompositions",
     "DecompResult": "m2m.ir.decompositions",
+    "KERNEL_REGISTRY": "m2m.ir.kernel_registry",
+    "KernelSpec": "m2m.ir.kernel_registry",
     "FXImporter": "m2m.ir.import_fx",
     "fx_to_xdsl": "m2m.ir.import_fx",
 }
 
-__all__ = ["DECOMPOSITION_TABLE", "DecompResult", "FXImporter", "fx_to_xdsl"]
+__all__ = ["DECOMPOSITION_TABLE", "DecompResult", "FXImporter", "KERNEL_REGISTRY", "KernelSpec",
+           "fx_to_xdsl"]
 
 
 def __getattr__(name: str):  # PEP 562
@@ -41,3 +47,4 @@ def __dir__() -> list[str]:
 if TYPE_CHECKING:
     from m2m.ir.decompositions import DECOMPOSITION_TABLE, DecompResult
     from m2m.ir.import_fx import FXImporter, fx_to_xdsl
+    from m2m.ir.kernel_registry import KERNEL_REGISTRY, KernelSpec

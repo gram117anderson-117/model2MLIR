@@ -214,6 +214,17 @@ def convert(
     # The high-level (structured) form is only produced by the FXImporter path -- torch-mlir
     # always emits standard linalg -- so requesting it forces the FXImporter backend.
     emit_named = level == "high-level"
+    # Registered kernels (m2m.ir.kernel_registry) are custom ops torch-mlir can't legalize
+    # ("failed to legalize operation 'torch.operator'"), so its attempt can only fail: go
+    # straight to the FXImporter, which emits them as black-box kernel calls.
+    kernel_targets: set[str] = set()
+    if exported_program is not None:
+        try:
+            from m2m.ir.kernel_registry import registered_kernel_targets
+
+            kernel_targets = registered_kernel_targets(exported_program.graph)
+        except Exception:  # noqa: BLE001
+            kernel_targets = set()
     result = bridge_fx_graph(
         model,
         tuple(example_inputs),
@@ -221,11 +232,14 @@ def convert(
         output_type=output_type,
         allow_fallback=allow_fallback,
         exported_program=exported_program,
-        use_torch_mlir=(backend != "fx_importer" and not emit_named),
+        use_torch_mlir=(backend != "fx_importer" and not emit_named and not kernel_targets),
         emit_named_ops=emit_named,
         weights_path=weights_path,
         capture_trace=capture_trace,
     )
+    if kernel_targets:
+        result.diagnostics.append(
+            f"registered kernels present ({sorted(kernel_targets)}); torch-mlir skipped")
     # Stamp the representation level so downstream/merlin knows which contract it received
     # (default portable standard form vs the opt-in structured high-level form).
     if result.module is not None:
