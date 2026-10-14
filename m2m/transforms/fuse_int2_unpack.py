@@ -27,7 +27,9 @@ from m2m.ir.quant.ops import UnpackInt2Op
 
 
 def _callee(op) -> str | None:
-    if not isinstance(op, CallOp):
+    # Registered kernel calls (prov.kernel) are black boxes: never match them by callee
+    # substring (a kernel named e.g. ``scale_and_shift`` must not be fused or swept as dead).
+    if not isinstance(op, CallOp) or "prov.kernel" in op.attributes:
         return None
     c = op.properties.get("callee")
     return c.root_reference.data if c is not None and hasattr(c, "root_reference") else None

@@ -210,3 +210,40 @@ def test_mutating_kernel_is_an_error(registered):
     r = m2m.convert(_M().eval(), _inputs(), backend="fx_importer")
     assert not r.ok
     assert any("in-place kernels are not supported" in d for d in r.diagnostics)
+
+
+# --- downstream passes leave kernels alone ---------------------------------------------------
+
+
+def test_sections_with_kernel_decls(registered):
+    from m2m.transforms import split_by_section
+
+    r = _convert(_Net(), _inputs())
+    secs = split_by_section(r.module)
+    assert secs
+    for mod in secs.values():
+        mod.verify()  # every called kernel is re-declared in its section
+    assert any("prov.kernel" in str(m) for m in secs.values())
+
+
+def test_int2_unpack_ignores_kernels(registered):
+    """A 4-operand kernel whose name contains 'stack'/'_and_' must not be matched by the
+    callee-substring bitvla pattern."""
+    from m2m.transforms.fuse_int2_unpack import fuse_int2_unpack
+
+    class _M(nn.Module):
+        def forward(self, a):
+            return torch.ops.m2m_test.stack_and_shift(a, a + 1, a + 2, a + 3)
+
+    r = _convert(_M(), (torch.randn(4, 8),))
+    _, n = fuse_int2_unpack(r.module)
+    assert n == 0
+
+
+def test_to_standard_keeps_kernel(registered):
+    from m2m.capture.torch_mlir_bridge import module_to_text
+    from m2m.transforms import to_standard
+
+    r = _convert(_Net(), _inputs())
+    text = module_to_text(to_standard(r.module))
+    assert kernel_report(text) == kernel_report(r.mlir_text)

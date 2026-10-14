@@ -41,10 +41,16 @@ def _free_values(op):
 def split_by_section(module: ModuleOp) -> dict[str, ModuleOp]:
     """Return ``{section_name: ModuleOp}`` -- one module per top-level source section, each a
     ``func.func @section_<name>`` with the section's ops and proper cross-section I/O. Ops
-    without an ``prov.module`` tag inherit their operands' section (else 'shared')."""
-    func = next((o for o in module.body.block.ops if isinstance(o, FuncOp)), None)
-    if func is None or not func.body.blocks:
+    without an ``prov.module`` tag inherit their operands' section (else 'shared').
+
+    The entry function is the first ``func.func`` WITH a body: body-less private declarations
+    (opaque calls, registered kernels) are not it. Each section module re-declares the
+    callees its ``func.call`` ops reference, so every section verifies on its own."""
+    func = next((o for o in module.body.block.ops if isinstance(o, FuncOp) and o.body.blocks), None)
+    if func is None:
         return {}
+    decls = {o.sym_name.data: o for o in module.body.block.ops
+             if isinstance(o, FuncOp) and not o.body.blocks}
     block = func.body.blocks[0]
     body_ops = [o for o in block.ops if not isinstance(o, ReturnOp)]
     ret = next((o for o in block.ops if isinstance(o, ReturnOp)), None)
@@ -97,7 +103,13 @@ def split_by_section(module: ModuleOp) -> dict[str, ModuleOp]:
         nblk.add_op(ReturnOp(*[vmap[o] for o in outputs]))
         ft = FunctionType.from_lists([v.type for v in inputs], [o.type for o in outputs])
         nf = FuncOp(f"section_{S}", ft, region=Region(nblk))
-        m = ModuleOp([nf])
+        callees = []
+        for op in nblk.walk():
+            c = op.properties.get("callee") if hasattr(op, "properties") else None
+            name = c.root_reference.data if c is not None and hasattr(c, "root_reference") else None
+            if name in decls and name not in callees:
+                callees.append(name)
+        m = ModuleOp([nf] + [decls[c].clone() for c in callees])
         m.attributes["prov.section"] = StringAttr(S)
         out[S] = m
     return out
