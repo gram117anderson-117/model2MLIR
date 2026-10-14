@@ -1,12 +1,16 @@
 """Kernel registry: registered custom-kernel ops lower to black-box ``func.call``s.
 
 The registry is backend-agnostic, so most tests register plain CPU ``torch.library.custom_op``s
-(with fake impls) in ``KERNEL_REGISTRY`` -- no Triton needed.
+(with fake impls) in ``KERNEL_REGISTRY`` -- no Triton needed. One test captures the real
+Triton workload (``workloads/mlp_basic_triton``) when the triton package is installed; capture
+never executes the kernel, so it runs on CPU.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 
 import pytest
 import torch
@@ -247,3 +251,45 @@ def test_to_standard_keeps_kernel(registered):
     r = _convert(_Net(), _inputs())
     text = module_to_text(to_standard(r.module))
     assert kernel_report(text) == kernel_report(r.mlir_text)
+
+
+# --- real Triton workload (MVP) -------------------------------------------------------------
+
+_WL = os.path.join(os.path.dirname(__file__), "..", "workloads")
+
+
+def _load(name):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(f"_{name}_loader", os.path.join(_WL, name, "loader.py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, os.path.join(_WL, name))
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.pop(0)
+    return mod.get_model_and_inputs()
+
+
+def test_mlp_basic_triton_mvp():
+    pytest.importorskip("triton")
+    m, inputs = _load("mlp_basic_triton")
+    r = _convert(m, inputs)
+    assert opaque_report(r.mlir_text) == {}
+    assert kernel_report(r.mlir_text) == {"triton_exp::fused_mlp2": 1}
+    assert 'prov.kernel_operands = ["x", "w1", "b1", "w2", "b2"]' in r.mlir_text
+    # The contract is minimal: no scalar args -> no prov.kernel_args; the decl carries only identity.
+    assert "prov.kernel_args" not in r.mlir_text
+    assert ('func.func private @triton_exp__fused_mlp2(tensor<4x16xf32>, tensor<32x16xf32>, '
+            'tensor<32xf32>, tensor<32x32xf32>, tensor<32xf32>) -> tensor<4x32xf32> '
+            'attributes {prov.kernel = "triton_exp::fused_mlp2"}') in r.mlir_text
+    assert any("torch-mlir skipped" in d for d in r.diagnostics)
+
+    # Same func signature as the plain-PyTorch reference, and the fc3 tail (everything after
+    # the kernel) is op-for-op identical to mlp_basic's fc3.
+    base = _convert(*_load("mlp_basic"))
+    sig = lambda t: re.search(r"func\.func @forward\(([^)]*)\)", t).group(1)  # noqa: E731
+    assert sig(r.mlir_text) == sig(base.mlir_text)
+    tail = lambda t, n: re.findall(r"= (\w+\.\w+)", t)[-n:]  # noqa: E731
+    after_kernel = re.findall(r"= (\w+\.\w+)", r.mlir_text.split("triton_exp::fused_mlp2", 1)[1])
+    assert after_kernel and tail(base.mlir_text, len(after_kernel)) == after_kernel

@@ -1,0 +1,2 @@
+venv = "../../.venv"   # the repo's own venv, relative to this workload dir
+python = "3.12"

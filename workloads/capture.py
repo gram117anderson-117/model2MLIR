@@ -9,7 +9,9 @@ Because models need conflicting torch/transformers/torchao versions, each gets a
 venv (default ``workloads/<model>/.venv``). This driver:
   1. ensures that venv exists (creates it + installs deps from capture.toml, idempotent);
   2. runs the capture INSIDE that venv (subprocess) for each requested datatype/level;
-  3. writes a single MLIR or a loader-authored multi-program session bundle, and checks 0 opaque ops;
+  3. writes a single MLIR or a loader-authored multi-program session bundle, and checks 0 opaque ops
+     (registered kernel calls -- ``m2m.ir.kernel_registry`` -- are black boxes, reported as
+     ``kernels=`` not opaque);
   4. prints a summary.
 
 Usage:
@@ -209,7 +211,7 @@ def _capture_multi_program(mdl, model_dir: Path, stem: str, quant) -> dict:
 def _inner_capture(model: str, formats: list[str], level: str) -> None:
     """Runs inside the model's venv: capture each format and emit a JSON summary."""
     import m2m
-    from m2m.coverage import family_histogram, opaque_report
+    from m2m.coverage import family_histogram, kernel_report, opaque_report
 
     model_dir = WORKLOADS / model
     cfg = _load_toml(model_dir)
@@ -245,6 +247,7 @@ def _inner_capture(model: str, formats: list[str], level: str) -> None:
             path = model_dir / f"{model}{suffix[fmt]}.mlir"
             path.write_text(r.mlir_text)
             opaque = opaque_report(r.mlir_text)
+            kernels = kernel_report(r.mlir_text)
             n_sections = 0
             if os.environ.get("M2M_EMIT_SECTIONS") and r.module is not None:
                 try:
@@ -260,6 +263,7 @@ def _inner_capture(model: str, formats: list[str], level: str) -> None:
                     pass
             results[fmt] = {
                 "ok": r.ok, "opaque": sum(opaque.values()), "opaque_detail": opaque,
+                "kernels": sum(kernels.values()), "kernel_detail": kernels,
                 "linalg": r.mlir_text.count("linalg."),
                 "families": len(family_histogram(r.mlir_text)),
                 "sections": n_sections,
@@ -335,7 +339,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"!! {model:14s} {fmt:5s} ERROR: {r['error']}")
                 else:
                     print(f"{'OK ' if clean else '!! '}{model:14s} {fmt:5s} "
-                          f"opaque={r['opaque']:<4d} linalg={r['linalg']:<5d} "
+                          f"opaque={r['opaque']:<4d} kernels={r.get('kernels', 0):<3d} "
+                          f"linalg={r['linalg']:<5d} "
                           f"families={r['families']:<3d} -> {r['path']}")
         except Exception as exc:  # noqa: BLE001
             failures += 1
