@@ -112,7 +112,8 @@ always the first `func.func`.
 merlin consumes this IR as-is: its kernel table maps `triton_exp::fused_mlp2` to CPU bodies, links one
 into the model's LLVM IR and runs it on spike rv64gcv. Measured there against PyTorch: max abs error
 3.0e-8 with the kernel (`llvm_mlir` body, 15,558 retired instructions) and 4.5e-8 for `mlp_basic`
-(16,156). See merlin's `docs/guides/triton_kernel_integration.md`.
+(16,156). In merlin, `build_tools/scripts/run_mlp_kernel_spike.py --form llvm_mlir` runs it; see
+merlin's `docs/guides/triton_kernel_integration.md`.
 
 ### 5. Tests
 

@@ -131,6 +131,8 @@ func.func private @triton_exp__fused_mlp2(...) -> tensor<4x32xf32> attributes {p
   `test_table_keys_match_m2m_registry` fails until it has one.
 - Not yet supported: in-place kernels (`mutates_args`, which export wraps in
   `auto_functionalized_v2`). A registered one is an import **error**, never silently wrong IR.
+- Status, the end-to-end MLP example and the full limitations list:
+  `docs/guides/triton_kernel_integration.md`.
 
 ## Layout
 ```
